@@ -8,7 +8,7 @@
 -- pulling in the plugin's precompiled header (Windows.h + CommonLibSSE-NG).
 
 set_project("HeapSentinelTests")
-set_version("0.4.0")
+set_version("0.5.0")
 set_languages("c++23")
 set_license("MIT")
 
@@ -45,6 +45,15 @@ target("heapsentinel-tests")
     add_files("../src/Core/PoisonQuarantine.cpp")
     add_files("../src/Core/WeakLibEvents.cpp")
     add_files("../src/Core/Verdict.cpp")
+    -- The 0.5.0 double-free fixes: the per-thread re-entrancy guard, the
+    -- alloc-side evidence formatter, the report-kind gating on allocator
+    -- confidence, the stats formatter/schedule and the reports-log header build
+    -- are all plain C++, so they are exercised off-game on both platforms.
+    add_files("../src/Core/FreeReentrancy.cpp")
+    add_files("../src/Core/FreeEvidence.cpp")
+    add_files("../src/Core/AllocatorConfidence.cpp")
+    add_files("../src/Core/Stats.cpp")
+    add_files("../src/Core/ReportLog.cpp")
     -- The hook-target verification table parser + verifier and the plugin health
     -- state are plain C++ too, so the committed table is parsed and the verifier
     -- is exercised with synthetic bytes off-game on both platforms (and under

@@ -42,6 +42,19 @@ screenshot and a freeze.
 
 ## Status
 
+**v0.5 — double-free reporting is honest and non-perturbing.** A suspected
+double free is reported and the original free is still called (the old
+behaviour skipped it and turned false positives into leaks); a per-thread,
+allocation-free re-entrancy guard stops one logical free being counted twice
+when two of our hooks observe it; every double-free report carries the
+allocation site/epoch/stack/flags and which hook family saw each free; and a
+report is emitted as `double-free-unverified` rather than `double-free` when the
+MemoryManager target is not the verified game function (e.g. replaced by
+EngineFixes). Poison-on-free now defaults off. Stats are emitted at data-load
+and on the first report, and the reports log is appended and rotated instead of
+truncated. Hooking the tbbmalloc choke point is designed but deferred (it is a
+mod-DLL target; see `DESIGN.md` §3.4).
+
 **v0.4 — committed hook-target verification.** Before installing each hook the
 plugin checks the running binary's identity, the Address Library id, the vtable
 slot for virtual targets and a hash of the function's first bytes against a
