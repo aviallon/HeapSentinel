@@ -82,7 +82,7 @@ namespace hs
 
 	std::string ClassifyAddress(std::uintptr_t a_addr)
 	{
-		if (const auto* mod = ModuleMap::Get().Find(a_addr)) {
+		if (ModuleMap::Get().Contains(a_addr)) {
 			return ModuleMap::Get().Describe(a_addr);
 		}
 		if (GuardedPool::Get().IsOurs(a_addr)) {
