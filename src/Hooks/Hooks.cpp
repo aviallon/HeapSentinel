@@ -197,11 +197,6 @@ namespace hs
 			}
 
 			bool plausible = IsPlausibleVTable(vtable);
-			if (!plausible && ModuleMap::Get().MaybeRefreshLazily()) {
-				// A module may have been loaded after kPostLoad; re-check before
-				// declaring the vtable corrupt.
-				plausible = IsPlausibleVTable(vtable);
-			}
 
 			if (!plausible) {
 				char detail[768]{};

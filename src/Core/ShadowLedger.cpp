@@ -137,6 +137,8 @@ namespace hs
 		} else if (firstFreed != static_cast<std::size_t>(-1)) {
 			shard.slots[firstFreed].key = a_ptr;
 			shard.slots[firstFreed].info = a_info;
+		} else {
+			_insertFailures.fetch_add(1, std::memory_order_relaxed);
 		}
 
 		shard.Unlock();

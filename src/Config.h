@@ -16,7 +16,10 @@ namespace hs
 
 		// [Ledger] - shadow allocation ledger (pointer -> metadata).
 		bool        ledgerEnabled = true;
-		std::size_t ledgerCapacity = 1u << 20;  // entries (power of two)
+		// One entry per live allocation. Skyrim has well over a million live
+		// engine allocations, so the default is 4 M; the table is bounded by a
+		// probe window and evicts the oldest freed entry when it is full.
+		std::size_t ledgerCapacity = 1u << 22;  // entries (power of two)
 		std::size_t ledgerShards = 64;
 		std::size_t ledgerStackDepth = 12;      // frames recorded per event (0 = off)
 

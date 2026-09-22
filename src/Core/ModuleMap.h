@@ -1,5 +1,6 @@
 #pragma once
 
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -13,14 +14,15 @@ namespace hs
 	};
 
 	// Snapshot of the loaded modules, used to answer the questions a memory
-	// sentinel asks constantly and on hot paths:
+	// sentinel asks on the refcount-guard path:
 	//   * is this pointer inside an image at all?
 	//   * is it inside an executable section (i.e. a plausible function)?
 	//   * which module+offset is it (for reports)?
 	//
-	// The module list is taken once at plugin load (SKSE has already loaded
-	// every plugin DLL by then) and stored sorted, so lookups are binary
-	// searches, not linear scans over hundreds of modules.
+	// The list is taken at plugin load and refreshed on the SKSE kPostLoad /
+	// kDataLoaded messages. Readers take a shared lock and get a *copy* of a
+	// range (never an interior pointer), so a refresh on another thread cannot
+	// invalidate what a reader is looking at.
 	class ModuleMap
 	{
 	public:
@@ -28,24 +30,18 @@ namespace hs
 
 		void Refresh();
 
-		// The module list is only complete once every SKSE plugin has been
-		// loaded. HeapSentinel loads early (alphabetically), so refreshing at
-		// plugin load sees ~95 of ~130 modules and every vtable in a not-yet-
-		// loaded plugin looks unmapped. The vtable guard is gated on this flag.
-		void SetComplete() { _complete = true; }
+		// The list is only complete once every SKSE plugin has been loaded.
+		// HeapSentinel loads early (SKSE loads plugins alphabetically), so a
+		// snapshot from SKSEPlugin_Load is missing plugins that load after it
+		// and every vtable inside one of those looks unmapped.
+		void               SetComplete() { _complete = true; }
 		[[nodiscard]] bool IsComplete() const { return _complete; }
 
-		// Refresh at most once every a_minIntervalMs; returns true when it did.
-		// Used on the slow path so a module loaded later is not mistaken for a
-		// corrupt vtable.
-		bool MaybeRefreshLazily(std::uint64_t a_minIntervalMs = 5000);
-
+		[[nodiscard]] bool Find(std::uintptr_t a_addr, ModuleRange& a_out) const;
 		[[nodiscard]] bool Contains(std::uintptr_t a_addr) const;
 		[[nodiscard]] bool IsExecutable(std::uintptr_t a_addr) const;
-		[[nodiscard]] const ModuleRange* Find(std::uintptr_t a_addr) const;
 		[[nodiscard]] std::string Describe(std::uintptr_t a_addr) const;
-
-		[[nodiscard]] std::size_t Size() const { return _modules.size(); }
+		[[nodiscard]] std::size_t Size() const;
 
 	private:
 		struct ExecRange
@@ -54,10 +50,10 @@ namespace hs
 			std::uintptr_t end = 0;
 		};
 
-		std::vector<ModuleRange> _modules;  // sorted by base
-		std::vector<ExecRange>   _exec;     // sorted by start
-		bool                     _complete = false;
-		std::atomic<std::uint64_t> _lastRefreshTick{ 0 };
+		mutable std::shared_mutex _mutex;
+		std::vector<ModuleRange>  _modules;  // sorted by base
+		std::vector<ExecRange>    _exec;     // sorted by start
+		bool                      _complete = false;
 	};
 
 	// A pointer is a plausible vtable pointer when it is 8-byte aligned, lies

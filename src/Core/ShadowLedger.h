@@ -47,6 +47,11 @@ namespace hs
 
 		[[nodiscard]] std::size_t Count() const;
 
+		// Inserts that could not be placed because the probe window was full of
+		// live entries. A non-zero and growing value means the ledger is
+		// saturating and recording has stopped for new allocations.
+		[[nodiscard]] std::uint64_t InsertFailures() const { return _insertFailures.load(std::memory_order_relaxed); }
+
 		// Fixed ring of captured stacks. 0 is reserved for "none".
 		[[nodiscard]] std::uint32_t StoreStack(const Stack& a_stack);
 		[[nodiscard]] const Stack*  GetStack(std::uint32_t a_index) const;
@@ -84,6 +89,7 @@ namespace hs
 		std::unique_ptr<Stack[]> _stacks;
 		std::size_t              _stackCount = 0;
 		std::atomic<std::uint32_t> _stackCursor{ 1 };
+		std::atomic<std::uint64_t> _insertFailures{ 0 };
 
 		std::atomic<bool> _ready{ false };
 	};

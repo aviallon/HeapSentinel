@@ -84,7 +84,8 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	std::thread([] {
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::seconds(60));
-			logger::info("stats: {} ledger entries", hs::ShadowLedger::Get().Count());
+			logger::info("stats: {} ledger entries, {} insert failures",
+				hs::ShadowLedger::Get().Count(), hs::ShadowLedger::Get().InsertFailures());
 		}
 	}).detach();
 
