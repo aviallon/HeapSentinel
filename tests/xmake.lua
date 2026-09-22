@@ -8,7 +8,7 @@
 -- pulling in the plugin's precompiled header (Windows.h + CommonLibSSE-NG).
 
 set_project("HeapSentinelTests")
-set_version("0.1.0")
+set_version("0.3.0")
 set_languages("c++23")
 set_license("MIT")
 
@@ -35,10 +35,15 @@ target("heapsentinel-tests")
 
     add_files("main.cpp", "test_*.cpp")
     add_files("../src/Ipc/ShmRing.cpp", "../src/Ipc/ShmSession.cpp")
-    -- The shadow ledger is plain C++ (HS_NO_PCH keeps it off Windows.h and the
-    -- CommonLib precompiled header), so the new Scaleform allocation source is
-    -- exercised off-game on both platforms.
+    -- The shadow ledger and the new Scaleform attribution cores are plain C++
+    -- (HS_NO_PCH keeps them off Windows.h and the CommonLib precompiled header),
+    -- so the poison encoding, the free-ring bound, the verdict and the
+    -- non-eviction rules are exercised off-game on both platforms.
     add_files("../src/Core/ShadowLedger.cpp")
+    add_files("../src/Core/ScaleformFreeRing.cpp")
+    add_files("../src/Core/PoisonQuarantine.cpp")
+    add_files("../src/Core/WeakLibEvents.cpp")
+    add_files("../src/Core/Verdict.cpp")
     add_includedirs("..", "../src", ".")
 
     if is_plat("linux") or is_plat("macosx") then

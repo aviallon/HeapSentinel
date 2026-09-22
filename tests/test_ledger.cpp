@@ -7,6 +7,10 @@
 
 #include "Core/ShadowLedger.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 using namespace hs;
 
 namespace
@@ -206,4 +210,69 @@ HS_TEST(ledger_is_fail_open_before_init)
 	AllocationInfo erased;
 	HS_CHECK(!ShadowLedger::Get().Erase(kKeyA, erased));
 	HS_CHECK_EQ(ShadowLedger::Get().Count(), std::size_t{ 0 });
+}
+
+HS_TEST(ledger_records_the_vtable_and_tick_attribution_fields)
+{
+	ResetLedger();
+
+	AllocationInfo info = MakeInfo(kKeyA, 0x280, kFlagLive | kFlagScaleform);
+	info.vtableAtAlloc = 0xDEAD;                  // pre-construction garbage
+	info.vtableAtFree = 0x140D0000;               // the real vtable at death
+	info.lastKnownVtable = 0x140D0000;
+	info.allocTick = 100;
+	info.freeTick = 250;
+	info.poisonIndex = 7;
+	ShadowLedger::Get().Insert(kKeyA, info);
+
+	AllocationInfo out;
+	HS_CHECK(ShadowLedger::Get().Find(kKeyA, out));
+	HS_CHECK_EQ(out.vtableAtAlloc, std::uintptr_t{ 0xDEAD });
+	HS_CHECK_EQ(out.vtableAtFree, std::uintptr_t{ 0x140D0000 });
+	HS_CHECK_EQ(out.lastKnownVtable, std::uintptr_t{ 0x140D0000 });
+	HS_CHECK_EQ(out.allocTick, std::uint64_t{ 100 });
+	HS_CHECK_EQ(out.freeTick, std::uint64_t{ 250 });
+	HS_CHECK_EQ(out.poisonIndex, 7u);
+
+	ShadowLedger::Get().Shutdown();
+}
+
+// The VEH reads the ledger with NO lock. The per-entry seqlock must therefore
+// guarantee that a successful Find never returns a record whose fields were
+// written by two different Insert calls (a torn record). The writer keeps two
+// fields equal on every write; the reader asserts that invariant on every
+// successful read. A plain data race would fail this frequently.
+HS_TEST(ledger_find_is_lock_free_and_never_returns_a_torn_record)
+{
+	ResetLedger(1024, 8, 0);
+
+	std::atomic<bool> stop{ false };
+	std::atomic<std::uint64_t> reads{ 0 };
+	std::atomic<std::uint64_t> mismatches{ 0 };
+
+	std::thread writer([&] {
+		for (std::uint64_t i = 1; i <= 200000; ++i) {
+			AllocationInfo info = MakeInfo(kKeyA, 0x40, kFlagLive);
+			info.poisonIndex = static_cast<std::uint32_t>(i);
+			info.size = static_cast<std::size_t>(i);
+			ShadowLedger::Get().Insert(kKeyA, info);
+		}
+		stop.store(true, std::memory_order_release);
+	});
+
+	while (!stop.load(std::memory_order_acquire)) {
+		AllocationInfo out;
+		if (ShadowLedger::Get().Find(kKeyA, out)) {
+			reads.fetch_add(1, std::memory_order_relaxed);
+			if (static_cast<std::uint64_t>(out.size) != static_cast<std::uint64_t>(out.poisonIndex)) {
+				mismatches.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+	writer.join();
+
+	HS_CHECK_NE(reads.load(), std::uint64_t{ 0 });
+	HS_CHECK_EQ(mismatches.load(), std::uint64_t{ 0 });
+
+	ShadowLedger::Get().Shutdown();
 }
