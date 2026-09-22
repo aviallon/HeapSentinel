@@ -60,7 +60,39 @@ namespace hs
 		std::sort(_modules.begin(), _modules.end(), [](const ModuleRange& a, const ModuleRange& b) { return a.base < b.base; });
 		std::sort(_exec.begin(), _exec.end(), [](const ExecRange& a, const ExecRange& b) { return a.start < b.start; });
 
-		logger::info("module map: {} modules, {} executable ranges", _modules.size(), _exec.size());
+		_lastRefreshTick.store(::GetTickCount64(), std::memory_order_relaxed);
+
+		// Self-test: every module must be findable at its first and last byte.
+		// A silent binary-search bug here would make valid vtables look corrupt.
+		std::size_t failures = 0;
+		for (const auto& mod : _modules) {
+			if (Find(mod.base) != &mod) {
+				++failures;
+			}
+			if (mod.size > 0 && Find(mod.base + mod.size - 1) != &mod) {
+				++failures;
+			}
+		}
+		if (failures != 0) {
+			logger::error("module map self-test: {} lookup failures", failures);
+		}
+
+		logger::info("module map: {} modules, {} executable ranges, {} self-test failures",
+			_modules.size(), _exec.size(), failures);
+	}
+
+	bool ModuleMap::MaybeRefreshLazily(std::uint64_t a_minIntervalMs)
+	{
+		const auto now = ::GetTickCount64();
+		std::uint64_t last = _lastRefreshTick.load(std::memory_order_relaxed);
+		if (now - last < a_minIntervalMs) {
+			return false;
+		}
+		if (!_lastRefreshTick.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+			return false;
+		}
+		Refresh();
+		return true;
 	}
 
 	const ModuleRange* ModuleMap::Find(std::uintptr_t a_addr) const

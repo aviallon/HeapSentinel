@@ -28,6 +28,18 @@ namespace hs
 
 		void Refresh();
 
+		// The module list is only complete once every SKSE plugin has been
+		// loaded. HeapSentinel loads early (alphabetically), so refreshing at
+		// plugin load sees ~95 of ~130 modules and every vtable in a not-yet-
+		// loaded plugin looks unmapped. The vtable guard is gated on this flag.
+		void SetComplete() { _complete = true; }
+		[[nodiscard]] bool IsComplete() const { return _complete; }
+
+		// Refresh at most once every a_minIntervalMs; returns true when it did.
+		// Used on the slow path so a module loaded later is not mistaken for a
+		// corrupt vtable.
+		bool MaybeRefreshLazily(std::uint64_t a_minIntervalMs = 5000);
+
 		[[nodiscard]] bool Contains(std::uintptr_t a_addr) const;
 		[[nodiscard]] bool IsExecutable(std::uintptr_t a_addr) const;
 		[[nodiscard]] const ModuleRange* Find(std::uintptr_t a_addr) const;
@@ -44,6 +56,8 @@ namespace hs
 
 		std::vector<ModuleRange> _modules;  // sorted by base
 		std::vector<ExecRange>   _exec;     // sorted by start
+		bool                     _complete = false;
+		std::atomic<std::uint64_t> _lastRefreshTick{ 0 };
 	};
 
 	// A pointer is a plausible vtable pointer when it is 8-byte aligned, lies

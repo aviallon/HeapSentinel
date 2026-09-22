@@ -188,7 +188,22 @@ namespace hs
 			const auto vtable = *reinterpret_cast<const std::uintptr_t*>(a_object);
 			const auto count = *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::byte*>(a_object) + 8);
 
-			if (!IsPlausibleVTable(vtable)) {
+			// The module list is only complete after every SKSE plugin has been
+			// loaded (kPostLoad). Until then, fail open: a vtable in a plugin
+			// that has not loaded yet would look unmapped.
+			if (!ModuleMap::Get().IsComplete()) {
+				o_Release(a_object);
+				return;
+			}
+
+			bool plausible = IsPlausibleVTable(vtable);
+			if (!plausible && ModuleMap::Get().MaybeRefreshLazily()) {
+				// A module may have been loaded after kPostLoad; re-check before
+				// declaring the vtable corrupt.
+				plausible = IsPlausibleVTable(vtable);
+			}
+
+			if (!plausible) {
 				char detail[768]{};
 				std::snprintf(detail, sizeof(detail),
 					"object %s has vtable 0x%llX (%s), first slot 0x%llX, refcount %d; releasing from %s",
