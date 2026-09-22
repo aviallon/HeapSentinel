@@ -134,6 +134,10 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 				hs::PoisonQuarantine::Get().Bytes() / 1024u, hs::PoisonQuarantine::Get().Evictions());
 			logger::info("stats: weaklib events {} (capacity {})",
 				hs::WeakLibEvents::Get().Count(), hs::WeakLibEvents::Get().Capacity());
+			logger::info("stats: bloom filters {} KiB (ledger) + {} KiB (free ring), {} swaps",
+				hs::ShadowLedger::Get().BloomBytes() / 1024u,
+				hs::ScaleformFreeRing::Get().BloomBytes() / 1024u,
+				hs::ShadowLedger::Get().BloomSwaps() + hs::ScaleformFreeRing::Get().BloomSwaps());
 
 			if (!warnedSaturated && (failures > 0 || drops > 0)) {
 				logger::warn("ledger lossy: {} insert failures, {} writer drops; raise [Ledger] uCapacity or accept the gap", failures, drops);

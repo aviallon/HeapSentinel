@@ -40,6 +40,7 @@ target("heapsentinel-tests")
     -- so the poison encoding, the free-ring bound, the verdict and the
     -- non-eviction rules are exercised off-game on both platforms.
     add_files("../src/Core/ShadowLedger.cpp")
+    add_files("../src/Core/BloomFilter.cpp")
     add_files("../src/Core/ScaleformFreeRing.cpp")
     add_files("../src/Core/PoisonQuarantine.cpp")
     add_files("../src/Core/WeakLibEvents.cpp")

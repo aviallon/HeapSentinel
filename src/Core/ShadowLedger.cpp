@@ -113,6 +113,11 @@ namespace hs
 			_stacks = std::make_unique<Stack[]>(_stackCount);
 		}
 
+		// ~10 bits/element gives ~1% false positives; sized to the table capacity
+		// and non-aging so a miss never hides a record the table holds. If this
+		// allocation fails, MightContain() fails open and Find() stays exact.
+		_bloom.Init(_shardCount * _shardCapacity, 10, false);
+
 		_ready.store(true, std::memory_order_release);
 #if !defined(HS_NO_PCH)
 		logger::info("ledger: {} shards x {} slots ({} entries), stack ring {} (lock-free seqlock, bounded {} attempt claim)",
@@ -126,6 +131,7 @@ namespace hs
 		_ready.store(false, std::memory_order_release);
 		_shards.reset();
 		_stacks.reset();
+		_bloom.Shutdown();
 		_shardCount = 0;
 		_shardCapacity = 0;
 		_stackCount = 0;
@@ -190,6 +196,8 @@ namespace hs
 			return;
 		}
 
+		_bloom.Add(a_ptr);
+
 		auto& shard = ShardFor(a_ptr);
 
 		const auto  mask = shard.capacity - 1;
@@ -251,6 +259,12 @@ namespace hs
 	bool ShadowLedger::Find(std::uintptr_t a_ptr, AllocationInfo& a_out) const
 	{
 		if (!Ready() || a_ptr <= kTombstone) {
+			return false;
+		}
+
+		// Bloom fast path: the common case (a register that is not ours) is one
+		// relaxed atomic read, with no seqlock, no probing and no shard walk.
+		if (!_bloom.MightContain(a_ptr)) {
 			return false;
 		}
 

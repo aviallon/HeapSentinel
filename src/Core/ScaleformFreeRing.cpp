@@ -57,6 +57,7 @@ namespace hs
 		}
 		_writeCursor.store(0, std::memory_order_relaxed);
 		_evictions.store(0, std::memory_order_relaxed);
+		_bloom.Init(_capacity, 10, false);
 		_ready.store(true, std::memory_order_release);
 #if !defined(HS_NO_PCH)
 		logger::info("scaleform free ring: {} records (oldest evicted first)", _capacity);
@@ -68,6 +69,7 @@ namespace hs
 	{
 		_ready.store(false, std::memory_order_release);
 		_slots.reset();
+		_bloom.Shutdown();
 		_capacity = 0;
 		_writeCursor.store(0, std::memory_order_relaxed);
 		_evictions.store(0, std::memory_order_relaxed);
@@ -81,6 +83,8 @@ namespace hs
 
 		const std::uint64_t seq = _writeCursor.fetch_add(1, std::memory_order_relaxed) + 1;
 		auto&               slot = _slots[seq & (_capacity - 1)];
+
+		_bloom.Add(a_record.ptr);
 
 		// Invalidate before touching the payload, publish after. A reader that
 		// sees the odd version skips the slot.
@@ -98,6 +102,11 @@ namespace hs
 	bool ScaleformFreeRing::Find(std::uintptr_t a_ptr, ScaleformFreeRecord& a_out) const
 	{
 		if (!Ready() || a_ptr <= 1) {
+			return false;
+		}
+
+		// Bloom fast path: a pointer we never recorded costs one relaxed load.
+		if (!_bloom.MightContain(a_ptr)) {
 			return false;
 		}
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Core/BloomFilter.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -47,6 +49,11 @@ namespace hs
 		[[nodiscard]] std::size_t Count() const;
 		[[nodiscard]] std::size_t Capacity() const { return _capacity; }
 		[[nodiscard]] std::uint64_t Evictions() const { return _evictions.load(std::memory_order_relaxed); }
+		// Bloom pre-filter before the ring scan. Sized to the ring capacity and
+		// non-aging, so a miss is authoritative for the retained window and never
+		// hides a record the ring still holds.
+		[[nodiscard]] std::size_t   BloomBytes() const { return _bloom.Bytes(); }
+		[[nodiscard]] std::uint64_t BloomSwaps() const { return _bloom.Swaps(); }
 
 		// Oldest/newest retained free tick, for a human-readable retention
 		// window in milliseconds. Returns false when empty.
@@ -63,6 +70,7 @@ namespace hs
 
 		std::unique_ptr<Slot[]>    _slots;
 		std::size_t                _capacity = 0;
+		BloomFilter                _bloom;
 		std::atomic<std::uint64_t> _writeCursor{ 0 };  // 1-based added count
 		std::atomic<std::uint64_t> _evictions{ 0 };
 		std::atomic<bool>          _ready{ false };

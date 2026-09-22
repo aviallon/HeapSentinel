@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Core/BloomFilter.h"
 #include "Core/StackCapture.h"
 
 #include <atomic>
@@ -109,6 +110,14 @@ namespace hs
 		// (a deployed ini overrides the compiled default).
 		[[nodiscard]] std::size_t Capacity() const { return _shardCount * _shardCapacity; }
 
+		// Bloom pre-filter accounting. The filter is queried before any probe, so
+		// the VEH's overwhelmingly-common "not ours" case is a single relaxed load
+		// with no seqlock and no probing. It is sized to the table capacity and
+		// non-aging here, so a miss is authoritative and never hides a record the
+		// ledger still holds.
+		[[nodiscard]] std::size_t   BloomBytes() const { return _bloom.Bytes(); }
+		[[nodiscard]] std::uint64_t BloomSwaps() const { return _bloom.Swaps(); }
+
 		// Fixed ring of captured stacks. 0 is reserved for "none".
 		[[nodiscard]] std::uint32_t StoreStack(const Stack& a_stack);
 		[[nodiscard]] const Stack*  GetStack(std::uint32_t a_index) const;
@@ -162,6 +171,7 @@ namespace hs
 
 		std::unique_ptr<Stack[]> _stacks;
 		std::size_t              _stackCount = 0;
+		BloomFilter              _bloom;
 		std::atomic<std::uint32_t> _stackCursor{ 1 };
 		std::atomic<std::uint64_t> _insertFailures{ 0 };
 		std::atomic<std::uint64_t> _writerDrops{ 0 };
