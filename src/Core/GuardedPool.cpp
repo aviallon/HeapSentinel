@@ -44,7 +44,7 @@ namespace hs
 		_slots = std::make_unique<Slot[]>(_slotCount);
 		for (std::size_t i = 0; i < _slotCount; ++i) {
 			_slots[i].data = _region + i * _slotStride + _pageSize;
-			_slots[i].state = kFree;
+			_slots[i].state.store(kFree, std::memory_order_relaxed);
 		}
 
 		_freeList = std::make_unique<std::uint32_t[]>(_slotCount);
@@ -112,9 +112,7 @@ namespace hs
 			return nullptr;
 		}
 
-		while (_lock.test_and_set(std::memory_order_acquire)) {
-			::YieldProcessor();
-		}
+		::AcquireSRWLockExclusive(&_lock);
 
 		std::size_t index = static_cast<std::size_t>(-1);
 
@@ -129,12 +127,12 @@ namespace hs
 		}
 
 		if (index == static_cast<std::size_t>(-1)) {
-			_lock.clear(std::memory_order_release);
+			::ReleaseSRWLockExclusive(&_lock);
 			return nullptr;
 		}
 
 		auto& slot = _slots[index];
-		if (slot.state != kInUse) {
+		if (slot.state.load(std::memory_order_relaxed) != kInUse) {
 			::VirtualAlloc(slot.data, _pageSize, MEM_COMMIT, PAGE_READWRITE);
 		}
 
@@ -152,9 +150,9 @@ namespace hs
 
 		slot.user = user;
 		slot.size = a_size;
-		slot.state = kInUse;
+		slot.state.store(kInUse, std::memory_order_relaxed);
 
-		_lock.clear(std::memory_order_release);
+		::ReleaseSRWLockExclusive(&_lock);
 
 		AllocationInfo info = a_info;
 		info.ptr = reinterpret_cast<std::uintptr_t>(user);
@@ -172,16 +170,14 @@ namespace hs
 			return false;
 		}
 
-		while (_lock.test_and_set(std::memory_order_acquire)) {
-			::YieldProcessor();
-		}
+		::AcquireSRWLockExclusive(&_lock);
 
-		if (slot->state == kQuarantined) {
-			_lock.clear(std::memory_order_release);
+		if (slot->state.load(std::memory_order_relaxed) == kQuarantined) {
+			::ReleaseSRWLockExclusive(&_lock);
 			return true;  // double free of a sampled block; the caller reports it
 		}
 
-		slot->state = kQuarantined;
+		slot->state.store(kQuarantined, std::memory_order_relaxed);
 		::VirtualProtect(slot->data, _pageSize, PAGE_NOACCESS, nullptr);
 
 		const auto index = static_cast<std::uint32_t>(slot - _slots.get());
@@ -191,7 +187,7 @@ namespace hs
 			const auto oldest = _quarantine[_quarantineHead];
 			_quarantineHead = (_quarantineHead + 1) % _quarantineCapacity;
 			--_quarantineCount;
-			_slots[oldest].state = kFree;
+			_slots[oldest].state.store(kFree, std::memory_order_relaxed);
 			if (_freeCount < _slotCount) {
 				_freeList[_freeCount++] = oldest;
 			}
@@ -200,7 +196,7 @@ namespace hs
 		_quarantine[(_quarantineHead + _quarantineCount) % _quarantineCapacity] = index;
 		++_quarantineCount;
 
-		_lock.clear(std::memory_order_release);
+		::ReleaseSRWLockExclusive(&_lock);
 
 		AllocationInfo info;
 		if (ShadowLedger::Get().Find(a_ptr, info)) {
@@ -224,9 +220,14 @@ namespace hs
 		a_out.ptr = reinterpret_cast<std::uintptr_t>(slot->user);
 		a_out.size = slot->size;
 
-		if (a_fixUp && slot->state == kQuarantined) {
-			::VirtualProtect(slot->data, _pageSize, PAGE_READWRITE, nullptr);
-			slot->state = kInUse;
+		if (a_fixUp) {
+			// Fail-up is best-effort and must not take a lock: the VEH runs on the
+			// faulting thread, which may hold the pool lock. A CAS keeps only one
+			// fixer, and a lost race just means someone else already fixed it.
+			std::uint32_t expected = kQuarantined;
+			if (slot->state.compare_exchange_strong(expected, kInUse, std::memory_order_acq_rel)) {
+				::VirtualProtect(slot->data, _pageSize, PAGE_READWRITE, nullptr);
+			}
 		}
 		return true;
 	}
