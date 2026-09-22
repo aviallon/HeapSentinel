@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+  <moduleName>HeapSentinel 0.3.0</moduleName>
+  <requiredInstallFiles>
+    <file source="SKSE/Plugins/HeapSentinel.dll" destination="SKSE/Plugins/HeapSentinel.dll" />
+    <file source="README.md" destination="README.md" />
+    <file source="RESEARCH.md" destination="RESEARCH.md" />
+    <file source="DESIGN.md" destination="DESIGN.md" />
+  </requiredInstallFiles>
+  <installSteps order="Explicit">
+    <installStep name="HeapSentinel">
+      <optionalFileGroups>
+        <group name="Install HeapSentinel" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Install HeapSentinel">
+              <description>HeapSentinel is an SKSE plugin that retrofits a memory sentinel onto the running game. It does NOT fix crashes. It tells you WHICH MOD caused one.
+
+What it does:
+- Hooks the engine's allocators (RE::MemoryManager) and Scaleform's GMemoryHeapPT, plus the refcount and GFxResourceWeakLib paths.
+- Keeps a shadow ledger of every tracked block, with the allocation and the free call stacks.
+- A vectored exception handler catches the fault and prints PROVENANCE: which module freed the object, and from where.
+- Optional poison-on-free overwrites a freed Scaleform object's vtable with a reserved poison address and delays the real free, so a later virtual call through the dead object faults deterministically at an address that maps back to the ledger record, with both the alloc and the free stack.
+
+What it is NOT:
+- It is not a crash fix and not a stability mod. It cannot repair a use-after-free; it exists to identify the mod that caused it. Install it while hunting a crash, read the report, then remove it or keep it as you prefer.
+- It is not a general antivirus for memory corruption, and it does not detect a bug it was never able to observe.
+
+Cost and privacy:
+- Memory: the profile you choose on the next page costs roughly 125-735 MiB of resident memory; the recommended Balanced profile is about 260 MiB. Each profile states its own number.
+- Per-allocation cost: every tracked allocation pays a small extra cost on the hot path (a bloom pre-filter, a sharded lock-free ledger insert, and, when stacks are on, a call-stack capture).
+- Nothing leaves the machine. Reports are written to the SKSE log next to the DLL; there is no network code.
+
+Choose a configuration profile on the next page.</description>
+              <conditionFlags>
+                <flag name="step">intro</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Required" />
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Configuration profile">
+      <optionalFileGroups>
+        <group name="Memory / attribution trade-off" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Balanced (recommended)">
+              <description>Recommended default. 1,048,576 ledger entries (~115 MiB),
+call stacks on (~14 MiB stack ring), Scaleform free ring with 1,048,576 records
+(~64 MiB), poison-on-free with up to 64 MiB withheld, and roughly 2.5 MiB of
+bloom filters. Total resident cost is roughly 260 MiB.
+
+This is the profile to run for normal play and for most crash hunts: it tracks
+the engine allocators, the Scaleform GMemoryHeapPT and the GFxResourceWeakLib
+paths, and it keeps the deterministic poison fast path. What you give up versus
+Max attribution is depth, not coverage: the ledger and free ring evict older
+records sooner, and the poison quarantine holds half as many bytes, so a
+delayed use-after-free may find its free record already evicted. Nothing else
+is lost.</description>
+              <conditionFlags>
+                <flag name="profile">balanced</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Recommended" />
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Max attribution (larger ledger + poison budget)">
+              <description>For hunting one specific, hard-to-reproduce crash. 4,194,304
+ledger entries (~460 MiB), call stacks on (~14 MiB), Scaleform free ring with
+2,097,152 records (~128 MiB), poison-on-free with up to 128 MiB withheld, and
+roughly 7.5 MiB of bloom filters. Total resident cost is roughly 735 MiB.
+
+What you give up is memory headroom: on a heavily modded, memory-tight setup,
+this profile can itself contribute to the memory pressure that triggers the
+crash. Use it for a targeted session with the failing setup, capture the
+report, then switch back. It does not detect anything Balanced does not; it
+merely remembers more of the past.</description>
+              <conditionFlags>
+                <flag name="profile">max-attribution</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional" />
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Low memory / low overhead">
+              <description>1,048,576 ledger entries (~115 MiB), call stacks OFF, Scaleform
+tracking on but poison-on-free OFF, Scaleform free ring with 131,072 records
+(~8 MiB), and roughly 1.4 MiB of bloom filters. Total resident cost is roughly
+125 MiB.
+
+What you give up: stack attribution and the deterministic poison fast path.
+Provenance degrades to the immediate return address (module+0xOFFSET, which a
+shipped PDB can still resolve to a function), and a use-after-free is no longer
+made deterministic by poison. The general free ring still answers "which module
+freed it", but over a much shorter window (~1/8 of Balanced). Choose it when
+resident memory matters more than attribution detail.</description>
+              <conditionFlags>
+                <flag name="profile">low-memory</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional" />
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Engine-only (pre-0.2 behaviour)">
+              <description>Engine-only, the pre-0.2 HeapSentinel behaviour. The
+Scaleform GMemoryHeapPT hooks, poison-on-free and the GFxResourceWeakLib context
+hooks are all off. 1,048,576 ledger entries (~115 MiB), call stacks on
+(~14 MiB), and roughly 1.25 MiB of bloom filters. Total resident cost is roughly
+130 MiB.
+
+What you give up: every kind of Scaleform/GFxResource attribution. This profile
+is blind to the GFxResource use-after-free crashes that 0.2 and 0.3 were added
+for. Only choose it if Scaleform tracking is itself suspect on your setup, or
+if you deliberately want the older, narrower behaviour.</description>
+              <conditionFlags>
+                <flag name="profile">engine-only</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional" />
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Custom (fully commented defaults, edit after install)">
+              <description>Install the fully commented HeapSentinel.ini for hand-editing.
+It ships with the plugin's compiled-in defaults: 4,194,304 ledger entries
+(~460 MiB), call stacks on (~14 MiB), Scaleform free ring with 1,048,576 records
+(~64 MiB), poison-on-free with up to 64 MiB withheld, and roughly 6.3 MiB of
+bloom filters, for a total of roughly 600 MiB.
+
+This is deliberately NOT the recommended default - Balanced, above, is. Install
+this only if you intend to edit Data/SKSE/Plugins/HeapSentinel.ini yourself.
+Every key is present and commented in the file, so a value you do not touch
+keeps its compiled default rather than silently reverting. The guarded pool
+([GuardPool]) is documented there but left OFF: it is opt-in and unverified, and
+it is not offered as a normal wizard choice.</description>
+              <conditionFlags>
+                <flag name="profile">custom</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional" />
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="profile" value="balanced" />
+        </dependencies>
+        <files>
+          <file source="fomod/profiles/balanced.ini" destination="SKSE/Plugins/HeapSentinel.ini" />
+        </files>
+      </pattern>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="profile" value="max-attribution" />
+        </dependencies>
+        <files>
+          <file source="fomod/profiles/max-attribution.ini" destination="SKSE/Plugins/HeapSentinel.ini" />
+        </files>
+      </pattern>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="profile" value="low-memory" />
+        </dependencies>
+        <files>
+          <file source="fomod/profiles/low-memory.ini" destination="SKSE/Plugins/HeapSentinel.ini" />
+        </files>
+      </pattern>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="profile" value="engine-only" />
+        </dependencies>
+        <files>
+          <file source="fomod/profiles/engine-only.ini" destination="SKSE/Plugins/HeapSentinel.ini" />
+        </files>
+      </pattern>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="profile" value="custom" />
+        </dependencies>
+        <files>
+          <file source="fomod/profiles/custom.ini" destination="SKSE/Plugins/HeapSentinel.ini" />
+        </files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>

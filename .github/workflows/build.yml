@@ -274,3 +274,100 @@ jobs:
           export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
           xmake run -P tests 2>&1 | tee sanitize.out
           grep -qE '0 failure\(s\)' sanitize.out || { echo "::error::the sanitized suite reported failures"; exit 1; }
+
+  # ===========================================================================
+  # FOMOD INSTALLER (feat/fomod-installer)
+  # ===========================================================================
+  # ONE self-contained job, APPENDED so a concurrent branch that also edits this
+  # file merges mechanically (if both append at EOF, expect a trivial rebase).
+  #
+  # It validates the FOMOD with tools/validate_fomod.py -- a real gate that can
+  # and has been seen to fail: a renamed ini key, a stale profile, or a
+  # <file source> that does not exist all turn this job red. On a tag it builds
+  # the installable zip and attaches it as the release asset. The loose files
+  # (SKSE/Plugins/HeapSentinel.dll + the flat archive) stay on the `HeapSentinel`
+  # artifact from the `build` job for manual install.
+  fomod:
+    name: FOMOD package + validation
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built DLL
+        uses: actions/download-artifact@v4
+        with:
+          name: HeapSentinel
+          path: artifact
+
+      - name: Locate the DLL and read the version
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          dll=$(find artifact -name HeapSentinel.dll | head -1)
+          [ -n "$dll" ] || { echo "::error::no HeapSentinel.dll in the downloaded artifact"; exit 1; }
+          test -s "$dll" || { echo "::error::the downloaded DLL is empty"; exit 1; }
+          version=$(grep -oP 'set_version\("\K[^"]+' xmake.lua)
+          [ -n "$version" ] || { echo "::error::could not read the version from xmake.lua"; exit 1; }
+          echo "dll=$dll" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "using $dll for HeapSentinel $version"
+          sha256sum "$dll"
+
+      - name: Install xmllint for FOMOD schema validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xmllint >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libxml2-utils
+          fi
+          xmllint --version
+
+      - name: Validate the FOMOD and build the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exit non-zero on any failure: stale generated files, an ini key the
+          # plugin does not parse, invalid XML, a missing <file source>, or a
+          # profile whose conditional-install flag resolves to the wrong ini.
+          python3 tools/validate_fomod.py \
+            --dll "${{ steps.vars.outputs.dll }}" \
+            --zip "HeapSentinel-${{ steps.vars.outputs.version }}-fomod.zip" \
+            --stage stage-fomod
+
+      - name: Assert the archive shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="HeapSentinel-${{ steps.vars.outputs.version }}-fomod.zip"
+          for f in fomod/ModuleConfig.xml fomod/info.xml SKSE/Plugins/HeapSentinel.dll; do
+            unzip -Z1 "$zip" | grep -qxF "$f" || { echo "::error::$f missing from $zip"; exit 1; }
+          done
+          unzip -Z1 "$zip" | grep -qE '^fomod/profiles/[^/]+\.ini$' || { echo "::error::no profile inis in $zip"; exit 1; }
+          echo "archive shape ok"
+          sha256sum "$zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HeapSentinel-FOMOD
+          path: "*-fomod.zip"
+
+      - name: Attach the FOMOD to a release when tagging
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*-fomod.zip"
+          body: |
+            HeapSentinel FOMOD for SKSE (Skyrim SE/AE, Address Library).
+
+            HeapSentinel is an SKSE plugin that retrofits a memory sentinel onto
+            the running game. It does NOT fix crashes: it tells you WHICH MOD
+            caused one. Install with Amethyst: Mods -> Install mod from file...,
+            then pick a memory/attribution profile in the wizard. The
+            recommended "Balanced" profile costs roughly 260 MiB of resident
+            memory; every profile states its own cost in the wizard.
+
+            Nothing leaves the machine. The loose SKSE/Plugins/HeapSentinel.dll
+            and the flat archive remain on the CI artifact for manual install.
