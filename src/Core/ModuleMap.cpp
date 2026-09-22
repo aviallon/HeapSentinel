@@ -162,6 +162,32 @@ namespace hs
 		return _modules.size();
 	}
 
+	std::uint64_t ModuleMap::ModlistHash() const
+	{
+		// FNV-1a, same constants as the hook-table prologue hash. The module names
+		// are gathered under the shared lock and hashed outside it.
+		std::vector<std::string> names;
+		{
+			std::shared_lock lock(_mutex);
+			names.reserve(_modules.size());
+			for (const auto& module : _modules) {
+				names.push_back(module.name);
+			}
+		}
+		std::sort(names.begin(), names.end());
+
+		std::uint64_t hash = 0xCBF29CE484222325ull;
+		for (const auto& name : names) {
+			for (const char c : name) {
+				hash ^= static_cast<std::uint8_t>(c);
+				hash *= 0x100000001B3ull;
+			}
+			hash ^= static_cast<std::uint8_t>('\n');
+			hash *= 0x100000001B3ull;
+		}
+		return hash;
+	}
+
 	bool IsPlausibleVTable(std::uintptr_t a_vtable)
 	{
 		if (a_vtable == 0 || (a_vtable & 0x7) != 0) {
