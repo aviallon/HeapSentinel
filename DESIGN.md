@@ -227,6 +227,11 @@ to hit a guard page.
 - **address classification** of the faulting or object address:
   `module+offset`, `guarded slot N (freed at T, allocated at T)`,
   `ledger-known (freed at T)`, `poison pattern`, `unknown/unmapped`;
+- **ledger provenance** of the fault address and the `rcx`/`rax`/`rdx`/`rbx`
+  registers (the object behind an indirect call is usually in `rcx`): whether
+  the block is live or freed, which allocator produced it (engine / Scaleform /
+  guarded pool), and the alloc and free stacks. This is what names the mod that
+  freed a stale `GFxResource` when the fault itself cannot;
 - the **pre-crash stack** captured at the hook (the culprit's stack, not the
   victim's);
 - **alloc stack** and **free stack** from the ledger/guard pool;

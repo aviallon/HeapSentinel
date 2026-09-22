@@ -42,6 +42,47 @@ namespace hs
 			}
 		}
 
+		// If a register (or the fault address) points at a block the shadow ledger
+		// knows, this is the attribution: which allocator produced it, whether it
+		// was already freed, and the alloc/free stacks. This is what turns "the
+		// vtable is heap" into "object X was freed by this stack".
+		[[nodiscard]] std::string DescribeLedgerProvenance(const char* a_name, std::uintptr_t a_value)
+		{
+			AllocationInfo info;
+			if (!ShadowLedger::Get().Find(a_value, info)) {
+				return {};
+			}
+
+			char header[128]{};
+			std::snprintf(header, sizeof(header), "\n  ledger: %s=0x%llX is a ", a_name, static_cast<unsigned long long>(a_value));
+
+			std::string result{ header };
+			result += (info.flags & kFlagFreed) ? "freed" : "live";
+			result += ' ';
+			if (info.flags & kFlagScaleform) {
+				result += "Scaleform";
+			} else if (info.flags & kFlagSampled) {
+				result += "guarded-pool";
+			} else {
+				result += "engine";
+			}
+			result += " block (size " + std::to_string(info.size) + ")";
+
+			if (info.allocSite) {
+				result += "\n    allocSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.allocSite));
+			}
+			if (info.freeSite) {
+				result += "\n    freeSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.freeSite));
+			}
+			if (const auto* alloc = ShadowLedger::Get().GetStack(info.allocStack)) {
+				result += "\n    alloc stack: " + FormatStack(*alloc);
+			}
+			if (const auto* freed = ShadowLedger::Get().GetStack(info.freeStack)) {
+				result += "\n    free  stack: " + FormatStack(*freed);
+			}
+			return result;
+		}
+
 		[[nodiscard]] std::string DescribeFault(EXCEPTION_POINTERS* a_info, std::uintptr_t a_faultAddr)
 		{
 			char buffer[1024]{};
@@ -61,6 +102,16 @@ namespace hs
 				static_cast<unsigned long long>(context->Rbx));
 
 			std::string result{ buffer };
+
+			// The registers most likely to hold the object behind an indirect call
+			// (this=rcx, vtable=rax) plus the fault address itself. Only registers
+			// the ledger actually knows produce a line, so an ordinary crash is
+			// unchanged.
+			result += DescribeLedgerProvenance("rcx", static_cast<std::uintptr_t>(context->Rcx));
+			result += DescribeLedgerProvenance("rax", static_cast<std::uintptr_t>(context->Rax));
+			result += DescribeLedgerProvenance("rdx", static_cast<std::uintptr_t>(context->Rdx));
+			result += DescribeLedgerProvenance("rbx", static_cast<std::uintptr_t>(context->Rbx));
+			result += DescribeLedgerProvenance("fault", a_faultAddr);
 
 			Stack stack;
 			ScanStack(static_cast<std::uintptr_t>(context->Rsp), stack);
