@@ -60,29 +60,37 @@ namespace hs
 		std::sort(modules.begin(), modules.end(), [](const ModuleRange& a, const ModuleRange& b) { return a.base < b.base; });
 		std::sort(exec.begin(), exec.end(), [](const ExecRange& a, const ExecRange& b) { return a.start < b.start; });
 
-		// Diagnostics: a zero-size or overlapping range breaks the binary search
+		// Diagnostics. A zero-size or overlapping range breaks the binary search
 		// and would make valid vtables look unmapped, so report it loudly.
 		std::size_t zeroSize = 0;
 		std::size_t overlaps = 0;
-		for (std::size_t i = 0; i < modules.size(); ++i) {
-			if (modules[i].size == 0) {
-				++zeroSize;
-			}
-			if (i != 0 && modules[i].base < modules[i - 1].base + modules[i - 1].size) {
-				++overlaps;
-			}
-		}
-
 		std::size_t failures = 0;
-		for (const auto& mod : modules) {
-			if (mod.size == 0) {
-				continue;
-			}
-			if (!std::binary_search(modules.begin(), modules.end(), mod.base,
-					[&](const ModuleRange& a, std::uintptr_t a_value) { return a.base < a_value; }) &&
-				!std::binary_search(modules.begin(), modules.end(), mod.base,
-					[&](std::uintptr_t a_value, const ModuleRange& a) { return a_value < a.base; })) {
-				++failures;
+		{
+			const auto lookup = [&modules](std::uintptr_t a_addr) -> const ModuleRange* {
+				const auto it = std::upper_bound(modules.begin(), modules.end(), a_addr,
+					[](std::uintptr_t a_value, const ModuleRange& a_range) { return a_value < a_range.base; });
+				if (it == modules.begin()) {
+					return nullptr;
+				}
+				const auto& candidate = *(it - 1);
+				return a_addr < candidate.base + candidate.size ? &candidate : nullptr;
+			};
+
+			for (std::size_t i = 0; i < modules.size(); ++i) {
+				if (modules[i].size == 0) {
+					++zeroSize;
+					continue;
+				}
+				if (i != 0 && modules[i].base < modules[i - 1].base + modules[i - 1].size) {
+					++overlaps;
+				}
+				// Tolerant of duplicate entries: what matters is that a lookup at
+				// the module's first and last byte lands on the same base.
+				const auto* first = lookup(modules[i].base);
+				const auto* last = lookup(modules[i].base + modules[i].size - 1);
+				if (!first || first->base != modules[i].base || !last || last->base != modules[i].base) {
+					++failures;
+				}
 			}
 		}
 
