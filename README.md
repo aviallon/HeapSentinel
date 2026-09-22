@@ -42,9 +42,14 @@ screenshot and a freeze.
 
 ## Status
 
-**v0.1 — scaffold. It builds in CI; it has not yet been verified in game.**
-The hooks are installed behind config flags so an unverified build is inert
-until you enable it. See `DESIGN.md` §11 for the roadmap.
+**v0.4 — committed hook-target verification.** Before installing each hook the
+plugin checks the running binary's identity, the Address Library id, the vtable
+slot for virtual targets and a hash of the function's first bytes against a
+table committed per exact game build (`hooks/`); a mismatch refuses that hook and
+reports `DEGRADED` instead of patching an address it cannot name. The
+verification logic and the committed table are unit-tested off-game and checked
+in CI; the plugin itself is still **not** verified in game. See `DESIGN.md` §3.3
+and §11 for the roadmap.
 
 ## Build
 
@@ -64,9 +69,11 @@ Dependencies are pinned as git submodules:
 - **MinHook** v1.3.4 — function-entry detours. The SKSE trampoline cannot
   install a prologue hook with a call-the-original trampoline.
 
-Portability comes from CommonLibSSE-NG: every engine target in
-`src/Hooks/Hooks.cpp` is a `REL::RelocationID(se, ae)` pair, so SE/AE/VR
-selection is the library's job and there are no hard-coded offsets.
+Portability comes from CommonLibSSE-NG: every engine target is a
+`REL::RelocationID(se, ae)` pair, so SE/AE/VR selection is the library's job and
+there are no hard-coded offsets. Which targets exist, and the ids, live in one
+place: `src/Hooks/HookTargets.def` (an X-macro list that also drives the
+committed-table completeness check in CI).
 
 ## Install
 
@@ -94,6 +101,14 @@ src/
     Report.{h,cpp}        classification, loud logging, screenshot, freeze
   Hooks/
     Hooks.{h,cpp}         MinHook install + MemoryManager / GRefCountImpl thunks
+    HookTargets.def       THE canonical list of hook targets (ids, kind, vtable slot)
+    HookTargets.h         X-macro expansion -> enum + metadata
+    HookTable.{h,cpp}     strict parser for the committed table
+    HookVerifier.{h,cpp}  identity + id + vtable slot + prologue-hash check
+    HookTableData.gen.h   GENERATED: the committed table embedded in the DLL
+  Core/Health.{h,cpp}     GREEN / DEGRADED / OFF, with reasons
+hooks/                    committed per-build verification tables (see hooks/README.md)
+tools/                    gen-hooktable.py, check-hooktable.py (CI gate)
 config/HeapSentinel.ini   documented defaults
 ```
 

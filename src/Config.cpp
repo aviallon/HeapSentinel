@@ -64,6 +64,8 @@ namespace hs
 
 		enabled = ReadBool("General", "bEnabled", enabled, ini);
 
+		verifyTargets = ReadBool("Hooks", "bVerifyTargets", verifyTargets, ini);
+
 		ledgerEnabled = ReadBool("Ledger", "bEnabled", ledgerEnabled, ini);
 		ledgerCapacity = ReadUInt("Ledger", "uCapacity", static_cast<std::uint32_t>(ledgerCapacity), ini);
 		ledgerShards = ReadUInt("Ledger", "uShards", static_cast<std::uint32_t>(ledgerShards), ini);
@@ -95,8 +97,8 @@ namespace hs
 		reportSymbolHint = ReadBool("Reporting", "bSymbolHint", reportSymbolHint, ini);
 		maxReportsPerSecond = ReadUInt("Reporting", "uMaxReportsPerSecond", static_cast<std::uint32_t>(maxReportsPerSecond), ini);
 
-		logger::info("config: enabled={} ledger={} guardPool={} (1/{}) refCountGuard={} (failSafe={}) scaleformHeap={} (stacks={}, poison={}, {} blocks/{} bytes) weaklib={}",
-			enabled, ledgerEnabled, guardPoolEnabled, guardPoolSampleRate, refCountGuardEnabled, refCountGuardFailSafe,
+		logger::info("config: enabled={} verifyTargets={} ledger={} guardPool={} (1/{}) refCountGuard={} (failSafe={}) scaleformHeap={} (stacks={}, poison={}, {} blocks/{} bytes) weaklib={}",
+			enabled, verifyTargets, ledgerEnabled, guardPoolEnabled, guardPoolSampleRate, refCountGuardEnabled, refCountGuardFailSafe,
 			scaleformHeapEnabled, scaleformCaptureStacks, scaleformPoisonEnabled, scaleformPoisonMaxBlocks,
 			scaleformPoisonMaxBytes, weakLibHooksEnabled);
 	}

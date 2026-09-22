@@ -98,6 +98,15 @@ jobs:
           done
           echo "the DLL contains the plugin name, config sections and report kinds"
 
+          # Hook-target verification must actually be compiled in: the embedded
+          # table, the mismatch refusal and the degraded health state are the
+          # difference between "we hooked an address" and "we hooked a function
+          # whose bytes we verified for this exact build".
+          for needle in "hook target mismatch" "not the build this revision was verified against" "heapsentinel.hooktable/1" "target verified" "vtable slot does not hold the expected function" "bVerifyTargets" "GMemoryHeapPT::AllocAutoHeap(size,align)"; do
+            strings -n 5 "$dll" | grep -qF "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
+          done
+          echo "the DLL contains the embedded hook table and the verification strings"
+
           sha256sum "$dll"
 
       - name: Package the mod archive
@@ -111,25 +120,25 @@ jobs:
           cp README.md RESEARCH.md DESIGN.md out/
           # Data at the archive root so Amethyst / MO2 / Vortex install it as a
           # mod with no manual placement.
-          ( cd out && 7z a -bd -y ../HeapSentinel-0.3.0.zip . >/dev/null )
-          ls -l HeapSentinel-0.3.0.zip
-          7z l HeapSentinel-0.3.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
-          7z l HeapSentinel-0.3.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
-          sha256sum HeapSentinel-0.3.0.zip
+          ( cd out && 7z a -bd -y ../HeapSentinel-0.4.0.zip . >/dev/null )
+          ls -l HeapSentinel-0.4.0.zip
+          7z l HeapSentinel-0.4.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
+          7z l HeapSentinel-0.4.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
+          sha256sum HeapSentinel-0.4.0.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: HeapSentinel
           path: |
             **/HeapSentinel.dll
-            HeapSentinel-0.3.0.zip
+            HeapSentinel-0.4.0.zip
 
       - name: Attach to a release when tagging
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            HeapSentinel-0.3.0.zip
+            HeapSentinel-0.4.0.zip
             **/HeapSentinel.dll
           body: |
             HeapSentinel - an SKSE plugin that retrofits a memory sentinel onto
@@ -137,6 +146,24 @@ jobs:
             engine's MemoryManager, a GWP-ASan-style sampled guarded pool, and a
             GRefCountImpl::Release vtable guard that can fail safe instead of
             crashing. See RESEARCH.md and DESIGN.md.
+
+  # The committed hook-target verification table. Needs no game binary and no
+  # third-party Address Library file: it checks the committed table against the
+  # canonical target list in the source, against the committed id->offset slice,
+  # and against the embedded header the DLL ships. Adding a hook without adding
+  # a verified signature fails here, by design.
+  hook-table:
+    name: hook table (completeness/consistency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the committed hook table
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 tools/check-hooktable.py
 
   # The shared-memory IPC layer (src/Ipc) is plain C++ with no Windows
   # dependency, so it is built and RUN on both platforms. That is the point:

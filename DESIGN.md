@@ -145,6 +145,58 @@ If all hold → call the original. If not:
 The check is exactly `IsPlausibleVTable()` in `Core/ModuleMap.h`. For the
 observed crash it fails at step 2 (`0x141A2E20C` is not 8-byte aligned).
 
+### 3.3 Hook target verification (committed, per exact game build)
+
+Installing a detour at "whatever the Address Library resolves" is an act of
+faith. v0.4 replaces it with a committed, content-verified table plus a runtime
+check, so the claim becomes "we hooked a function whose bytes we verified for
+this exact binary".
+
+- **The table** is `hooks/skyrimse-<version>-<sha256-prefix>.json`, one file per
+exact game build. Per target it records the AE Address Library id, the
+`meh321/AddressLibraryDatabase` name (provenance recorded, not vendored), the
+RVA, the `.pdata` extent and slot length, and a 64-bit **FNV-1a hash of the
+first N bytes** (N = 32, shortened only when the `.pdata`/slot bound requires
+it). **No byte of `SkyrimSE.exe` is committed**: a hash verifies identity
+exactly as well as a verbatim prologue would, and a prologue is Bethesda's
+copyrighted code. `hooks/README.md` records the licensing decision and the name
+database's provenance.
+- **Virtual targets are first-class**: `{vtable id, vtable name, vtable RVA,
+slot, expected target id}`. This is not hypothetical - reading the engine's own
+`??_7GMemoryHeapPT@@6B@` (AE id 242891) is what caught that CommonLibSSE-NG's
+header comment order for `GMemoryHeap` does not match the engine's real vtable
+order. `MemoryManager` and `GRefCountImpl` are **not** polymorphic in this build
+(verified: no vtable in the image contains their function addresses), so they
+are plain RVA targets.
+- **The source of truth for the target list** is `src/Hooks/HookTargets.def`, an
+X-macro list included by `src/Hooks/HookTargets.h` (the enum + metadata the
+installer uses) and parsed by `tools/check-hooktable.py`, which fails CI when a
+target has no verified entry. Adding a hook without adding a signature is a
+build error, not an act of faith.
+- **The table is embedded in the DLL** (`HookTableData.gen.h`, generated from the
+committed JSON and checked byte-for-byte in CI), so a DLL-only install still has
+the verified bytes. There is deliberately no on-disk table that could be missing
+or edited out from under the check.
+- **Runtime check, before installing each hook**: the cheap identity (exe size,
+PE `TimeDateStamp`, `SizeOfImage`) must match the table's; then the id must
+resolve to the recorded RVA; for a virtual target the vtable slot must hold the
+expected function; then the N-byte prologue hash must match. On any mismatch
+that hook is **refused** and the sentinel reports **DEGRADED**, naming the target
+and the reason. The game keeps running; nothing is patched that we cannot name.
+- **Generation** is `tools/gen-hooktable.py <SkyrimSE.exe> <versionlib.bin>
+<skyrimae.rename>`. It also writes the id->offset slice
+(`hooks/addresslibrary-<version>.json`) that CI cross-checks every record's RVA
+against, so a hand edit to an RVA is caught without the third-party Address
+Library file. It **refuses to generate** when a vtable slot does not hold the
+target, so a layout change must be investigated rather than rubber-stamped.
+
+**What it does not do.** It verifies *identity*, not *semantics*: a hook can sit
+at the right address with the right prologue and still be wrong for our purpose
+(the `GMemoryHeapPT` argument count had to come from disassembly for exactly
+this reason, and no signature check would have caught it). It is AE-only,
+matching the existing `RelocationID(0, ae)` convention; the SE ids in
+`HookTargets.def` are recorded, not verified. It says nothing about mod DLLs.
+
 ## 4. Shadow ledger
 
 The ledger maps `ptr → AllocationInfo` and is **lock-free by construction**
@@ -398,6 +450,9 @@ runs before Crash Logger SSE) that:
 [General]
 bEnabled=1
 
+[Hooks]
+bVerifyTargets=1      ; refuse a hook whose bytes are not the verified ones
+
 [Ledger]
 bEnabled=1
 uCapacity=4194304      ; 4M entries (~112 bytes each, plus the stack ring)
@@ -484,10 +539,18 @@ a watchdog thread; fail open when the ledger or quarantine is unavailable.
   poison-on-free quarantine (64 MiB default); GFxResourceWeakLib context hooks;
   freed-vs-stray-write verdict. `AllocSysDirect`/`FreeSysDirect` remain
   unhooked (unmeasured share).
-- **v0.4**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
+- **v0.4**: committed, per-exact-build hook target verification. A table
+  (`hooks/skyrimse-<version>-<hash>.json`) recording each target's Address
+  Library id, RVA, `.pdata` extent and a hash of its first bytes - plus
+  `{vtable id, slot, expected target}` for virtual targets - verified at load
+  time before each hook is installed; a mismatch refuses that hook and reports
+  DEGRADED. `tools/gen-hooktable.py` regenerates it; `tools/check-hooktable.py`
+  makes "a hook with no verified signature" a CI failure. (Semantics - argument
+  counts, which vtable slot means what - still comes from disassembly.)
+- **v0.5**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
   (RESEARCH §7.1) instead of maintaining a parallel stack table where possible;
   payload poison + write-after-free check on `ScrapHeap` blocks.
-- **v0.5**: a "bisect" mode that narrows sampling to one size range or one
+- **v0.6**: a "bisect" mode that narrows sampling to one size range or one
   allocation site, for reproducing a specific bug.
 
 ## 12. Testing and sanitizers
@@ -520,9 +583,24 @@ non-atomically by design, so TSan would flag every one as a race and drown the
 real signal. Enabling it later needs suppressions/annotations and is a separate
 deliberate decision - do not "helpfully" turn it on.
 
+**Hook target verification is checked without the game.** CI's `hook-table` job
+needs no game binary and no third-party Address Library file: it checks the
+committed table against the canonical target list in the source (completeness
+both ways), against the committed id->offset slice (consistency), for internal
+invariants (no duplicate RVAs, unique vtable slots per vtable id, distinct
+prologue signatures, no overlapping prologue windows, every field present), and
+against the embedded header the DLL ships (byte-for-byte regeneration). The C++
+parser and verifier are unit-tested off-game on both platforms and under
+ASan/UBSan with synthetic bytes: match, single-byte mismatch, corrupted recorded
+hash, truncated read, unknown id, missing entry, moved vtable slot. The
+completeness check was proven able to fail with a temporary target added to the
+source and no table entry (see the report).
+
 **Reach of the tests, stated honestly.** The ledger, bloom, quarantine,
-free-ring and verdict logic are unit-tested off-game. The Scaleform **hook
-wiring** and the poison path are NOT unit-testable here: there is no game to
-hook. They are verified only by "the DLL contains these strings" plus CI
-compiling the Windows plugin and running the off-game suite; the in-game
+free-ring, verdict and hook-table logic are unit-tested off-game. The Scaleform
+**hook wiring**, the poison path and the **runtime** (Windows)
+`REL::RelocationID`-backed resolver are NOT unit-testable here: there is no game
+to hook. The committed table itself was verified against the real
+`SkyrimSE.exe` bytes off-game with the real verifier (14/14 targets), but the
+plugin's own load-time path has only been compiled and string-checked. In-game
 behaviour is unobserved.

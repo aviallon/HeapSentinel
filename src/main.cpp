@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "Core/GuardedPool.h"
+#include "Core/Health.h"
 #include "Core/ModuleMap.h"
 #include "Core/PoisonQuarantine.h"
 #include "Core/Report.h"
@@ -48,7 +49,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	hs::SetupLog();
 
-	logger::info("HeapSentinel v0.3.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
+	logger::info("HeapSentinel v0.4.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
 
 	if (auto* messaging = SKSE::GetMessagingInterface()) {
 		messaging->RegisterListener("SKSE", OnMessage);
@@ -57,6 +58,8 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	hs::Config::Get().Load();
 	if (!hs::Config::Get().enabled) {
 		logger::info("disabled in HeapSentinel.ini - installing nothing");
+		hs::Health::Off("disabled in HeapSentinel.ini");
+		logger::info("health: {}", hs::Health::Line());
 		return true;
 	}
 
@@ -94,6 +97,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 				blocks, reinterpret_cast<std::uintptr_t>(base), bytes / (1u << 20));
 		} else {
 			logger::warn("poison region reserve failed ({}); poison-on-free will fail open", ::GetLastError());
+			hs::Health::Degrade("poison region reserve failed: poison-on-free is off, the verdict is not deterministic");
 		}
 	}
 
@@ -138,6 +142,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 				hs::ShadowLedger::Get().BloomBytes() / 1024u,
 				hs::ScaleformFreeRing::Get().BloomBytes() / 1024u,
 				hs::ShadowLedger::Get().BloomSwaps() + hs::ScaleformFreeRing::Get().BloomSwaps());
+			logger::info("stats: health {}", hs::Health::Line());
 
 			if (!warnedSaturated && (failures > 0 || drops > 0)) {
 				logger::warn("ledger lossy: {} insert failures, {} writer drops; raise [Ledger] uCapacity or accept the gap", failures, drops);
@@ -146,6 +151,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 		}
 	}).detach();
 
+	logger::info("health: {}", hs::Health::Line());
 	logger::info("...ready");
 	return true;
 }

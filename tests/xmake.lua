@@ -8,7 +8,7 @@
 -- pulling in the plugin's precompiled header (Windows.h + CommonLibSSE-NG).
 
 set_project("HeapSentinelTests")
-set_version("0.3.0")
+set_version("0.4.0")
 set_languages("c++23")
 set_license("MIT")
 
@@ -45,6 +45,13 @@ target("heapsentinel-tests")
     add_files("../src/Core/PoisonQuarantine.cpp")
     add_files("../src/Core/WeakLibEvents.cpp")
     add_files("../src/Core/Verdict.cpp")
+    -- The hook-target verification table parser + verifier and the plugin health
+    -- state are plain C++ too, so the committed table is parsed and the verifier
+    -- is exercised with synthetic bytes off-game on both platforms (and under
+    -- ASan/UBSan). No game binary is involved.
+    add_files("../src/Hooks/HookTable.cpp")
+    add_files("../src/Hooks/HookVerifier.cpp")
+    add_files("../src/Core/Health.cpp")
     add_includedirs("..", "../src", ".")
 
     if is_plat("linux") or is_plat("macosx") then

@@ -3,6 +3,7 @@
 #include "Hooks/Hooks.h"
 
 #include "Core/GuardedPool.h"
+#include "Core/Health.h"
 #include "Core/ModuleMap.h"
 #include "Core/PoisonQuarantine.h"
 #include "Core/Report.h"
@@ -11,11 +12,19 @@
 #include "Core/StackCapture.h"
 #include "Core/WeakLibEvents.h"
 #include "Config.h"
+#include "Hooks/HookTable.h"
+#include "Hooks/HookTableData.gen.h"
+#include "Hooks/HookTargets.h"
+#include "Hooks/HookVerifier.h"
 
 #include <MinHook.h>
 #include <intrin.h>
 
+#include <array>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace hs
 {
@@ -643,23 +652,209 @@ namespace hs
 			o_WlUnpin(a_weakLib, a_resource);
 		}
 
-		template <class T>
-		bool InstallOne(const char* a_name, std::uint64_t a_se, std::uint64_t a_ae, void* a_detour, T* a_original)
+		// --- committed-table verification ---------------------------------
+		//
+		// Every hook target is named in Hooks/HookTargets.def, which is the only
+		// place ids live. Before any detour is created we resolve each target
+		// through the Address Library, check the vtable slot for virtual targets,
+		// and hash the bytes at the target against the committed table for this
+		// exact build. A mismatch REFUSES that hook and marks the plugin DEGRADED:
+		// the game keeps running, but nothing unverifiable is ever patched.
+
+		[[nodiscard]] std::uint64_t ModuleImageSize()
 		{
-			const REL::RelocationID id{ a_se, a_ae };
-			const auto             address = id.address();
-			if (!address) {
-				logger::error("hook {}: address library returned null", a_name);
+			const auto  base = REL::Module::get().base();
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			return nt->OptionalHeader.SizeOfImage;
+		}
+
+		[[nodiscard]] ModuleIdentity ReadModuleIdentity()
+		{
+			ModuleIdentity identity;
+			identity.sizeOfImage = ModuleImageSize();
+
+			const auto  base = REL::Module::get().base();
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			identity.timeDateStamp = nt->FileHeader.TimeDateStamp;
+
+			char path[MAX_PATH]{};
+			if (::GetModuleFileNameA(nullptr, path, MAX_PATH) != 0) {
+				WIN32_FILE_ATTRIBUTE_DATA data{};
+				if (::GetFileAttributesExA(path, GetFileExInfoStandard, &data)) {
+					identity.size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+				}
+			}
+			return identity;
+		}
+
+		// A bad pointer must never turn the verifier into the second fault.
+		[[nodiscard]] bool SafeRead(const void* a_src, std::uint8_t* a_out, std::size_t a_size)
+		{
+			__try {
+				std::memcpy(a_out, a_src, a_size);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		class EngineResolver final : public TargetResolver
+		{
+		public:
+			[[nodiscard]] std::uint64_t Base() const override { return REL::Module::get().base(); }
+
+			[[nodiscard]] bool ResolveId(std::uint64_t a_id, std::uint64_t& a_rvaOut) const override
+			{
+				const auto address = REL::RelocationID(0, a_id).address();
+				if (address == 0 || address < Base()) {
+					return false;
+				}
+				a_rvaOut = address - Base();
+				return true;
+			}
+
+			[[nodiscard]] bool ReadBytes(std::uint64_t a_rva, std::uint8_t* a_out, std::size_t a_size) const override
+			{
+				const auto imageSize = ModuleImageSize();
+				if (a_size == 0 || a_rva >= imageSize || a_size > imageSize - a_rva) {
+					return false;
+				}
+				return SafeRead(reinterpret_cast<const void*>(Base() + a_rva), a_out, a_size);
+			}
+		};
+
+		struct TargetStatus
+		{
+			const HookTableRecord* record = nullptr;
+			TargetCheck            check;
+			std::uint64_t          address = 0;  // VA the detour will be created at
+			bool                   installable = false;
+		};
+
+		std::array<TargetStatus, kHookTargetCount> g_targetStatus{};
+		std::size_t                                g_installed = 0;
+
+		// The tables travel inside the DLL (HookTableData.gen.h), so a DLL-only
+		// install still has the verified bytes. There is deliberately no on-disk
+		// table that could be missing or edited out from under the check; the
+		// committed JSON stays the reviewable source of truth and CI proves the
+		// embedded copy is byte-identical to it.
+		[[nodiscard]] const HookTable* SelectHookTable(const ModuleIdentity& a_actual)
+		{
+			static std::vector<HookTable> tables;
+			static bool                   populated = false;
+
+			if (!populated) {
+				populated = true;
+				for (std::size_t i = 0; i < kEmbeddedHookTableCount; ++i) {
+					HookTable   table;
+					std::string error;
+					if (!ParseHookTable(kEmbeddedHookTables[i].json, table, error)) {
+						logger::error("hook table {}: {}", kEmbeddedHookTables[i].source, error);
+						Health::Degrade(std::string("hook table ") + kEmbeddedHookTables[i].source +
+										" failed to parse: " + error);
+						continue;
+					}
+					table.source = kEmbeddedHookTables[i].source;
+					tables.push_back(std::move(table));
+				}
+			}
+
+			for (const auto& table : tables) {
+				if (IdentityMatches(table.identity, a_actual)) {
+					logger::info("hook table {}: {} {} (sha256 {}...) identity matches the running binary",
+						table.source, table.identity.module, table.identity.version,
+						table.identity.sha256.substr(0, 16));
+					return &table;
+				}
+			}
+			return nullptr;
+		}
+
+		void VerifyAllTargets(const HookTable* a_table, const TargetResolver& a_resolver)
+		{
+			for (std::size_t i = 0; i < kHookTargetCount; ++i) {
+				const auto& target = kHookTargets[i];
+				auto&       status = g_targetStatus[i];
+
+				if (a_table == nullptr) {
+					continue;  // no table matched: already reported and DEGRADED
+				}
+
+				const auto* record = a_table->Find(target.name);
+				if (record == nullptr) {
+					status.check.verdict = TargetVerdict::kNoRecord;
+					logger::error("hook {}: no entry in {} - hook disabled", target.name, a_table->source);
+					Health::Degrade(std::string("hook ") + target.name + " has no verification entry");
+					continue;
+				}
+
+				status.record = record;
+				status.check = VerifyHookTarget(*record, a_resolver);
+				if (!status.check.Verified()) {
+					logger::error("hook {}: REFUSED - {} (rva 0x{:X}; expected fnv1a64 0x{:016X}, got 0x{:016X}); hook disabled",
+						target.name, TargetVerdictName(status.check.verdict), status.check.rva,
+						status.check.expectedHash, status.check.actualHash);
+					Health::Degrade(std::string("hook ") + target.name + " not verified: " +
+									TargetVerdictName(status.check.verdict));
+					continue;
+				}
+
+				status.address = a_resolver.Base() + status.check.rva;
+				status.installable = true;
+				if (record->kind == HookKind::kVtable) {
+					logger::info("hook {}: target verified (vtable {} slot {:#x} -> rva 0x{:X}, {} bytes, fnv1a64 0x{:016X})",
+						target.name, record->vtable.name, record->vtable.slot, status.check.rva,
+						record->prologueLength, record->prologueHash);
+				} else {
+					logger::info("hook {}: target verified (rva 0x{:X}, {} bytes, fnv1a64 0x{:016X})",
+						target.name, status.check.rva, record->prologueLength, record->prologueHash);
+				}
+			}
+		}
+
+		// Escape hatch: resolve every target but verify nothing. Loud, and it
+		// leaves the sentinel DEGRADED, so a run with it off cannot look healthy.
+		void ResolveAllTargetsUnverified(const TargetResolver& a_resolver)
+		{
+			logger::warn("hook target verification is DISABLED ([Hooks] bVerifyTargets=0): hooks are installed at "
+						 "whatever address the Address Library resolves, with no check that it is the verified function");
+			Health::Degrade("hook target verification disabled by [Hooks] bVerifyTargets=0");
+			for (std::size_t i = 0; i < kHookTargetCount; ++i) {
+				const auto&   target = kHookTargets[i];
+				auto&         status = g_targetStatus[i];
+				std::uint64_t rva = 0;
+				if (!a_resolver.ResolveId(target.aeId, rva)) {
+					logger::error("hook {}: address library returned null (AE id {})", target.name, target.aeId);
+					Health::Degrade(std::string("hook ") + target.name + " unresolved (AE id " +
+									std::to_string(target.aeId) + ")");
+					continue;
+				}
+				status.address = a_resolver.Base() + rva;
+				status.installable = true;
+			}
+		}
+
+		template <class T>
+		bool InstallOne(HookTargetId a_id, void* a_detour, T* a_original)
+		{
+			const auto& target = GetHookTarget(a_id);
+			const auto& status = g_targetStatus[static_cast<std::size_t>(a_id)];
+			if (!status.installable) {
+				return false;  // the reason was already logged during verification
+			}
+
+			const auto hookStatus = MH_CreateHook(reinterpret_cast<LPVOID>(status.address), a_detour,
+				reinterpret_cast<LPVOID*>(a_original));
+			if (hookStatus != MH_OK) {
+				logger::error("hook {}: MH_CreateHook failed ({})", target.name, MH_StatusToString(hookStatus));
+				Health::Degrade(std::string("hook ") + target.name + " MH_CreateHook failed");
 				return false;
 			}
 
-			const auto status = MH_CreateHook(reinterpret_cast<LPVOID>(address), a_detour, reinterpret_cast<LPVOID*>(a_original));
-			if (status != MH_OK) {
-				logger::error("hook {}: MH_CreateHook failed ({})", a_name, MH_StatusToString(status));
-				return false;
-			}
-
-			logger::info("hook {}: 0x{:X}", a_name, address);
+			++g_installed;
 			return true;
 		}
 	}
@@ -669,51 +864,87 @@ namespace hs
 		const auto status = MH_Initialize();
 		if (status != MH_OK) {
 			logger::error("MH_Initialize failed ({})", MH_StatusToString(status));
+			Health::Degrade("MH_Initialize failed");
 			return false;
 		}
 
 		const auto& config = Config::Get();
 
-		// MemoryManager: 66859/68115 Allocate, 66861/68117 Deallocate, 66860/68116 Reallocate.
-		InstallOne("MemoryManager::Allocate", 66859, 68115, reinterpret_cast<void*>(&hk_Allocate), &o_Allocate);
-		InstallOne("MemoryManager::Deallocate", 66861, 68117, reinterpret_cast<void*>(&hk_Deallocate), &o_Deallocate);
-		InstallOne("MemoryManager::Reallocate", 66860, 68116, reinterpret_cast<void*>(&hk_Reallocate), &o_Reallocate);
+		// The committed table is AE-only, matching the existing convention: the SE
+		// ids recorded in HookTargets.def are provenance, not a verified claim.
+		if (REL::Module::GetRuntime() != REL::Module::Runtime::AE) {
+			logger::error("hook target verification is AE-only (the committed table covers 1.7.104.0); the running "
+						  "runtime is not AE - ALL hooks disabled");
+			Health::Degrade("hook target verification is AE-only and this is not an AE runtime");
+		} else {
+			EngineResolver resolver;
+			const auto     actual = ReadModuleIdentity();
+			logger::info("module identity: size {} timestamp 0x{:X} sizeofimage 0x{:X}",
+				actual.size, actual.timeDateStamp, actual.sizeOfImage);
 
-		// GRefCountImpl::Release (82197 on AE).
+			if (!config.verifyTargets) {
+				ResolveAllTargetsUnverified(resolver);
+			} else {
+				const auto* table = SelectHookTable(actual);
+				if (table == nullptr) {
+					logger::error("hook target mismatch: this SkyrimSE.exe is not the build this revision was verified "
+								  "against (running size {} timestamp 0x{:X} sizeofimage 0x{:X}); ALL hooks disabled. "
+								  "Regenerate hooks/ with tools/gen-hooktable.py for this build.",
+						actual.size, actual.timeDateStamp, actual.sizeOfImage);
+					Health::Degrade("running SkyrimSE.exe is not the verified build - all hooks disabled");
+				}
+				VerifyAllTargets(table, resolver);
+			}
+		}
+
+		// MemoryManager: the engine allocation facade (not virtual).
+		InstallOne(HookTargetId::kMemoryManagerAllocate, reinterpret_cast<void*>(&hk_Allocate), &o_Allocate);
+		InstallOne(HookTargetId::kMemoryManagerDeallocate, reinterpret_cast<void*>(&hk_Deallocate), &o_Deallocate);
+		InstallOne(HookTargetId::kMemoryManagerReallocate, reinterpret_cast<void*>(&hk_Reallocate), &o_Reallocate);
+
 		if (config.refCountGuardEnabled) {
-			InstallOne("GRefCountImpl::Release", 0, 82197, reinterpret_cast<void*>(&hk_Release), &o_Release);
+			InstallOne(HookTargetId::kGRefCountImplRelease, reinterpret_cast<void*>(&hk_Release), &o_Release);
 		}
 
-		// Scaleform/GFx heap (GMemoryHeapPT). AE Address Library ids only; the
-		// SE ids are not verified here, so (like the Release hook above) this is
-		// AE-only. ids 84498/84499/84501/84502/84520/84540, verified against
-		// versionlib-1-7-104-0.bin and the engine's own ??_7GMemoryHeapPT vtable.
+		// Scaleform/GFx heap (GMemoryHeapPT), all six reached through the engine's
+		// own ??_7GMemoryHeapPT vtable.
 		if (config.scaleformHeapEnabled) {
-			InstallOne("GMemoryHeapPT::Alloc(size,align)", 0, 84498, reinterpret_cast<void*>(&hk_SfAlloc), &o_SfAlloc);
-			InstallOne("GMemoryHeapPT::Alloc(size)", 0, 84499, reinterpret_cast<void*>(&hk_SfAlloc1), &o_SfAlloc1);
-			InstallOne("GMemoryHeapPT::AllocAutoHeap(size,align)", 0, 84501, reinterpret_cast<void*>(&hk_SfAllocAuto), &o_SfAllocAuto);
-			InstallOne("GMemoryHeapPT::AllocAutoHeap(size)", 0, 84502, reinterpret_cast<void*>(&hk_SfAllocAuto1), &o_SfAllocAuto1);
-			InstallOne("GMemoryHeapPT::Realloc", 0, 84540, reinterpret_cast<void*>(&hk_SfRealloc), &o_SfRealloc);
-			InstallOne("GMemoryHeapPT::Free", 0, 84520, reinterpret_cast<void*>(&hk_SfFree), &o_SfFree);
+			InstallOne(HookTargetId::kSfAlloc, reinterpret_cast<void*>(&hk_SfAlloc), &o_SfAlloc);
+			InstallOne(HookTargetId::kSfAlloc1, reinterpret_cast<void*>(&hk_SfAlloc1), &o_SfAlloc1);
+			InstallOne(HookTargetId::kSfAllocAuto, reinterpret_cast<void*>(&hk_SfAllocAuto), &o_SfAllocAuto);
+			InstallOne(HookTargetId::kSfAllocAuto1, reinterpret_cast<void*>(&hk_SfAllocAuto1), &o_SfAllocAuto1);
+			InstallOne(HookTargetId::kSfRealloc, reinterpret_cast<void*>(&hk_SfRealloc), &o_SfRealloc);
+			InstallOne(HookTargetId::kSfFree, reinterpret_cast<void*>(&hk_SfFree), &o_SfFree);
 		}
 
-		// GFxResourceWeakLib context. These ids are re-derived (versionlib +
-		// disassembly); the prologues begin with a 5-byte mov, so MinHook's
-		// 5-byte prologue copy does not relocate the later RIP-relative calls.
+		// GFxResourceWeakLib context.
 		if (config.weakLibHooksEnabled) {
-			InstallOne("GFxResource::AddRef", 0, 82783, reinterpret_cast<void*>(&hk_WlAddRef), &o_WlAddRef);
-			InstallOne("GFxResourceWeakLib::PinResource", 0, 82796, reinterpret_cast<void*>(&hk_WlPin), &o_WlPin);
-			InstallOne("GFxResourceWeakLib::RemoveResourceOnRelease", 0, 82798, reinterpret_cast<void*>(&hk_WlRemove), &o_WlRemove);
-			InstallOne("GFxResourceWeakLib::UnpinResource", 0, 82802, reinterpret_cast<void*>(&hk_WlUnpin), &o_WlUnpin);
+			InstallOne(HookTargetId::kWlAddRef, reinterpret_cast<void*>(&hk_WlAddRef), &o_WlAddRef);
+			InstallOne(HookTargetId::kWlPin, reinterpret_cast<void*>(&hk_WlPin), &o_WlPin);
+			InstallOne(HookTargetId::kWlRemove, reinterpret_cast<void*>(&hk_WlRemove), &o_WlRemove);
+			InstallOne(HookTargetId::kWlUnpin, reinterpret_cast<void*>(&hk_WlUnpin), &o_WlUnpin);
+		}
+
+		if (g_installed == 0) {
+			logger::error("no hooks were installed - HeapSentinel is running, but blind");
+			Health::Degrade("no hooks installed");
+			return false;
 		}
 
 		const auto enable = MH_EnableHook(MH_ALL_HOOKS);
 		if (enable != MH_OK) {
 			logger::error("MH_EnableHook failed ({})", MH_StatusToString(enable));
+			Health::Degrade("MH_EnableHook failed");
 			return false;
 		}
 
-		logger::info("hooks installed and enabled");
+		logger::info("{} hooks installed and enabled of {} targets", g_installed, kHookTargetCount);
+		// A run that degraded nothing is GREEN, not UNKNOWN: silence must never be
+		// ambiguous, and "unknown" would be indistinguishable from "never set".
+		if (Health::State() == ipc::HealthState::kUnknown) {
+			Health::SetState(ipc::HealthState::kGreen, "all hook targets verified for this build");
+		}
+		logger::info("health: {}", Health::Line());
 		return true;
 	}
 

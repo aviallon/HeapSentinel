@@ -1,0 +1,60 @@
+// HeapSentinel hook target registry - THE single source of truth for which
+// engine functions this plugin hooks, and for what the committed verification
+// table must contain.
+//
+// This file is an X-macro list: it is #included by src/Hooks/HookTargets.h to
+// build the C++ enum + metadata, and parsed (not compiled) by
+// tools/check-hooktable.py, which FAILS THE BUILD when a target listed here has
+// no entry in the committed table in hooks/. That is the point: adding a hook
+// without adding a verified signature is a build error, not a silent act of
+// faith.
+//
+// HOOK_TARGET(<enum id>, "<display name>", <kind>, <se id>, <ae id>, <vtable id>, <vtable slot>)
+//
+//   kind      kRva     - a plain (non-virtual) function; the AE id resolves
+//                        straight to the hook address.
+//             kVtable  - a virtual function reached through a vtable; the AE id
+//                        resolves to the function, <vtable id> to the vtable,
+//                        and <vtable slot> is the index that MUST hold it.
+//   se id     the SE Address Library id as used by the installer (0 = none
+//             declared). SE ids are recorded, NOT verified: the committed table
+//             is AE-only, matching the existing convention.
+//   ae id     the AE Address Library id - this is what the table verifies.
+//   vtable id the AE Address Library id of the vtable symbol (0 for kRva).
+//   slot      the vtable index (0 for kRva).
+//
+// Display names are the join key with the committed table and are also what the
+// startup log prints. Keep them stable; renaming one is a table regeneration.
+//
+// Why these are vtable targets and not raw RVAs: the GMemoryHeapPT work proved
+// that a vtable dump catches real mistakes - CommonLibSSE-NG's header comment
+// order for GMemoryHeap did NOT match the engine's actual vtable order, and only
+// reading the engine's own ??_7GMemoryHeapPT@@6B@ exposed it. MemoryManager and
+// GRefCountImpl are NOT polymorphic in this build (verified: no vtable contains
+// their function addresses), so they are kRva targets.
+
+// [MemoryManager] the engine allocation facade - not virtual.
+HOOK_TARGET(kMemoryManagerAllocate, "MemoryManager::Allocate", kRva, 66859, 68115, 0, 0)
+HOOK_TARGET(kMemoryManagerDeallocate, "MemoryManager::Deallocate", kRva, 66861, 68117, 0, 0)
+HOOK_TARGET(kMemoryManagerReallocate, "MemoryManager::Reallocate", kRva, 66860, 68116, 0, 0)
+
+// [RefCountGuard] GRefCountImpl::Release - a plain member function; the
+// destructor dispatch happens inside it.
+HOOK_TARGET(kGRefCountImplRelease, "GRefCountImpl::Release", kRva, 0, 82197, 0, 0)
+
+// [ScaleformHeap] GMemoryHeapPT - virtual, through ??_7GMemoryHeapPT@@6B@
+// (AE id 242891). Slots 9/0xA/0xB/0xC/0xD/0xE, derived from the engine vtable.
+HOOK_TARGET(kSfAlloc, "GMemoryHeapPT::Alloc(size,align)", kVtable, 0, 84498, 242891, 9)
+HOOK_TARGET(kSfAlloc1, "GMemoryHeapPT::Alloc(size)", kVtable, 0, 84499, 242891, 10)
+HOOK_TARGET(kSfRealloc, "GMemoryHeapPT::Realloc", kVtable, 0, 84540, 242891, 11)
+HOOK_TARGET(kSfFree, "GMemoryHeapPT::Free", kVtable, 0, 84520, 242891, 12)
+HOOK_TARGET(kSfAllocAuto, "GMemoryHeapPT::AllocAutoHeap(size,align)", kVtable, 0, 84501, 242891, 13)
+HOOK_TARGET(kSfAllocAuto1, "GMemoryHeapPT::AllocAutoHeap(size)", kVtable, 0, 84502, 242891, 14)
+
+// [WeakLib] GFxResource context. AddRef is a plain member function; the
+// GFxResourceWeakLib trio is virtual through ??_7GFxResourceWeakLib@@6B@
+// (AE id 242218), slots 1/2/3.
+HOOK_TARGET(kWlAddRef, "GFxResource::AddRef", kRva, 0, 82783, 0, 0)
+HOOK_TARGET(kWlPin, "GFxResourceWeakLib::PinResource", kVtable, 0, 82796, 242218, 2)
+HOOK_TARGET(kWlRemove, "GFxResourceWeakLib::RemoveResourceOnRelease", kVtable, 0, 82798, 242218, 1)
+HOOK_TARGET(kWlUnpin, "GFxResourceWeakLib::UnpinResource", kVtable, 0, 82802, 242218, 3)

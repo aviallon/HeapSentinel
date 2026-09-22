@@ -2,3 +2,5 @@ build/
 .xmake-global/
 .xmake/
 *.zip
+__pycache__/
+*.pyc
