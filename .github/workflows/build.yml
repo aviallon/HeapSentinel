@@ -93,7 +93,7 @@ jobs:
 
           # A green build must not come from a stub: the plugin name, the
           # config section and the report kinds have to be in the binary.
-          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "bad-vtable-release" "double-free"; do
+          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "ScaleformHeap" "bad-vtable-release" "double-free"; do
             strings -n 5 "$dll" | grep -q "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
           done
           echo "the DLL contains the plugin name, config sections and report kinds"
@@ -111,25 +111,25 @@ jobs:
           cp README.md RESEARCH.md DESIGN.md out/
           # Data at the archive root so Amethyst / MO2 / Vortex install it as a
           # mod with no manual placement.
-          ( cd out && 7z a -bd -y ../HeapSentinel-0.1.1.zip . >/dev/null )
-          ls -l HeapSentinel-0.1.1.zip
-          7z l HeapSentinel-0.1.1.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
-          7z l HeapSentinel-0.1.1.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
-          sha256sum HeapSentinel-0.1.1.zip
+          ( cd out && 7z a -bd -y ../HeapSentinel-0.2.0.zip . >/dev/null )
+          ls -l HeapSentinel-0.2.0.zip
+          7z l HeapSentinel-0.2.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
+          7z l HeapSentinel-0.2.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
+          sha256sum HeapSentinel-0.2.0.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: HeapSentinel
           path: |
             **/HeapSentinel.dll
-            HeapSentinel-0.1.1.zip
+            HeapSentinel-0.2.0.zip
 
       - name: Attach to a release when tagging
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            HeapSentinel-0.1.1.zip
+            HeapSentinel-0.2.0.zip
             **/HeapSentinel.dll
           body: |
             HeapSentinel - an SKSE plugin that retrofits a memory sentinel onto

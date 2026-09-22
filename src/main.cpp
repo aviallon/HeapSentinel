@@ -45,7 +45,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	hs::SetupLog();
 
-	logger::info("HeapSentinel v0.1.1 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
+	logger::info("HeapSentinel v0.2.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
 
 	if (auto* messaging = SKSE::GetMessagingInterface()) {
 		messaging->RegisterListener("SKSE", OnMessage);
@@ -80,12 +80,20 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 
 	// Periodic stats so a soak test is observable: if the ledger stays bounded
 	// (and keeps changing) the hooks are live and the bounded-probe eviction is
-	// working; if it is stuck, recording has stopped.
+	// working; if it is stuck, recording has stopped. A one-shot warning the
+	// first time insert failures appear makes a saturated ledger loud instead of
+	// silently dropping the allocations the crash hunt depends on.
 	std::thread([] {
+		bool warnedSaturated = false;
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::seconds(60));
-			logger::info("stats: {} ledger entries, {} insert failures",
-				hs::ShadowLedger::Get().Count(), hs::ShadowLedger::Get().InsertFailures());
+			const auto failures = hs::ShadowLedger::Get().InsertFailures();
+			logger::info("stats: {} ledger entries, {} insert failures (capacity {})",
+				hs::ShadowLedger::Get().Count(), failures, hs::ShadowLedger::Get().Capacity());
+			if (failures > 0 && !warnedSaturated) {
+				logger::warn("ledger saturated: {} allocations could not be recorded; raise [Ledger] uCapacity in HeapSentinel.ini", failures);
+				warnedSaturated = true;
+			}
 		}
 	}).detach();
 

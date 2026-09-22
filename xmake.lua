@@ -11,7 +11,7 @@ set_xmakever("3.0.0")
 includes("lib/CommonLibSSE-NG/xmake.lua")
 
 set_project("HeapSentinel")
-set_version("0.1.1")
+set_version("0.2.0")
 set_languages("c++23")
 set_license("MIT")
 

@@ -26,10 +26,30 @@ namespace hs
 		// Scaleform refcounting: the destructor dispatch that crashes.
 		using ReleaseFn = void(*)(void*);
 
+		// Scaleform/GFx heap (GMemoryHeapPT). These are virtual-function
+		// implementations reached through the GMemoryHeap vtable, so they cannot
+		// be inlined away at the call site. Signatures were verified against the
+		// engine's own vtable at SkyrimSE.exe + 0x1A9C510: slots 9/0xA/0xB/0xC are
+		// Alloc(size,align)/Alloc(size)/Realloc/Free, and 0xD/0xE are the two
+		// AllocAutoHeap overloads (see the report for the full derivation).
+		using SfAllocFn = void*(*)(void* a_self, std::size_t a_size, std::size_t a_align);                       // 84498
+		using SfAlloc1Fn = void*(*)(void* a_self, std::size_t a_size);                                          // 84499
+		using SfAutoAllocFn = void*(*)(void* a_self, const void* a_object, std::size_t a_size, std::size_t a_align);  // 84501
+		using SfAutoAlloc1Fn = void*(*)(void* a_self, const void* a_object, std::size_t a_size);                 // 84502
+		using SfReallocFn = void*(*)(void* a_self, void* a_oldMem, std::size_t a_newSize);                       // 84540
+		using SfFreeFn = void(*)(void* a_self, void* a_mem);                                                    // 84520
+
 		AllocateFn   o_Allocate = nullptr;
 		DeallocateFn o_Deallocate = nullptr;
 		ReallocateFn o_Reallocate = nullptr;
 		ReleaseFn    o_Release = nullptr;
+
+		SfAllocFn      o_SfAlloc = nullptr;
+		SfAlloc1Fn     o_SfAlloc1 = nullptr;
+		SfAutoAllocFn  o_SfAllocAuto = nullptr;
+		SfAutoAlloc1Fn o_SfAllocAuto1 = nullptr;
+		SfReallocFn    o_SfRealloc = nullptr;
+		SfFreeFn       o_SfFree = nullptr;
 
 		[[nodiscard]] std::uint32_t CaptureStackIndex(std::uint32_t a_skip)
 		{
@@ -218,6 +238,154 @@ namespace hs
 			o_Release(a_object);
 		}
 
+		// --- Scaleform / GFx heap (GMemoryHeapPT) -------------------------
+		//
+		// Scaleform objects (GFxResource and friends) are allocated by Scaleform's
+		// own GMemoryHeapPT, not by RE::MemoryManager, so the engine hooks above
+		// are blind to exactly the objects that keep dying. These detours feed the
+		// SAME shadow ledger with the SAME fail-open discipline: when the ledger is
+		// full or not ready, every operation is a no-op and the original is called.
+
+		[[nodiscard]] bool ScaleformTrackingEnabled()
+		{
+			const auto& config = Config::Get();
+			return config.enabled && config.scaleformHeapEnabled && config.ledgerEnabled;
+		}
+
+		void RecordScaleformAlloc(void* a_ptr, std::size_t a_size, void* a_site, std::uint32_t a_stack)
+		{
+			if (!a_ptr || !Config::Get().ledgerEnabled) {
+				return;
+			}
+			AllocationInfo info;
+			info.ptr = reinterpret_cast<std::uintptr_t>(a_ptr);
+			info.size = a_size;
+			info.threadId = ::GetCurrentThreadId();
+			info.flags = kFlagLive | kFlagScaleform;
+			info.allocSite = a_site;
+			info.allocStack = a_stack;
+			ShadowLedger::Get().Insert(info.ptr, info);
+		}
+
+		// Returns false when the block is already known to have been freed; the
+		// caller then refuses to call the original (fail safe). An untracked block
+		// is recorded as a freed-only entry: that is the provenance the stale
+		// GFxResource crash needs ("object X was freed by this stack"), and it is
+		// the only way to attribute objects allocated before the hooks were live.
+		[[nodiscard]] bool RecordScaleformFree(void* a_mem, void* a_site, std::uint32_t a_stack)
+		{
+			if (!a_mem || !Config::Get().ledgerEnabled) {
+				return true;
+			}
+
+			const auto address = reinterpret_cast<std::uintptr_t>(a_mem);
+			AllocationInfo info;
+			if (ShadowLedger::Get().Find(address, info)) {
+				if (info.flags & kFlagFreed) {
+					Report("double-free", "Scaleform block " + DescribePtr(address) +
+										  " (size " + std::to_string(info.size) + ") freed again from " +
+										  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(a_site)) +
+										  "; first free from " +
+										  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.freeSite)));
+					return false;  // fail safe: never hand it back to the heap twice
+				}
+				info.flags |= kFlagFreed | kFlagScaleform;
+				info.freeSite = a_site;
+				info.freeStack = a_stack;
+				ShadowLedger::Get().Insert(address, info);
+			} else {
+				AllocationInfo fresh;
+				fresh.ptr = address;
+				fresh.size = 0;
+				fresh.threadId = ::GetCurrentThreadId();
+				fresh.flags = kFlagFreed | kFlagScaleform;
+				fresh.freeSite = a_site;
+				fresh.freeStack = a_stack;
+				ShadowLedger::Get().Insert(address, fresh);
+			}
+			return true;
+		}
+
+		void* hk_SfAlloc(void* a_self, std::size_t a_size, std::size_t a_align)
+		{
+			if (!ScaleformTrackingEnabled()) {
+				return o_SfAlloc(a_self, a_size, a_align);
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			auto*      result = o_SfAlloc(a_self, a_size, a_align);
+			RecordScaleformAlloc(result, a_size, site, stack);
+			return result;
+		}
+
+		void* hk_SfAlloc1(void* a_self, std::size_t a_size)
+		{
+			if (!ScaleformTrackingEnabled()) {
+				return o_SfAlloc1(a_self, a_size);
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			auto*      result = o_SfAlloc1(a_self, a_size);
+			RecordScaleformAlloc(result, a_size, site, stack);
+			return result;
+		}
+
+		void* hk_SfAllocAuto(void* a_self, const void* a_object, std::size_t a_size, std::size_t a_align)
+		{
+			if (!ScaleformTrackingEnabled()) {
+				return o_SfAllocAuto(a_self, a_object, a_size, a_align);
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			auto*      result = o_SfAllocAuto(a_self, a_object, a_size, a_align);
+			RecordScaleformAlloc(result, a_size, site, stack);
+			return result;
+		}
+
+		void* hk_SfAllocAuto1(void* a_self, const void* a_object, std::size_t a_size)
+		{
+			if (!ScaleformTrackingEnabled()) {
+				return o_SfAllocAuto1(a_self, a_object, a_size);
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			auto*      result = o_SfAllocAuto1(a_self, a_object, a_size);
+			RecordScaleformAlloc(result, a_size, site, stack);
+			return result;
+		}
+
+		void hk_SfFree(void* a_self, void* a_mem)
+		{
+			if (!a_mem || !ScaleformTrackingEnabled()) {
+				o_SfFree(a_self, a_mem);
+				return;
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			if (!RecordScaleformFree(a_mem, site, stack)) {
+				return;  // fail safe
+			}
+			o_SfFree(a_self, a_mem);
+		}
+
+		void* hk_SfRealloc(void* a_self, void* a_oldMem, std::size_t a_newSize)
+		{
+			if (!ScaleformTrackingEnabled()) {
+				return o_SfRealloc(a_self, a_oldMem, a_newSize);
+			}
+			const auto site = _ReturnAddress();
+			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
+			auto*      result = o_SfRealloc(a_self, a_oldMem, a_newSize);
+			if (result) {
+				if (a_oldMem) {
+					AllocationInfo old;
+					ShadowLedger::Get().Erase(reinterpret_cast<std::uintptr_t>(a_oldMem), old);
+				}
+				RecordScaleformAlloc(result, a_newSize, site, stack);
+			}
+			return result;
+		}
+
 		template <class T>
 		bool InstallOne(const char* a_name, std::uint64_t a_se, std::uint64_t a_ae, void* a_detour, T* a_original)
 		{
@@ -257,6 +425,19 @@ namespace hs
 		// GRefCountImpl::Release (82197 on AE).
 		if (config.refCountGuardEnabled) {
 			InstallOne("GRefCountImpl::Release", 0, 82197, reinterpret_cast<void*>(&hk_Release), &o_Release);
+		}
+
+		// Scaleform/GFx heap (GMemoryHeapPT). AE Address Library ids only; the SE
+		// ids are not verified here, so (like the Release hook above) this is
+		// AE-only. ids 84498/84499/84501/84502/84520/84540, verified against
+		// versionlib-1-7-104-0.bin and the engine's own ??_7GMemoryHeapPT vtable.
+		if (config.scaleformHeapEnabled) {
+			InstallOne("GMemoryHeapPT::Alloc(size,align)", 0, 84498, reinterpret_cast<void*>(&hk_SfAlloc), &o_SfAlloc);
+			InstallOne("GMemoryHeapPT::Alloc(size)", 0, 84499, reinterpret_cast<void*>(&hk_SfAlloc1), &o_SfAlloc1);
+			InstallOne("GMemoryHeapPT::AllocAutoHeap(size,align)", 0, 84501, reinterpret_cast<void*>(&hk_SfAllocAuto), &o_SfAllocAuto);
+			InstallOne("GMemoryHeapPT::AllocAutoHeap(size)", 0, 84502, reinterpret_cast<void*>(&hk_SfAllocAuto1), &o_SfAllocAuto1);
+			InstallOne("GMemoryHeapPT::Realloc", 0, 84540, reinterpret_cast<void*>(&hk_SfRealloc), &o_SfRealloc);
+			InstallOne("GMemoryHeapPT::Free", 0, 84520, reinterpret_cast<void*>(&hk_SfFree), &o_SfFree);
 		}
 
 		const auto enable = MH_EnableHook(MH_ALL_HOOKS);

@@ -32,6 +32,16 @@ namespace hs
 		std::size_t   guardPoolMaxSize = 3072;     // larger requests pass through
 		bool          guardPoolFixUp = true;       // unprotect + continue on fault
 
+		// [ScaleformHeap] - Scaleform/GFx allocations (GMemoryHeapPT). These do
+		// NOT come from RE::MemoryManager, which is why the engine hooks are
+		// blind to the GFxResource lifetime crashes. Tier A only (ledger); the
+		// guard pool is deliberately not extended to this heap (see DESIGN).
+		bool scaleformHeapEnabled = true;
+		// Capture call stacks for Scaleform alloc/free events. The free stack is
+		// what names the culprit, so this defaults on; turn it off to trade
+		// attribution detail for lower hot-path cost.
+		bool scaleformCaptureStacks = true;
+
 		// [RefCountGuard] - validate the vtable before a refcounted destructor
 		// is dispatched from GRefCountImpl::Release.
 		bool refCountGuardEnabled = true;

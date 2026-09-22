@@ -80,8 +80,12 @@ with a call-the-original trampoline. MinHook handles prologue length decoding.
 | `ScrapHeap::Allocate` | 68144 | (optional) finer-grained coverage of the per-thread heap |
 | `ScrapHeap::Deallocate` | 68146 | (optional) |
 | `GRefCountImpl::Release` | 82197 | vtable validation + optional fail-safe |
-| `GMemoryHeapPT::Alloc` | 84498 / 84499 | (optional) Scaleform allocation coverage |
-| `GMemoryHeapPT::Free` | 84520 | (optional) Scaleform free coverage |
+| `GMemoryHeapPT::Alloc(size, align)` | AE 84498 | Scaleform/GFx allocation coverage (vtable slot 9) |
+| `GMemoryHeapPT::Alloc(size)` | AE 84499 | Scaleform/GFx allocation coverage (vtable slot 0xA) |
+| `GMemoryHeapPT::AllocAutoHeap(size, align)` | AE 84501 | Scaleform/GFx allocation coverage (vtable slot 0xD) |
+| `GMemoryHeapPT::AllocAutoHeap(size)` | AE 84502 | Scaleform/GFx allocation coverage (vtable slot 0xE) |
+| `GMemoryHeapPT::Realloc` | AE 84540 | Scaleform/GFx realloc coverage (vtable slot 0xB) |
+| `GMemoryHeapPT::Free` | AE 84520 | Scaleform/GFx free coverage (vtable slot 0xC) |
 
 `GRefCountImpl::AddRef` (82195) is included only as an optional counter if it
 turns out not to be inlined at the call sites we care about; most AddRefs are
@@ -281,6 +285,11 @@ bFixUp=1
 bEnabled=1
 bFailSafe=0           ; 1 = skip the dispatch and leak instead of crashing
 
+[ScaleformHeap]
+; Scaleform/GFx allocations (GMemoryHeapPT). Same ledger, fail-open.
+bEnabled=1
+bCaptureStacks=1      ; free stacks are what name the culprit
+
 [Reporting]
 bScreenshot=0
 bFreeze=0
@@ -323,7 +332,9 @@ ledger is unavailable.
   stack capture, shadow ledger, report, VEH, `MemoryManager` ledger hooks,
   `GRefCountImpl::Release` guard. Guarded pool present but off.
 - **v0.2**: guarded pool hardened (quarantine, fix-up tested in game),
-  `ScrapHeap` hooks, Scaleform `GMemoryHeapPT` hooks, screenshot via swapchain.
+  `ScrapHeap` hooks, Scaleform `GMemoryHeapPT` ledger hooks (done: Alloc ×2,
+  AllocAutoHeap ×2, Realloc, Free, AE-only ids verified against the 1.7.104
+  Address Library and the engine vtable), screenshot via swapchain.
 - **v0.3**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
   (RESEARCH §7.1) instead of maintaining a parallel stack table where possible;
   payload poison + write-after-free check on `ScrapHeap` blocks.
