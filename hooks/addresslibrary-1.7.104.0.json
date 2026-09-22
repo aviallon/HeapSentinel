@@ -1,0 +1,31 @@
+{
+  "schema": "heapsentinel.addresslibrary/1",
+  "version": "1.7.104.0",
+  "file": "versionlib-1-7-104-0.bin",
+  "format": 5,
+  "pointerSize": 8,
+  "dataFormat": 0,
+  "offsetCount": 565759,
+  "size": 2263132,
+  "sha256": "8aab3dd251d135b849bd983f86a4a205c920fa3e81f8e30c0e63ccfef9423842",
+  "base": 5368709120,
+  "note": "Only the ids the committed hook table needs. Committed so CI can check each record's id->rva without the third-party Address Library file, which is not redistributable and is not in this repository.",
+  "offsets": {
+    "68115": 13492816,
+    "68116": 13493408,
+    "68117": 13493920,
+    "82197": 13578832,
+    "82783": 13662160,
+    "82796": 13664048,
+    "82798": 13664256,
+    "82802": 13665120,
+    "84498": 18334000,
+    "84499": 18334144,
+    "84501": 18334304,
+    "84502": 18334544,
+    "84520": 18337680,
+    "84540": 18340176,
+    "242218": 27425304,
+    "242891": 27903248
+  }
+}
