@@ -298,7 +298,11 @@ namespace hs::ipc
 			return;
 		}
 		auto& header = HeaderAt(_base);
-		StoreRelaxed(header.hostPid, static_cast<std::uint32_t>(::GetCurrentProcessId()));
+		// hostPid is a 32-bit field, so it needs the 32-bit accessor. This is
+		// exactly the line GCC never compiles (the whole method is inside
+		// #if defined(_WIN32)), which is why the CI matrix builds and runs the
+		// suite on Windows as well as Linux.
+		StoreRelaxed32(header.hostPid, static_cast<std::uint32_t>(::GetCurrentProcessId()));
 		StoreRelaxed(header.helperHeartbeat, NowTick());
 		StoreRelease(header.helperAttached, 1);
 	}
