@@ -78,6 +78,16 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 
 	hs::InstallHooks();
 
+	// Periodic stats so a soak test is observable: if the ledger stays bounded
+	// (and keeps changing) the hooks are live and the bounded-probe eviction is
+	// working; if it is stuck, recording has stopped.
+	std::thread([] {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(60));
+			logger::info("stats: {} ledger entries", hs::ShadowLedger::Get().Count());
+		}
+	}).detach();
+
 	logger::info("...ready");
 	return true;
 }

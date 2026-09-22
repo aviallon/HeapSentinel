@@ -9,6 +9,12 @@ namespace hs
 		constexpr std::uintptr_t kEmpty = 0;
 		constexpr std::uintptr_t kTombstone = 1;
 
+		// Bounded linear probing. A full probe of a large shard is far too slow
+		// for an allocation hook, and an unbounded table would grow until the
+		// load-factor cap silently stopped recording. The window is long enough
+		// to find a recently-freed entry to reuse (the ledger's quarantine).
+		constexpr std::size_t kMaxProbe = 64;
+
 		[[nodiscard]] constexpr std::uintptr_t Mix(std::uintptr_t a_value)
 		{
 			std::uintptr_t x = a_value >> 4;
@@ -91,11 +97,12 @@ namespace hs
 		auto& shard = ShardFor(a_ptr);
 		shard.Lock();
 
-		const auto mask = shard.capacity - 1;
-		auto       index = Mix(a_ptr) & mask;
+		const auto  mask = shard.capacity - 1;
+		auto        index = Mix(a_ptr) & mask;
 		std::size_t firstTombstone = static_cast<std::size_t>(-1);
+		std::size_t firstFreed = static_cast<std::size_t>(-1);
 
-		for (std::size_t probe = 0; probe < shard.capacity; ++probe) {
+		for (std::size_t probe = 0; probe < kMaxProbe; ++probe) {
 			auto& slot = shard.slots[index];
 			if (slot.key == a_ptr) {
 				slot.info = a_info;
@@ -104,15 +111,9 @@ namespace hs
 			}
 			if (slot.key == kEmpty) {
 				if (firstTombstone != static_cast<std::size_t>(-1)) {
-					auto& target = shard.slots[firstTombstone];
-					target.key = a_ptr;
-					target.info = a_info;
+					shard.slots[firstTombstone].key = a_ptr;
+					shard.slots[firstTombstone].info = a_info;
 				} else {
-					// Keep the load factor at 50% so probing stays short.
-					if ((shard.count + 1) * 2 > shard.capacity) {
-						shard.Unlock();
-						return;
-					}
 					slot.key = a_ptr;
 					slot.info = a_info;
 					++shard.count;
@@ -122,8 +123,20 @@ namespace hs
 			}
 			if (slot.key == kTombstone && firstTombstone == static_cast<std::size_t>(-1)) {
 				firstTombstone = index;
+			} else if ((slot.info.flags & kFlagFreed) != 0 && firstFreed == static_cast<std::size_t>(-1)) {
+				firstFreed = index;
 			}
 			index = (index + 1) & mask;
+		}
+
+		// Probe window exhausted. Reuse a tombstone, else evict the oldest freed
+		// entry we saw (that is the ledger's bounded quarantine), else fail open.
+		if (firstTombstone != static_cast<std::size_t>(-1)) {
+			shard.slots[firstTombstone].key = a_ptr;
+			shard.slots[firstTombstone].info = a_info;
+		} else if (firstFreed != static_cast<std::size_t>(-1)) {
+			shard.slots[firstFreed].key = a_ptr;
+			shard.slots[firstFreed].info = a_info;
 		}
 
 		shard.Unlock();
@@ -142,7 +155,7 @@ namespace hs
 		auto       index = Mix(a_ptr) & mask;
 		bool       found = false;
 
-		for (std::size_t probe = 0; probe < shard.capacity; ++probe) {
+		for (std::size_t probe = 0; probe < kMaxProbe; ++probe) {
 			const auto& slot = shard.slots[index];
 			if (slot.key == a_ptr) {
 				a_out = slot.info;
@@ -172,7 +185,7 @@ namespace hs
 		auto       index = Mix(a_ptr) & mask;
 		bool       found = false;
 
-		for (std::size_t probe = 0; probe < shard.capacity; ++probe) {
+		for (std::size_t probe = 0; probe < kMaxProbe; ++probe) {
 			auto& slot = shard.slots[index];
 			if (slot.key == a_ptr) {
 				a_out = slot.info;

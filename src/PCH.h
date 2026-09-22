@@ -22,12 +22,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace logger = SKSE::log;
