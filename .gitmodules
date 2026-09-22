@@ -1,0 +1,7 @@
+[submodule "lib/CommonLibSSE-NG"]
+	path = lib/CommonLibSSE-NG
+	url = https://github.com/alandtse/CommonLibVR.git
+	branch = ng
+[submodule "lib/minhook"]
+	path = lib/minhook
+	url = https://github.com/TsudaKageyu/minhook.git

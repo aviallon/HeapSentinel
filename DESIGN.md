@@ -1,0 +1,296 @@
+# HeapSentinel — design
+
+An SKSE plugin that retrofits a memory sentinel onto a running Skyrim SE/AE
+process: it watches the allocators the engine and Scaleform actually use,
+detects the classes of dangling-reference bug that crash this install, fails
+safe instead of dying, and writes a loud, precise report.
+
+Read [`RESEARCH.md`](RESEARCH.md) first — this document assumes its conclusions
+(especially §7 the allocator landscape and §8 the transfer matrix).
+
+## 1. Goals and non-goals
+
+**Goals**
+
+1. Detect, *before* the fault, the operations that are provably wrong:
+   double free, invalid free, sized-dealloc mismatch, release of a refcounted
+   object whose vtable is not a plausible vtable.
+2. Detect, deterministically for a sampled subset, use-after-free and
+   buffer overflow, via guard pages (GWP-ASan).
+3. Fail safe where a specific operation can be refused (skip a destructor
+   dispatch, refuse a double free) instead of letting the engine crash.
+4. Produce a report a human can act on without a debugger: kind, address
+   classification, alloc stack, free stack, fault stack, object bytes,
+   optional screenshot, optional freeze.
+5. Stay portable: every target is `REL::RelocationID` / `RELOCATION_ID` plus
+   `RE::` types, so SE/AE/VR selection is CommonLibSSE-NG's job.
+
+**Non-goals**
+
+- Repairing corrupted object graphs. We can refuse an operation or leak; we
+  cannot rewrite every pointer (see RESEARCH §6).
+- Detecting every use-after-free. Without shadow memory or hardware tagging,
+  a UAF *read* of a live-looking address is undetectable. We make it
+  *probable* (sampling), *visible* (poison), or *impossible for one class*
+  (refcount guard).
+- Zero overhead. The dial is explicit: Tier A is cheap, Tier B is opt-in.
+
+## 2. Architecture
+
+```
+                       ┌──────────────────────────────┐
+   MinHook detours ──▶ │ Hooks/MemoryHooks            │  MemoryManager::Allocate/Deallocate/Reallocate
+                       │                              │  ScrapHeap::Allocate/Deallocate
+                       └──────────┬───────────────────┘
+                                  │ record / look up / route
+                       ┌──────────▼───────────────────┐
+                       │ Core/ShadowLedger            │  ptr → {size, thread, allocSite, freeSite, flags}
+                       │  sharded, lock-free, fixed   │
+                       └──────────┬───────────────────┘
+                                  │
+              ┌───────────────────┼────────────────────┐
+              ▼                   ▼                    ▼
+   ┌──────────────────┐ ┌────────────────────┐ ┌────────────────────┐
+   │ Core/GuardedPool │ │ Hooks/RefCountGuard│ │ Core/Report        │
+   │  sampled slots,  │ │  GRefCountImpl::   │ │  classify + stacks │
+   │  guard pages,    │ │  Release vtable    │ │  + screenshot +    │
+   │  quarantine      │ │  validation        │ │  freeze            │
+   └────────┬─────────┘ └────────────────────┘ └────────────────────┘
+            │ fault
+   ┌────────▼─────────┐
+   │ Veh              │  AddVectoredExceptionHandler: classify any AV,
+   │                  │  fix up guarded-slot faults, rate-limit reports
+   └──────────────────┘
+```
+
+Everything is off/on through `HeapSentinel.ini` (see §8).
+
+## 3. Hooks
+
+Installed with **MinHook** (function-entry detours). The SKSE trampoline is
+*not* usable here: `Trampoline::write_branch<5>` redirects an existing branch
+and returns the original branch target, so it cannot install a prologue hook
+with a call-the-original trampoline. MinHook handles prologue length decoding.
+
+| Target | CommonLibSSE-NG id (SE/AE) | Purpose |
+|---|---|---|
+| `MemoryManager::Allocate` | 66859 / 68115 | record allocation; maybe sample into the guarded pool |
+| `MemoryManager::Deallocate` | 66861 / 68117 | double/invalid-free check; route guarded blocks; poison payload |
+| `MemoryManager::Reallocate` | 66860 / 68116 | route guarded blocks; update ledger |
+| `ScrapHeap::Allocate` | 68144 | (optional) finer-grained coverage of the per-thread heap |
+| `ScrapHeap::Deallocate` | 68146 | (optional) |
+| `GRefCountImpl::Release` | 82197 | vtable validation + optional fail-safe |
+| `GMemoryHeapPT::Alloc` | 84498 / 84499 | (optional) Scaleform allocation coverage |
+| `GMemoryHeapPT::Free` | 84520 | (optional) Scaleform free coverage |
+
+`GRefCountImpl::AddRef` (82195) is included only as an optional counter if it
+turns out not to be inlined at the call sites we care about; most AddRefs are
+inlined and cannot be intercepted without patching every site.
+
+### 3.1 Why `MemoryManager` is the primary chokepoint
+
+It is the facade every engine allocation goes through, and its prologue reads
+`gs:0x58` (the TEB TLS array), so the per-thread scrap-heap path is largely
+lock-free. Hooking it gives near-complete coverage of *engine* objects.
+Coverage gaps (Scaleform, plugin CRTs, Havok, direct `VirtualAlloc`) are
+documented in RESEARCH §7.3 and addressed by the Scaleform hooks.
+
+### 3.2 `GRefCountImpl::Release` guard
+
+```asm
+140cf3250  mov eax,-1
+140cf3255  lock xadd [rcx+8],eax     ; refcount--
+140cf325a  cmp eax,1
+140cf325f  test rcx,rcx
+140cf3264  mov rax,[rcx]             ; vtable
+140cf326c  jmp [rax]                 ; <-- the TrueHUD crash
+```
+
+The thunk runs *before* the decrement and validates:
+
+1. `rcx` is non-null and plausibly a heap pointer;
+2. `[rcx]` is 8-byte aligned and inside a loaded image (`ModuleMap::Contains`);
+3. `[[rcx]]` (the first vtable slot) is inside an **executable** section.
+
+If all hold → call the original. If not:
+- log a full report (object address, "vtable", first slot, module+offset,
+  the caller's stack);
+- with `bFailSafe=1`, **return without calling the original**. The refcount is
+  not decremented, the object leaks, and the crash does not happen.
+
+The check is exactly `IsPlausibleVTable()` in `Core/ModuleMap.h`. For the
+observed crash it fails at step 2 (`0x141A2E20C` is not 8-byte aligned).
+
+## 4. Shadow ledger
+
+`Core/ShadowLedger` maps `ptr → AllocationInfo`:
+
+```cpp
+struct AllocationInfo {
+    std::uintptr_t ptr;        // key
+    std::size_t    size;
+    std::uint32_t  threadId;
+    std::uint32_t  flags;      // live | sampled | quarantined | freed
+    void*          allocSite;  // return address of the hook
+    void*          freeSite;
+    std::uint32_t  allocStack; // index into the stack ring (0 = none)
+    std::uint32_t  freeStack;
+};
+```
+
+- **Sharded open addressing**, `uShards` independent tables, each with a
+  `std::atomic_flag` spinlock, linear probing, empty key `0`, tombstone `1`,
+  load factor capped at 0.5. No allocation after `Init()`.
+- **Per-thread sharding** mirrors the per-thread ScrapHeap so contention is
+  rare; the spinlock is only a fallback.
+- **Fail open**: if the table is full or uninitialised, the hook passes
+  through untouched. A sentinel that breaks the game is worse than no sentinel.
+- **Stack ring**: a fixed ring of captured stacks (`Core/StackCapture`), indexed
+  by `allocStack`/`freeStack`. Depth is configurable (default 12 frames);
+  `0` disables stack capture and keeps only the immediate return address.
+
+Ledger operations used by the hooks:
+
+| Event | Check | Action |
+|---|---|---|
+| Allocate | — | insert `{size, live}` |
+| Deallocate, not tracked | not in ledger, not in any heap | report **invalid free** |
+| Deallocate, tracked, already freed | flags has `freed` | report **double free**, do not call original (fail safe) |
+| Deallocate, tracked, live | size mismatch vs `a_size` (if provided) | report **sized-dealloc mismatch**, continue |
+| Deallocate, tracked, live | — | mark freed, record `freeSite`, call original |
+| Reallocate, guarded | in guarded region | allocate new slot, copy, free old |
+
+## 5. Guarded pool (GWP-ASan, Tier B)
+
+`Core/GuardedPool` implements the sampled detector directly, because no
+existing implementation can be dropped into a running game.
+
+- Reserve one region with `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)`, carved
+  into `uSlots` slots. Each slot is `[guard page][data pages][guard page]`.
+- `ShouldSample()` is a fast counter/PRNG check against `uSampleRate` (default
+  1 in 2000) and a size filter (`uMaxSize`, default 3 KiB — one data page
+  handles it).
+- `Allocate(size, alignment)` picks a free slot, commits the data pages
+  `PAGE_READWRITE`, chooses the user pointer **left- or right-aligned at
+  random**, and records the slot metadata plus the alloc stack in the ledger.
+- `IsOurs(ptr)` is a cheap range test, so the `Deallocate`/`Reallocate` hooks
+  can route our blocks away from the engine's allocator.
+- `Deallocate(ptr)` `VirtualProtect`s the data pages to `PAGE_NOACCESS`, records
+  the free stack, and moves the slot to a small FIFO quarantine. Any later
+  access faults — that is the detection.
+- The **VEH** recognises a fault inside the region, reports the access plus the
+  alloc and free stacks, and (with `bFixUp=1`) re-protects the page and returns
+  `EXCEPTION_CONTINUE_EXECUTION`, so the game survives the bug it just made.
+
+The risk that makes this opt-in is explicit: a sampled block was never
+returned by any of the engine's heaps, so the engine must never call
+`ContainsBlockImpl`/`Size` on it. We intercept the free/realloc path, but any
+engine code that inspects a heap directly would be surprised. Hence default
+`bEnabled=0`, a low sample rate, and a size cap.
+
+## 6. Reporting
+
+`Core/Report` is the product. A report contains:
+
+- **kind**: double free / invalid free / sized-dealloc mismatch / bad vtable
+  release / guarded-slot UAF / guarded-slot overflow / unclassified AV;
+- **address classification** of the faulting or object address:
+  `module+offset`, `guarded slot N (freed at T, allocated at T)`,
+  `ledger-known (freed at T)`, `poison pattern`, `unknown/unmapped`;
+- the **pre-crash stack** captured at the hook (the culprit's stack, not the
+  victim's);
+- **alloc stack** and **free stack** from the ledger/guard pool;
+- **object bytes** (the first N bytes, so a garbage vtable is visible);
+- the **register state** if the report came from the VEH;
+- optional **screenshot**: hook the D3D11 swapchain `Present`, keep the last
+  frame in a staging texture, WIC-encode a PNG. GDI `PrintWindow`/`BitBlt` is
+  the fallback and is often black for a DXGI flip-model window.
+- optional **freeze**: a modal dialog instead of continuing, so the user can
+  attach a debugger or take their own screenshot.
+
+Reports go to `HeapSentinel.log` (spdlog, next to the other SKSE logs) and to a
+dedicated `HeapSentinel-reports.log`. Rate limiting (`uMaxReportsPerSecond`,
+default 20) prevents a fault storm from hanging the game.
+
+## 7. Exception handling
+
+`Veh` installs an `AddVectoredExceptionHandler(1, …)` (first handler, so it
+runs before Crash Logger SSE) that:
+
+- ignores everything except `EXCEPTION_ACCESS_VIOLATION` and
+  `EXCEPTION_IN_PAGE_ERROR`;
+- classifies the fault address;
+- if it is a guarded slot → report + optional fix-up + continue;
+- otherwise → report (if `bVeh`) and return `EXCEPTION_CONTINUE_SEARCH`, so
+  Crash Logger SSE still produces its own log and the game still dies the way
+  it always did. **We never swallow an unknown crash.**
+
+## 8. Configuration (`Data/SKSE/Plugins/HeapSentinel.ini`)
+
+```ini
+[General]
+bEnabled=1
+
+[Ledger]
+bEnabled=1
+uCapacity=1048576
+uShards=64
+uStackDepth=12
+
+[GuardPool]
+bEnabled=0            ; opt-in: sampled blocks are foreign to the engine
+uSampleRate=2000
+uSlots=64
+uMaxSize=3072
+bFixUp=1
+
+[RefCountGuard]
+bEnabled=1
+bFailSafe=0           ; 1 = skip the dispatch and leak instead of crashing
+
+[Reporting]
+bScreenshot=0
+bFreeze=0
+bVeh=1
+uMaxReportsPerSecond=20
+```
+
+## 9. Performance budget
+
+The constraint is **latency on the main/render thread**, not total CPU.
+
+| Tier | Hot-path work | Budget |
+|---|---|---|
+| Ledger insert/lookup | one shard lock, a few probes, optional stack capture | tens of ns; stack capture is the expensive part, hence configurable depth |
+| Guarded pool sample | `VirtualAlloc`/`VirtualProtect` only on the sampled 1-in-N | negligible amortised |
+| RefCount guard | one shard-free vtable validation per non-inlined release | tens of ns |
+| VEH | only on a fault | n/a |
+
+Rules: no allocation inside a hook; no logging inside a hook; no global lock;
+defer symbolization and file I/O to a watchdog thread; fail open when the
+ledger is unavailable.
+
+## 10. Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| The sentinel itself crashes the game | fail-open ledger; no allocation/locks/logging in hooks; MinHook only, no hand-rolled trampolines; every hook wrapped so an exception disables it and passes through |
+| Hooking hot functions costs frames | per-thread/sharded tables; stack capture sampled or off; guard pool opt-in |
+| Inlined `Release`/`AddRef` are not intercepted | documented limitation; the standalone `Release` is the one on the observed crash stack |
+| The engine does not know our sampled region | guard pool off by default, size-capped, and frees/reallocs intercepted |
+| Poisoning corrupts the allocator | poison only the payload beyond the allocator's private prefix; never touch `Block::sizeFlags`/free-list fields; start with `ScrapHeap` sizes only |
+| Swallowing a real crash | VEH only fixes up faults in our own region; everything else is `CONTINUE_SEARCH` |
+| Wrong Address Library resolution | `REL::RelocationID` with SE/AE pairs; verify each target's prologue before installing and log a refusal if it does not match |
+
+## 11. Roadmap
+
+- **v0.1 (this scaffold)**: build system, CI, config, logging, module map,
+  stack capture, shadow ledger, report, VEH, `MemoryManager` ledger hooks,
+  `GRefCountImpl::Release` guard. Guarded pool present but off.
+- **v0.2**: guarded pool hardened (quarantine, fix-up tested in game),
+  `ScrapHeap` hooks, Scaleform `GMemoryHeapPT` hooks, screenshot via swapchain.
+- **v0.3**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
+  (RESEARCH §7.1) instead of maintaining a parallel stack table where possible;
+  payload poison + write-after-free check on `ScrapHeap` blocks.
+- **v0.4**: a "bisect" mode that narrows sampling to one size range or one
+  allocation site, for reproducing a specific bug.

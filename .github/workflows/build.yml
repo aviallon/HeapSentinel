@@ -1,0 +1,118 @@
+name: build
+
+# Builds HeapSentinel.dll for Skyrim AE 1.7.104 with xmake + CommonLibSSE-NG.
+#
+# The whole portability story is CommonLibSSE-NG + the Address Library: every
+# engine target in src/Hooks/Hooks.cpp is a REL::RelocationID(se, ae) pair, so
+# SE/AE/VR selection is the library's job. The pinned CommonLibSSE-NG revision
+# is the one whose include/REL/IDDB.h defines Format::SSEv5, i.e. it can read
+# the 1.7.104 Address Library (versionlib-1-7-104-0.bin, format 5). CI asserts
+# that before compiling, so a green run cannot come from the wrong reader.
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  COMMONLIB_COMMIT: abe9ca7b7318dbc04bccfcd59fc3fb670244c2d7
+  XMAKE_GLOBALDIR: ${{ github.workspace }}/.xmake-global
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Pin CommonLibSSE-NG to the format-5 revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd lib/CommonLibSSE-NG
+          git fetch --depth 1 origin "$COMMONLIB_COMMIT"
+          git checkout --detach "$COMMONLIB_COMMIT"
+          git log --oneline -1
+          test -f include/REL/IDDB.h || { echo "::error::IDDB.h missing - wrong revision"; exit 1; }
+          grep -q "SSEv5" include/REL/IDDB.h || { echo "::error::no SSEv5 in IDDB.h"; exit 1; }
+          echo "format-5 Address Library reader present in the pinned revision"
+
+      - name: Pin MinHook
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd lib/minhook
+          git log --oneline -1
+          test -f include/MinHook.h || { echo "::error::MinHook.h missing"; exit 1; }
+          test -f src/hde/hde64.c || { echo "::error::hde64.c missing"; exit 1; }
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.xmake-global
+          key: xmake-pkgs-${{ runner.os }}-${{ hashFiles('xmake.lua') }}
+          restore-keys: xmake-pkgs-${{ runner.os }}-
+
+      - name: Build HeapSentinel.dll
+        shell: pwsh
+        run: |
+          # The xmake-mirror sometimes answers 504 while fetching a prebuilt
+          # package (directxtk); retry the configure step instead of failing.
+          $ok = $false
+          for ($i = 1; $i -le 8; $i++) {
+            xmake f -p windows -a x64 -m release -y
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "::warning::xmake configure attempt $i failed; retrying in 20s"
+            Start-Sleep -Seconds 20
+          }
+          if (-not $ok) { Write-Host "::error::xmake configure failed after 8 attempts"; exit 1 }
+
+          xmake build HeapSentinel
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem -Recurse -Filter HeapSentinel.dll | Select-Object FullName, Length
+
+      - name: Assert the artifact carries the work
+        shell: bash
+        run: |
+          set -euo pipefail
+          dll=$(find build -name HeapSentinel.dll | head -1)
+          [ -n "$dll" ] || { echo "::error::HeapSentinel.dll was not built"; exit 1; }
+          test -s "$dll" || { echo "::error::the built DLL is empty"; exit 1; }
+
+          # A green build must not come from a stub: the plugin name, the
+          # config section and the report kinds have to be in the binary.
+          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "bad-vtable-release" "double-free"; do
+            strings -n 5 "$dll" | grep -q "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
+          done
+          echo "the DLL contains the plugin name, config sections and report kinds"
+
+          sha256sum "$dll"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HeapSentinel-dll
+          path: "**/HeapSentinel.dll"
+
+      - name: Attach to a release when tagging
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "**/HeapSentinel.dll"
+          body: |
+            HeapSentinel - an SKSE plugin that retrofits a memory sentinel onto
+            a running Skyrim SE/AE process: a shadow allocation ledger on the
+            engine's MemoryManager, a GWP-ASan-style sampled guarded pool, and a
+            GRefCountImpl::Release vtable guard that can fail safe instead of
+            crashing. See RESEARCH.md and DESIGN.md.
