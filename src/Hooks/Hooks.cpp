@@ -4,6 +4,10 @@
 
 #include "Core/GuardedPool.h"
 #include "Core/Health.h"
+#include "Core/AllocatorConfidence.h"
+#include "Core/FreeEvidence.h"
+#include "Core/FreePolicy.h"
+#include "Core/FreeReentrancy.h"
 #include "Core/ModuleMap.h"
 #include "Core/PoisonQuarantine.h"
 #include "Core/Report.h"
@@ -171,11 +175,23 @@ namespace hs
 			const auto& config = Config::Get();
 			const auto  address = reinterpret_cast<std::uintptr_t>(a_mem);
 
+			// M1 guard: when one logical free is observed by two of our hooks (e.g.
+			// hk_SfFree calls o_SfFree, which re-enters here through EngineFixes'
+			// Scaleform allocator), the nested observation must not be counted or
+			// reported again. The original is still called so the memory is really
+			// freed exactly once.
+			FreeReentrancy freeGuard(a_mem);
+			if (freeGuard.Nested()) {
+				o_Deallocate(a_self, a_mem, a_alignmentRequired);
+				return;
+			}
+
 			if (config.guardPoolEnabled && GuardedPool::Get().IsOurs(address)) {
 				AllocationInfo known;
 				if (ShadowLedger::Get().Find(address, known) && (known.flags & kFlagFreed)) {
-					Report("double-free", "guarded block " + DescribePtr(address) +
-											 " freed again from " + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(_ReturnAddress())));
+					Report(DoubleFreeReportKind(GetAllocatorConfidence()),
+						"guarded block " + DescribePtr(address) +
+							" freed again from " + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(_ReturnAddress())));
 					return;  // fail safe: never hand it back to the pool twice
 				}
 				GuardedPool::Get().Deallocate(address, _ReturnAddress(), CaptureStackIndex(1));
@@ -186,18 +202,24 @@ namespace hs
 				AllocationInfo info;
 				if (ShadowLedger::Get().Find(address, info)) {
 					if (info.flags & kFlagFreed) {
-						Report("double-free", "block " + DescribePtr(address) +
-												  " (size " + std::to_string(info.size) + ") freed again from " +
-												  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(_ReturnAddress())) +
-												  "; first free from " + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.freeSite)));
-						return;  // fail safe
+						// Report-only by default: the original is still called below. A
+						// diagnostic must not turn a false positive into a leak.
+						Report(DoubleFreeReportKind(GetAllocatorConfidence()),
+							"block " + DescribePtr(address) + " (size " + std::to_string(info.size) +
+								") freed again by MM from " +
+								ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(_ReturnAddress())) + "; " +
+								FormatDoubleFreeEvidence(info, FreeHookFamily::kMemoryManager));
+						if (!DecideDoubleFree(config.preventDoubleFree).callOriginal) {
+							return;  // explicit opt-in prevention only
+						}
+					} else {
+						info.flags |= kFlagFreed | kFlagFreedByMM;
+						info.freeSite = _ReturnAddress();
+						info.freeStack = CaptureStackIndex(1);
+						info.freeTick = NowTick();
+						info.vtableAtFree = SafeReadFirstQword(a_mem);
+						ShadowLedger::Get().Insert(address, info);
 					}
-					info.flags |= kFlagFreed;
-					info.freeSite = _ReturnAddress();
-					info.freeStack = CaptureStackIndex(1);
-					info.freeTick = NowTick();
-					info.vtableAtFree = SafeReadFirstQword(a_mem);
-					ShadowLedger::Get().Insert(address, info);
 				} else if (config.reportUntrackedFree) {
 					Report("invalid-free", "block " + DescribePtr(address) + " was never recorded as an allocation");
 				}
@@ -331,29 +353,28 @@ namespace hs
 			ShadowLedger::Get().Insert(info.ptr, info);
 		}
 
-		// Returns false when the block is already known to have been freed; the
-		// caller then refuses to call the original (fail safe). An untracked block
-		// is recorded as a freed-only entry: that is the provenance the stale
-		// GFxResource crash needs, and it is the only way to attribute objects
-		// allocated before the hooks were live.
-		[[nodiscard]] bool RecordScaleformFreeBeforePoison(void* a_mem, void* a_site, std::uint32_t a_stack)
+		// Report a suspected Scaleform double free with the full alloc-side
+		// evidence, and tell the caller whether it was one. The caller decides
+		// whether to still call the original (default: yes - report-only).
+		// Separated from the policy so the report and the action are independently
+		// visible, which is the whole point of the 0.5.0 fix.
+		[[nodiscard]] bool ReportScaleformDoubleFreeIfKnown(void* a_mem, void* a_site)
 		{
 			if (!a_mem || !Config::Get().ledgerEnabled) {
-				return true;
+				return false;
 			}
 
-			const auto address = reinterpret_cast<std::uintptr_t>(a_mem);
+			const auto      address = reinterpret_cast<std::uintptr_t>(a_mem);
 			AllocationInfo info;
-			if (ShadowLedger::Get().Find(address, info)) {
-				if (info.flags & kFlagFreed) {
-					Report("double-free", "Scaleform block " + DescribePtr(address) +
-										  " (size " + std::to_string(info.size) + ") freed again from " +
-										  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(a_site)) +
-										  "; first free from " +
-										  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.freeSite)));
-					return false;  // fail safe: never hand it back to the heap twice
-				}
+			if (!ShadowLedger::Get().Find(address, info) || (info.flags & kFlagFreed) == 0) {
+				return false;
 			}
+
+			Report(DoubleFreeReportKind(GetAllocatorConfidence()),
+				"Scaleform block " + DescribePtr(address) + " (size " + std::to_string(info.size) +
+					") freed again by SF from " +
+					ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(a_site)) + "; " +
+					FormatDoubleFreeEvidence(info, FreeHookFamily::kScaleform));
 			return true;
 		}
 
@@ -371,7 +392,7 @@ namespace hs
 			if (Config::Get().ledgerEnabled) {
 				AllocationInfo info;
 				if (ShadowLedger::Get().Find(address, info)) {
-					info.flags |= kFlagFreed | kFlagScaleform;
+					info.flags |= kFlagFreed | kFlagScaleform | kFlagFreedBySF;
 					if (a_poisonIndex != 0) {
 						info.flags |= kFlagPoisoned;
 					}
@@ -386,7 +407,7 @@ namespace hs
 					fresh.ptr = address;
 					fresh.size = a_size;
 					fresh.threadId = ::GetCurrentThreadId();
-					fresh.flags = kFlagFreed | kFlagScaleform;
+					fresh.flags = kFlagFreed | kFlagScaleform | kFlagFreedBySF;
 					if (a_poisonIndex != 0) {
 						fresh.flags |= kFlagPoisoned;
 					}
@@ -546,12 +567,26 @@ namespace hs
 				o_SfFree(a_self, a_mem);
 				return;
 			}
+
+			// M1 guard: if this exact pointer is already being freed on this thread
+			// (hk_SfFree -> o_SfFree -> hk_Deallocate), this is the same logical
+			// free, not a second one.
+			FreeReentrancy freeGuard(a_mem);
+			if (freeGuard.Nested()) {
+				o_SfFree(a_self, a_mem);
+				return;
+			}
+
 			const auto site = _ReturnAddress();
 			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
 			const auto tick = NowTick();
 
-			if (!RecordScaleformFreeBeforePoison(a_mem, site, stack)) {
-				return;  // fail safe: double free
+			if (ReportScaleformDoubleFreeIfKnown(a_mem, site)) {
+				if (!DecideDoubleFree(Config::Get().preventDoubleFree).callOriginal) {
+					return;  // explicit opt-in prevention only
+				}
+				o_SfFree(a_self, a_mem);  // report-only default: still free it
+				return;
 			}
 
 			const auto vtableAtFree = SafeReadFirstQword(a_mem);
@@ -857,6 +892,84 @@ namespace hs
 			++g_installed;
 			return true;
 		}
+
+		// Decide how much a double-free report may be trusted, by verifying the
+		// MemoryManager targets itself. A kPrologueMismatch means the bytes at our
+		// target are not the committed game function - the allocator has been
+		// replaced (EngineFixes bOverrideMemoryManager). That is exactly the
+		// configuration in which a confident [double-free] would be a lie, so it
+		// downgrades the report kind instead of pretending.
+		//
+		// This runs its own VerifyHookTarget rather than reading what
+		// VerifyAllTargets left behind, so it is safe to call in the bVerifyTargets=0
+		// escape hatch without emitting misleading "REFUSED" lines for hooks that
+		// are then installed anyway.
+		AllocatorConfidence AssessMemoryManagerConfidence(const HookTable* a_table, const TargetResolver& a_resolver,
+			bool a_verbose)
+		{
+			if (a_table == nullptr) {
+				SetAllocatorConfidence(AllocatorConfidence::kUnverified,
+					"no committed verification table matched this build");
+				return AllocatorConfidence::kUnverified;
+			}
+
+			const HookTargetId mmTargets[] = {
+				HookTargetId::kMemoryManagerAllocate,
+				HookTargetId::kMemoryManagerDeallocate,
+				HookTargetId::kMemoryManagerReallocate,
+			};
+
+			bool        overridden = false;
+			bool        allVerified = true;
+			std::string detail;
+			for (const auto id : mmTargets) {
+				auto&       status = g_targetStatus[static_cast<std::size_t>(id)];
+				const auto& target = GetHookTarget(id);
+				const auto  append = [&](std::string_view a_text) {
+                    if (!detail.empty()) {
+                        detail += "; ";
+                    }
+                    detail += a_text;
+                };
+
+				const auto* record = a_table->Find(target.name);
+				if (record == nullptr) {
+					allVerified = false;
+					append(std::string(target.name) + " has no table entry");
+					continue;
+				}
+				status.record = record;
+				status.check = VerifyHookTarget(*record, a_resolver);
+
+				if (status.check.verdict == TargetVerdict::kPrologueMismatch) {
+					overridden = true;
+					allVerified = false;
+					append(std::string(target.name) + " bytes differ from the committed game function (allocator replaced)");
+					continue;
+				}
+				if (!status.check.Verified()) {
+					allVerified = false;
+					append(std::string(target.name) + " " + TargetVerdictName(status.check.verdict));
+				}
+			}
+
+			if (overridden) {
+				SetAllocatorConfidence(AllocatorConfidence::kOverridden, detail);
+				logger::error("allocator confidence: OVERRIDDEN - {}; double-free reports will be marked unverified", detail);
+				Health::Degrade("MemoryManager is not the committed game function - double-free reports are unverified");
+				return AllocatorConfidence::kOverridden;
+			}
+			if (allVerified) {
+				SetAllocatorConfidence(AllocatorConfidence::kVerified,
+					"all MemoryManager targets matched the committed table");
+				return AllocatorConfidence::kVerified;
+			}
+			SetAllocatorConfidence(AllocatorConfidence::kUnverified, detail);
+			if (a_verbose) {
+				logger::warn("allocator confidence: UNVERIFIED - {}", detail);
+			}
+			return AllocatorConfidence::kUnverified;
+		}
 	}
 
 	bool InstallHooks()
@@ -882,18 +995,34 @@ namespace hs
 			logger::info("module identity: size {} timestamp 0x{:X} sizeofimage 0x{:X}",
 				actual.size, actual.timeDateStamp, actual.sizeOfImage);
 
+			const auto* table = SelectHookTable(actual);
+			const bool  tableMissing = (table == nullptr);
+			if (tableMissing) {
+				logger::error("hook target mismatch: this SkyrimSE.exe is not the build this revision was verified "
+							  "against (running size {} timestamp 0x{:X} sizeofimage 0x{:X}); hooks cannot be verified. "
+							  "Regenerate hooks/ with tools/gen-hooktable.py for this build.",
+					actual.size, actual.timeDateStamp, actual.sizeOfImage);
+				Health::Degrade("running SkyrimSE.exe is not the verified build");
+			}
+
 			if (!config.verifyTargets) {
+				// Escape hatch: install at whatever the Address Library resolves, as
+				// before. It leaves the sentinel DEGRADED. The assessment below still
+				// checks the allocator and marks reports kOverridden if it is not the
+				// game's function, but never claims kVerified.
 				ResolveAllTargetsUnverified(resolver);
-			} else {
-				const auto* table = SelectHookTable(actual);
-				if (table == nullptr) {
-					logger::error("hook target mismatch: this SkyrimSE.exe is not the build this revision was verified "
-								  "against (running size {} timestamp 0x{:X} sizeofimage 0x{:X}); ALL hooks disabled. "
-								  "Regenerate hooks/ with tools/gen-hooktable.py for this build.",
-						actual.size, actual.timeDateStamp, actual.sizeOfImage);
-					Health::Degrade("running SkyrimSE.exe is not the verified build - all hooks disabled");
+				AssessMemoryManagerConfidence(table, resolver, false);
+				if (GetAllocatorConfidence() != AllocatorConfidence::kOverridden) {
+					SetAllocatorConfidence(AllocatorConfidence::kUnverified,
+						"bVerifyTargets=0: the MemoryManager target was not verified");
+					logger::warn("allocator confidence: UNVERIFIED - bVerifyTargets=0");
 				}
+			} else if (tableMissing) {
+				SetAllocatorConfidence(AllocatorConfidence::kUnverified,
+					"no committed verification table matched this build; all hooks disabled");
+			} else {
 				VerifyAllTargets(table, resolver);
+				AssessMemoryManagerConfidence(table, resolver, true);
 			}
 		}
 
@@ -939,6 +1068,9 @@ namespace hs
 		}
 
 		logger::info("{} hooks installed and enabled of {} targets", g_installed, kHookTargetCount);
+		logger::info("allocator confidence: {} ({})", ConfidenceName(GetAllocatorConfidence()),
+			GetAllocatorConfidenceDetail().empty() ? std::string(ConfidenceReason(GetAllocatorConfidence()))
+												 : GetAllocatorConfidenceDetail());
 		// A run that degraded nothing is GREEN, not UNKNOWN: silence must never be
 		// ambiguous, and "unknown" would be indistinguishable from "never set".
 		if (Health::State() == ipc::HealthState::kUnknown) {

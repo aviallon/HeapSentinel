@@ -94,6 +94,7 @@ namespace hs
 		reportFreeze = ReadBool("Reporting", "bFreeze", reportFreeze, ini);
 		vehEnabled = ReadBool("Reporting", "bVeh", vehEnabled, ini);
 		reportUntrackedFree = ReadBool("Reporting", "bReportUntrackedFree", reportUntrackedFree, ini);
+		preventDoubleFree = ReadBool("Reporting", "bPreventDoubleFree", preventDoubleFree, ini);
 		reportSymbolHint = ReadBool("Reporting", "bSymbolHint", reportSymbolHint, ini);
 		maxReportsPerSecond = ReadUInt("Reporting", "uMaxReportsPerSecond", static_cast<std::uint32_t>(maxReportsPerSecond), ini);
 
@@ -101,5 +102,41 @@ namespace hs
 			enabled, verifyTargets, ledgerEnabled, guardPoolEnabled, guardPoolSampleRate, refCountGuardEnabled, refCountGuardFailSafe,
 			scaleformHeapEnabled, scaleformCaptureStacks, scaleformPoisonEnabled, scaleformPoisonMaxBlocks,
 			scaleformPoisonMaxBytes, weakLibHooksEnabled);
+	}
+
+	std::string Config::Summary() const
+	{
+		std::string behaviourChanging;
+		if (preventDoubleFree) {
+			behaviourChanging += "preventDoubleFree (suspected double free skipped -> leak)";
+		}
+		if (scaleformPoisonEnabled) {
+			if (!behaviourChanging.empty()) {
+				behaviourChanging += ", ";
+			}
+			behaviourChanging += "scaleformPoison (real free withheld + poison qword written)";
+		}
+		if (guardPoolEnabled) {
+			if (!behaviourChanging.empty()) {
+				behaviourChanging += ", ";
+			}
+			behaviourChanging += "guardPool (sampled blocks served from our region)";
+		}
+		if (refCountGuardFailSafe) {
+			if (!behaviourChanging.empty()) {
+				behaviourChanging += ", ";
+			}
+			behaviourChanging += "refCountGuardFailSafe (bad-vtable release skipped -> leak)";
+		}
+		if (behaviourChanging.empty()) {
+			behaviourChanging = "none (semantics-preserving)";
+		}
+
+		return "verifyTargets=" + std::to_string(verifyTargets ? 1 : 0) +
+			" ledger=" + std::to_string(ledgerEnabled ? 1 : 0) +
+			" scaleformHeap=" + std::to_string(scaleformHeapEnabled ? 1 : 0) +
+			" weaklib=" + std::to_string(weakLibHooksEnabled ? 1 : 0) +
+			" refCountGuard=" + std::to_string(refCountGuardEnabled ? 1 : 0) +
+			" behaviourChanging=" + behaviourChanging;
 	}
 }
