@@ -220,7 +220,7 @@ namespace hs
 		}
 
 		a_out = AllocationInfo{};
-		ShadowLedger::Get().Find(reinterpret_cast<std::uintptr_t>(slot->user), a_out);
+		(void)ShadowLedger::Get().Find(reinterpret_cast<std::uintptr_t>(slot->user), a_out);
 		a_out.ptr = reinterpret_cast<std::uintptr_t>(slot->user);
 		a_out.size = slot->size;
 

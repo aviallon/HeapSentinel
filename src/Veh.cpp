@@ -69,48 +69,57 @@ namespace hs
 			return result;
 		}
 
+		// The reporting body. It allocates (std::string) and therefore cannot
+		// live inside the __try frame: MSVC rejects __try in a function that
+		// requires object unwinding (C2712). It is called from Handler below,
+		// whose SEH frame catches any fault raised here.
+		LONG HandleException(EXCEPTION_POINTERS* a_info)
+		{
+			if (!a_info || !a_info->ExceptionRecord) {
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+			if (a_info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+			if (a_info->ExceptionRecord->NumberParameters < 2) {
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+
+			const auto faultAddr = static_cast<std::uintptr_t>(a_info->ExceptionRecord->ExceptionInformation[1]);
+
+			// 1. Our own guarded pool: the deterministic UAF/OOB case, with the
+			//    allocation and free stacks on record.
+			AllocationInfo slot;
+			if (GuardedPool::Get().OnFault(faultAddr, Config::Get().guardPoolFixUp, slot)) {
+				std::string detail = DescribeFault(a_info, faultAddr);
+				detail += "\n  guarded slot: size=" + std::to_string(slot.size);
+				detail += " allocSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(slot.allocSite));
+				detail += " freeSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(slot.freeSite));
+				if (const auto* alloc = ShadowLedger::Get().GetStack(slot.allocStack)) {
+					detail += "\n  alloc stack: " + FormatStack(*alloc);
+				}
+				if (const auto* freed = ShadowLedger::Get().GetStack(slot.freeStack)) {
+					detail += "\n  free  stack: " + FormatStack(*freed);
+				}
+				Report("guarded-slot-use-after-free", detail);
+
+				if (Config::Get().guardPoolFixUp) {
+					return EXCEPTION_CONTINUE_EXECUTION;
+				}
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+
+			// 2. Anything else: report and hand over. We do not swallow it.
+			if (Config::Get().vehEnabled) {
+				Report("access-violation", DescribeFault(a_info, faultAddr));
+			}
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
 		LONG CALLBACK Handler(EXCEPTION_POINTERS* a_info)
 		{
 			__try {
-				if (!a_info || !a_info->ExceptionRecord) {
-					return EXCEPTION_CONTINUE_SEARCH;
-				}
-				if (a_info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
-					return EXCEPTION_CONTINUE_SEARCH;
-				}
-				if (a_info->ExceptionRecord->NumberParameters < 2) {
-					return EXCEPTION_CONTINUE_SEARCH;
-				}
-
-				const auto faultAddr = static_cast<std::uintptr_t>(a_info->ExceptionRecord->ExceptionInformation[1]);
-
-				// 1. Our own guarded pool: this is the deterministic UAF/OOB
-				//    case, with the allocation and free stacks on record.
-				AllocationInfo slot;
-				if (GuardedPool::Get().OnFault(faultAddr, Config::Get().guardPoolFixUp, slot)) {
-					std::string detail = DescribeFault(a_info, faultAddr);
-					detail += "\n  guarded slot: size=" + std::to_string(slot.size);
-					detail += " allocSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(slot.allocSite));
-					detail += " freeSite=" + ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(slot.freeSite));
-					if (const auto* alloc = ShadowLedger::Get().GetStack(slot.allocStack)) {
-						detail += "\n  alloc stack: " + FormatStack(*alloc);
-					}
-					if (const auto* freed = ShadowLedger::Get().GetStack(slot.freeStack)) {
-						detail += "\n  free  stack: " + FormatStack(*freed);
-					}
-					Report("guarded-slot-use-after-free", detail);
-
-					if (Config::Get().guardPoolFixUp) {
-						return EXCEPTION_CONTINUE_EXECUTION;
-					}
-					return EXCEPTION_CONTINUE_SEARCH;
-				}
-
-				// 2. Anything else: report and hand over. We do not swallow it.
-				if (Config::Get().vehEnabled) {
-					Report("access-violation", DescribeFault(a_info, faultAddr));
-				}
-				return EXCEPTION_CONTINUE_SEARCH;
+				return HandleException(a_info);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 				// Never let the sentinel's own report path turn one fault into
 				// two; fall through to the real handler.

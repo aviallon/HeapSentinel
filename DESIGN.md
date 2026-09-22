@@ -87,6 +87,22 @@ with a call-the-original trampoline. MinHook handles prologue length decoding.
 turns out not to be inlined at the call sites we care about; most AddRefs are
 inlined and cannot be intercepted without patching every site.
 
+MinHook is the v0.1 choice because it is the lightest dependency, but it is the
+weakest link: its HDE64 disassembler is **length-only** and it does not
+advertise general RIP-relative relocation of the prologue bytes it copies into
+the trampoline (RESEARCH §5). The upgrade path is **SafetyHook**, which
+suspends the other threads, fixes their IPs, relocates RIP-relative
+displacements and widens short branches. Until then, each target's prologue
+should be verified before installing rather than trusting the Address Library
+blindly. The SKSE trampoline is deliberately not used: it is a branch writer,
+not a prologue relocator.
+
+These ids are not guesses. EngineFixes has shipped hooks on exactly these
+functions for years (`MemoryManager` 66859/68115 etc., `ScrapHeap`
+66882–66885, the Scaleform heap-init call site 80300/82323 + 0xED/0x16C), which
+is independent evidence that the chokepoints are real and hookable
+(RESEARCH §10).
+
 ### 3.1 Why `MemoryManager` is the primary chokepoint
 
 It is the facade every engine allocation goes through, and its prologue reads
@@ -188,6 +204,16 @@ returned by any of the engine's heaps, so the engine must never call
 engine code that inspects a heap directly would be surprised. Hence default
 `bEnabled=0`, a low sample rate, and a size cap.
 
+Sizing follows Chromium's production numbers (RESEARCH §3.1): ~400 bytes of
+metadata per slot against 4 KB per allocation; 1/1000 sampling with 16 slots
+exhausts on long-lived allocations while 1/8000 with 64 slots samples a whole
+process lifetime; and up to a 5 % regression from the instrumentation alone,
+however low the rate. The defaults above (64 slots, 1/2000, one data page)
+sit inside that envelope. Like Chromium, the region should be reserved at a
+high address so a wild pointer is unlikely to land in it by accident, and
+left/right alignment is randomized so under- and overflows are equally likely
+to hit a guard page.
+
 ## 6. Reporting
 
 `Core/Report` is the product. A report contains:
@@ -211,6 +237,13 @@ engine code that inspects a heap directly would be surprised. Hence default
 Reports go to `HeapSentinel.log` (spdlog, next to the other SKSE logs) and to a
 dedicated `HeapSentinel-reports.log`. Rate limiting (`uMaxReportsPerSecond`,
 default 20) prevents a fault storm from hanging the game.
+
+Known hazard, on the roadmap: the VEH runs on the faulting thread inside a
+corrupt process, and Microsoft's guidance is that a vectored handler "should
+not call functions that acquire synchronization objects or allocate memory".
+`Report` currently builds `std::string`s and writes through spdlog, i.e. it
+allocates. The fix is a preallocated report ring buffer that the handler fills
+and a watchdog thread drains (RESEARCH §8).
 
 ## 7. Exception handling
 
@@ -276,6 +309,8 @@ ledger is unavailable.
 |---|---|
 | The sentinel itself crashes the game | fail-open ledger; no allocation/locks/logging in hooks; MinHook only, no hand-rolled trampolines; every hook wrapped so an exception disables it and passes through |
 | Hooking hot functions costs frames | per-thread/sharded tables; stack capture sampled or off; guard pool opt-in |
+| MinHook copies prologue bytes with a length-only disassembler | verify each target's prologue before installing; upgrade to SafetyHook (IP fix-up + RIP-relative relocation) |
+| The VEH allocates while reporting | preallocated report ring + watchdog drain (roadmap) |
 | Inlined `Release`/`AddRef` are not intercepted | documented limitation; the standalone `Release` is the one on the observed crash stack |
 | The engine does not know our sampled region | guard pool off by default, size-capped, and frees/reallocs intercepted |
 | Poisoning corrupts the allocator | poison only the payload beyond the allocator's private prefix; never touch `Block::sizeFlags`/free-list fields; start with `ScrapHeap` sizes only |
