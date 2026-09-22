@@ -14,6 +14,14 @@ namespace hs
 		// Master switch. When false the plugin installs nothing at all.
 		bool enabled = true;
 
+		// [Hooks] Verify every hook target against the committed table for this
+		// exact game build (identity, Address Library id, vtable slot, prologue
+		// hash) before installing it. On a mismatch the hook is REFUSED and the
+		// sentinel reports DEGRADED instead of patching an address it cannot name.
+		// Turning this off is an escape hatch, not a supported mode: it leaves the
+		// sentinel DEGRADED and says so in the log.
+		bool verifyTargets = true;
+
 		// [Ledger] - shadow allocation ledger (pointer -> metadata).
 		bool        ledgerEnabled = true;
 		// One entry per live allocation. Skyrim has well over a million live
