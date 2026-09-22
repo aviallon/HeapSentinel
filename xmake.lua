@@ -52,4 +52,8 @@ target("HeapSentinel")
     add_files("lib/minhook/src/hook.c", "lib/minhook/src/buffer.c", "lib/minhook/src/trampoline.c", "lib/minhook/src/hde/hde64.c")
     add_includedirs("lib/minhook/include", "lib/minhook/src", "lib/minhook/src/hde")
     add_defines("WIN32_LEAN_AND_MEAN", "NOMINMAX")
+
+    -- GDI/user32 for the optional report screenshot (CreateDIBSection, BitBlt,
+    -- PrintWindow, GetDC/ReleaseDC, GetForegroundWindow).
+    add_syslinks("gdi32", "user32")
 target_end()
