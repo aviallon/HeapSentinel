@@ -257,6 +257,30 @@ is committed and the first qword looks like a vtable, **not** that it is the
 same heap object; a heap destroyed inside the retention window would be refused
 (block leaked) rather than called.
 
+### 4.3 Bloom pre-filter (read path only)
+
+A crash lands on an address that is almost never one of our blocks, so the
+common case on the read side is a MISS. Both the ledger and the free ring
+therefore sit behind a lock-free `BloomFilter`:
+
+- **Read-only in the VEH:** `MightContain` is a handful of relaxed atomic
+  loads. No lock, no seqlock, no probing, no allocation. A miss short-circuits
+  the lookup, so the dangerous surface inside the exception handler shrinks to
+  one read for the overwhelmingly common case.
+- **Never a positive decision.** A set bit may be a false positive; only the
+  exact store confirms. A miss maps to *unknown*, never to a bug.
+- **Off the alloc/dealloc write path.** There the common case is a HIT, which a
+  bloom filter cannot confirm, so it would be pure added cost.
+- **Sized to the store capacity, ~10 bits/element (~1% FP), non-aging** in
+  production. An aging two-half filter is implemented and tested (clear the
+  older half at a fill threshold and swap; `Swaps()` is reported), but if the
+  filter window is shorter than the store's own retention, a false negative
+  would silently drop attribution for a record the store still holds. So the
+  production filters are sized to the ledger/free-ring capacity and never
+  cleared; a key inserted since `Init` always has its bits set. Bytes: ~5 MiB
+  for a 4 M ledger (~1.25 MiB at the deployed 1 M) and ~1.25 MiB for a 1 M
+  free ring.
+
 Ledger operations used by the hooks:
 
 | Event | Check | Action |
@@ -465,3 +489,40 @@ a watchdog thread; fail open when the ledger or quarantine is unavailable.
   payload poison + write-after-free check on `ScrapHeap` blocks.
 - **v0.5**: a "bisect" mode that narrows sampling to one size range or one
   allocation site, for reproducing a specific bug.
+
+## 12. Testing and sanitizers
+
+The off-game suite is a separate xmake project (`tests/`) that builds and RUNS
+on Linux and Windows, so the layout/`static_assert`s and the new attribution
+cores are a claim about two toolchains, not one. The suite counts failures and
+asserts a non-trivial check count, so a runner that executes nothing cannot look
+like success.
+
+**Harness: keep the dependency-free one (decision).** Its zero-dependency
+nature is exactly why `tests/` builds and runs with nothing but a compiler.
+GoogleTest's value-add (fixtures, matchers, mocks, death tests) only starts
+paying off when the surface is large and mock-heavy - i.e. Phase B with libmdbx.
+When that happens, vendor it **as a submodule** like MinHook and
+CommonLibSSE-NG, never as a network fetch, so CI stays hermetic.
+
+**ASan + UBSan** run as a separate `sanitize` CI job on the off-game suite,
+configured with `-fsanitize=address,undefined -fno-omit-frame-pointer`, with
+`ASAN_OPTIONS`/`UBSAN_OPTIONS` `halt_on_error=1`. Leak detection is off on
+purpose: the harness and the single-instance cores keep state alive for the
+whole process by design, so LSAN would report those as leaks and drown the
+signal. A sanitizer job that has never been observed to fail is not evidence,
+so it was proven able to fail with a temporary deliberate out-of-bounds access
+(see the report).
+
+**TSan is deliberately not enabled.** It does not understand seqlocks, and the
+per-entry seqlock and the lock-free rings read/write payload fields
+non-atomically by design, so TSan would flag every one as a race and drown the
+real signal. Enabling it later needs suppressions/annotations and is a separate
+deliberate decision - do not "helpfully" turn it on.
+
+**Reach of the tests, stated honestly.** The ledger, bloom, quarantine,
+free-ring and verdict logic are unit-tested off-game. The Scaleform **hook
+wiring** and the poison path are NOT unit-testable here: there is no game to
+hook. They are verified only by "the DLL contains these strings" plus CI
+compiling the Windows plugin and running the off-game suite; the in-game
+behaviour is unobserved.

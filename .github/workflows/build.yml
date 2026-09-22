@@ -190,3 +190,53 @@ jobs:
           echo "checks executed: ${checks:-<none>}"
           test -n "$checks" || { echo "::error::could not read the check count"; exit 1; }
           test "$checks" -gt 5000 || { echo "::error::only $checks checks ran - the suite did not really execute"; exit 1; }
+
+  # ASan + UBSan on the off-game suite. A SEPARATE job so a sanitizer finding is
+  # attributable to the sanitizer rather than conflated with the plain run.
+  #
+  # TSan is deliberately NOT enabled: it does not understand seqlocks, and the
+  # per-entry seqlock and the lock-free rings read/write payload fields
+  # non-atomically by design, so TSan would flag every one of them and drown the
+  # real signal. Adding it later needs suppressions/annotations and is a
+  # deliberate separate decision.
+  sanitize:
+    name: off-game tests (asan+ubsan, ${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure with ASan+UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          xmake f -P tests -p ${{ matrix.platform }} -m debug \
+            --cxflags="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            --ldflags="-fsanitize=address,undefined" -y
+
+      - name: Build
+        shell: bash
+        run: xmake build -P tests -y
+
+      - name: Run under ASan+UBSan (errors fatal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Leak detection is OFF ON PURPOSE: the harness and the cores keep
+          # singleton state alive for the whole process by design, so LSAN would
+          # report those as leaks and drown the signal. ASan AND UBSan errors are
+          # fatal (halt_on_error=1), so a real finding fails the job, and
+          # pipefail propagates a sanitizer abort through tee.
+          export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0:print_stacktrace=1
+          export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+          xmake run -P tests 2>&1 | tee sanitize.out
+          grep -qE '0 failure\(s\)' sanitize.out || { echo "::error::the sanitized suite reported failures"; exit 1; }
