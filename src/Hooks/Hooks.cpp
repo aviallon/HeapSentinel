@@ -4,9 +4,12 @@
 
 #include "Core/GuardedPool.h"
 #include "Core/ModuleMap.h"
+#include "Core/PoisonQuarantine.h"
 #include "Core/Report.h"
+#include "Core/ScaleformFreeRing.h"
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
+#include "Core/WeakLibEvents.h"
 #include "Config.h"
 
 #include <MinHook.h>
@@ -39,6 +42,15 @@ namespace hs
 		using SfReallocFn = void*(*)(void* a_self, void* a_oldMem, std::size_t a_newSize);                       // 84540
 		using SfFreeFn = void(*)(void* a_self, void* a_mem);                                                    // 84520
 
+		// GFxResourceWeakLib context (0.3.0). AE Address Library ids 82783/82796/
+		// 82798/82802, re-derived from the engine binary and versionlib-1-7-104-0.bin:
+		//   82783 GFxResource::AddRef         0x140D077D0  lock xadd [rcx+8]  (resource)
+		//   82796 GFxResourceWeakLib::PinResource            0x140D07F30  (weakLib, resource)
+		//   82798 GFxResourceWeakLib::RemoveResourceOnRelease 0x140D08000 (weakLib, resource)
+		//   82802 GFxResourceWeakLib::UnpinResource          0x140D08360  (weakLib, resource)
+		using WlAddRefFn = std::uint32_t (*)(void* a_resource);
+		using WlResourceFn = void (*)(void* a_weakLib, void* a_resource);
+
 		AllocateFn   o_Allocate = nullptr;
 		DeallocateFn o_Deallocate = nullptr;
 		ReallocateFn o_Reallocate = nullptr;
@@ -50,6 +62,11 @@ namespace hs
 		SfAutoAlloc1Fn o_SfAllocAuto1 = nullptr;
 		SfReallocFn    o_SfRealloc = nullptr;
 		SfFreeFn       o_SfFree = nullptr;
+
+		WlAddRefFn   o_WlAddRef = nullptr;
+		WlResourceFn o_WlPin = nullptr;
+		WlResourceFn o_WlRemove = nullptr;
+		WlResourceFn o_WlUnpin = nullptr;
 
 		[[nodiscard]] std::uint32_t CaptureStackIndex(std::uint32_t a_skip)
 		{
@@ -68,6 +85,36 @@ namespace hs
 			std::snprintf(buffer, sizeof(buffer), "0x%llX (%s)", static_cast<unsigned long long>(a_ptr),
 				ClassifyAddress(a_ptr).c_str());
 			return buffer;
+		}
+
+		[[nodiscard]] std::uint64_t NowTick()
+		{
+			return ::GetTickCount64();
+		}
+
+		// Fault-safe read of a block's first qword. Used on both the alloc and
+		// free hooks; a bad pointer must not turn the sentinel into a second
+		// fault. No C++ objects live in this frame, so SEH is legal here.
+		[[nodiscard]] std::uintptr_t SafeReadFirstQword(const void* a_ptr)
+		{
+			__try {
+				return *static_cast<const std::uintptr_t*>(a_ptr);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		[[nodiscard]] bool IsReadableRegion(const void* a_ptr)
+		{
+			MEMORY_BASIC_INFORMATION mbi{};
+			if (!::VirtualQuery(a_ptr, &mbi, sizeof(mbi))) {
+				return false;
+			}
+			if (mbi.State != MEM_COMMIT) {
+				return false;
+			}
+			constexpr DWORD bad = PAGE_NOACCESS | PAGE_GUARD;
+			return (mbi.Protect & bad) == 0;
 		}
 
 		void* hk_Allocate(RE::MemoryManager* a_self, std::size_t a_size, std::int32_t a_alignment, bool a_alignmentRequired)
@@ -97,6 +144,8 @@ namespace hs
 				info.flags = kFlagLive;
 				info.allocSite = _ReturnAddress();
 				info.allocStack = CaptureStackIndex(1);
+				info.allocTick = NowTick();
+				info.vtableAtAlloc = SafeReadFirstQword(result);
 				ShadowLedger::Get().Insert(info.ptr, info);
 			}
 
@@ -137,6 +186,8 @@ namespace hs
 					info.flags |= kFlagFreed;
 					info.freeSite = _ReturnAddress();
 					info.freeStack = CaptureStackIndex(1);
+					info.freeTick = NowTick();
+					info.vtableAtFree = SafeReadFirstQword(a_mem);
 					ShadowLedger::Get().Insert(address, info);
 				} else if (config.reportUntrackedFree) {
 					Report("invalid-free", "block " + DescribePtr(address) + " was never recorded as an allocation");
@@ -185,6 +236,8 @@ namespace hs
 				info.flags = kFlagLive;
 				info.allocSite = _ReturnAddress();
 				info.allocStack = CaptureStackIndex(1);
+				info.allocTick = NowTick();
+				info.vtableAtAlloc = SafeReadFirstQword(result);
 				ShadowLedger::Get().Insert(info.ptr, info);
 			}
 
@@ -264,15 +317,17 @@ namespace hs
 			info.flags = kFlagLive | kFlagScaleform;
 			info.allocSite = a_site;
 			info.allocStack = a_stack;
+			info.allocTick = NowTick();
+			info.vtableAtAlloc = SafeReadFirstQword(a_ptr);
 			ShadowLedger::Get().Insert(info.ptr, info);
 		}
 
 		// Returns false when the block is already known to have been freed; the
 		// caller then refuses to call the original (fail safe). An untracked block
 		// is recorded as a freed-only entry: that is the provenance the stale
-		// GFxResource crash needs ("object X was freed by this stack"), and it is
-		// the only way to attribute objects allocated before the hooks were live.
-		[[nodiscard]] bool RecordScaleformFree(void* a_mem, void* a_site, std::uint32_t a_stack)
+		// GFxResource crash needs, and it is the only way to attribute objects
+		// allocated before the hooks were live.
+		[[nodiscard]] bool RecordScaleformFreeBeforePoison(void* a_mem, void* a_site, std::uint32_t a_stack)
 		{
 			if (!a_mem || !Config::Get().ledgerEnabled) {
 				return true;
@@ -289,20 +344,142 @@ namespace hs
 										  ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.freeSite)));
 					return false;  // fail safe: never hand it back to the heap twice
 				}
-				info.flags |= kFlagFreed | kFlagScaleform;
-				info.freeSite = a_site;
-				info.freeStack = a_stack;
-				ShadowLedger::Get().Insert(address, info);
-			} else {
-				AllocationInfo fresh;
-				fresh.ptr = address;
-				fresh.size = 0;
-				fresh.threadId = ::GetCurrentThreadId();
-				fresh.flags = kFlagFreed | kFlagScaleform;
-				fresh.freeSite = a_site;
-				fresh.freeStack = a_stack;
-				ShadowLedger::Get().Insert(address, fresh);
 			}
+			return true;
+		}
+
+		[[nodiscard]] std::size_t KnownScaleformSize(std::uintptr_t a_address)
+		{
+			AllocationInfo info;
+			return ShadowLedger::Get().Find(a_address, info) ? info.size : 0;
+		}
+
+		void RecordScaleformFree(void* a_mem, std::size_t a_size, std::uintptr_t a_vtableAtFree, void* a_site,
+			std::uint32_t a_stack, std::uint64_t a_tick, std::uint32_t a_poisonIndex)
+		{
+			const auto address = reinterpret_cast<std::uintptr_t>(a_mem);
+
+			if (Config::Get().ledgerEnabled) {
+				AllocationInfo info;
+				if (ShadowLedger::Get().Find(address, info)) {
+					info.flags |= kFlagFreed | kFlagScaleform;
+					if (a_poisonIndex != 0) {
+						info.flags |= kFlagPoisoned;
+					}
+					info.freeSite = a_site;
+					info.freeStack = a_stack;
+					info.freeTick = a_tick;
+					info.vtableAtFree = a_vtableAtFree;
+					info.poisonIndex = a_poisonIndex;
+					ShadowLedger::Get().Insert(address, info);
+				} else {
+					AllocationInfo fresh;
+					fresh.ptr = address;
+					fresh.size = a_size;
+					fresh.threadId = ::GetCurrentThreadId();
+					fresh.flags = kFlagFreed | kFlagScaleform;
+					if (a_poisonIndex != 0) {
+						fresh.flags |= kFlagPoisoned;
+					}
+					fresh.freeSite = a_site;
+					fresh.freeStack = a_stack;
+					fresh.freeTick = a_tick;
+					fresh.vtableAtFree = a_vtableAtFree;
+					fresh.poisonIndex = a_poisonIndex;
+					ShadowLedger::Get().Insert(address, fresh);
+				}
+			}
+
+			// Durable provenance, evict-oldest and separately budgeted.
+			ScaleformFreeRecord record;
+			record.ptr = address;
+			record.vtableAtFree = a_vtableAtFree;
+			record.size = a_size;
+			record.freeSite = a_site;
+			record.freeStack = a_stack;
+			record.poisonIndex = a_poisonIndex;
+			record.freeTick = a_tick;
+			record.threadId = ::GetCurrentThreadId();
+			ScaleformFreeRing::Get().Record(record);
+		}
+
+		// Really free one withheld block. The heap pointer is validated before we
+		// call into it: a destroyed heap is refused (that block leaks) rather than
+		// called. Residual risk remains: VirtualQuery only proves the page is
+		// committed, and the module-map plausibility check only proves the first
+		// qword looks like a vtable - neither proves it is the same GMemoryHeapPT.
+		bool DrainOneQuarantined()
+		{
+			QuarantineRecord record;
+			if (!PoisonQuarantine::Get().PopOldest(record)) {
+				return false;
+			}
+			if (!record.heap) {
+				return true;
+			}
+
+			const auto heap = reinterpret_cast<std::uintptr_t>(record.heap);
+			if (!IsReadableRegion(record.heap) || !IsPlausibleVTable(SafeReadFirstQword(record.heap))) {
+				logger::warn("poison quarantine: refusing to drain 0x{:X}: its heap 0x{:X} no longer looks like a live GMemoryHeapPT (leaking the block)",
+					record.ptr, heap);
+				return true;
+			}
+
+			o_SfFree(record.heap, reinterpret_cast<void*>(record.ptr));
+			return true;
+		}
+
+		// Try to withhold this block's real free. Returns true when the block was
+		// poisoned (poisonIndex set) and the caller must NOT call the original.
+		bool TryPoisonOnFree(void* a_mem, void* a_heap, std::size_t a_size, void* a_site, std::uint32_t a_stack,
+			std::uint64_t a_tick, std::uintptr_t a_vtableAtFree, std::uint32_t& a_poisonIndex)
+		{
+			a_poisonIndex = 0;
+			auto& quarantine = PoisonQuarantine::Get();
+			if (!Config::Get().scaleformPoisonEnabled || !quarantine.Ready()) {
+				return false;
+			}
+			// The poison is one qword; never write past a block we know is smaller.
+			if (a_size != 0 && a_size < sizeof(std::uintptr_t)) {
+				return false;
+			}
+			if (!IsReadableRegion(a_mem)) {
+				return false;  // a free of an unmapped block: let the engine report it
+			}
+
+			// Drain oldest-first until the budget admits this block. Bounded:
+			// PopOldest empties the ring, so this loop terminates.
+			std::size_t drains = 0;
+			while (quarantine.OverBudget(a_size) && drains < (1u << 20)) {
+				if (!DrainOneQuarantined()) {
+					break;
+				}
+				++drains;
+			}
+			if (quarantine.OverBudget(a_size)) {
+				return false;  // still over budget: fail open
+			}
+
+			const auto index = quarantine.Reserve();
+			if (index == 0) {
+				return false;
+			}
+
+			QuarantineRecord record;
+			record.ptr = reinterpret_cast<std::uintptr_t>(a_mem);
+			record.heap = a_heap;
+			record.size = a_size;
+			record.vtableAtFree = a_vtableAtFree;
+			record.freeSite = a_site;
+			record.freeStack = a_stack;
+			record.index = index;
+			record.freeTick = a_tick;
+
+			// Poison first, publish second: a reader that finds the record must
+			// already be able to trust the poison value in the block.
+			*reinterpret_cast<volatile std::uintptr_t*>(a_mem) = quarantine.PoisonFor(index);
+			quarantine.Publish(record);
+			a_poisonIndex = index;
 			return true;
 		}
 
@@ -362,9 +539,22 @@ namespace hs
 			}
 			const auto site = _ReturnAddress();
 			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
-			if (!RecordScaleformFree(a_mem, site, stack)) {
-				return;  // fail safe
+			const auto tick = NowTick();
+
+			if (!RecordScaleformFreeBeforePoison(a_mem, site, stack)) {
+				return;  // fail safe: double free
 			}
+
+			const auto vtableAtFree = SafeReadFirstQword(a_mem);
+			const auto size = KnownScaleformSize(reinterpret_cast<std::uintptr_t>(a_mem));
+
+			std::uint32_t poisonIndex = 0;
+			if (TryPoisonOnFree(a_mem, a_self, size, site, stack, tick, vtableAtFree, poisonIndex)) {
+				RecordScaleformFree(a_mem, size, vtableAtFree, site, stack, tick, poisonIndex);
+				return;  // real free withheld; a later call through the block hits poison
+			}
+
+			RecordScaleformFree(a_mem, size, vtableAtFree, site, stack, tick, 0);
 			o_SfFree(a_self, a_mem);
 		}
 
@@ -384,6 +574,73 @@ namespace hs
 				RecordScaleformAlloc(result, a_newSize, site, stack);
 			}
 			return result;
+		}
+
+		// --- GFxResourceWeakLib context -----------------------------------
+		//
+		// Low-frequency (menu load/close), so recording is free relative to the
+		// heap hooks. The event ring is bounded and evicts oldest-first.
+
+		[[nodiscard]] bool WeakLibTrackingEnabled()
+		{
+			const auto& config = Config::Get();
+			return config.enabled && config.weakLibHooksEnabled && config.ledgerEnabled;
+		}
+
+		void RecordWeakLibEvent(WeakLibEventKind a_kind, void* a_resource, void* a_site)
+		{
+			if (!a_resource) {
+				return;
+			}
+			const auto resource = reinterpret_cast<std::uintptr_t>(a_resource);
+
+			WeakLibEvents::Get().Record(a_kind, resource, a_site, NowTick(), ::GetCurrentThreadId());
+
+			// Refresh the last vtable seen on this live resource, so the verdict
+			// can tell "changed since we last saw it" from "always garbage".
+			AllocationInfo info;
+			if (ShadowLedger::Get().Find(resource, info) && !(info.flags & kFlagFreed)) {
+				const auto seen = SafeReadFirstQword(a_resource);
+				if (seen && IsPlausibleVTable(seen)) {
+					info.lastKnownVtable = seen;
+					if ((info.flags & kFlagScaleform) == 0) {
+						info.flags |= kFlagScaleform;  // it is a Scaleform resource now
+					}
+					ShadowLedger::Get().Insert(resource, info);
+				}
+			}
+		}
+
+		std::uint32_t hk_WlAddRef(void* a_resource)
+		{
+			if (WeakLibTrackingEnabled()) {
+				RecordWeakLibEvent(WeakLibEventKind::kAddRef, a_resource, _ReturnAddress());
+			}
+			return o_WlAddRef(a_resource);
+		}
+
+		void hk_WlPin(void* a_weakLib, void* a_resource)
+		{
+			if (WeakLibTrackingEnabled()) {
+				RecordWeakLibEvent(WeakLibEventKind::kPin, a_resource, _ReturnAddress());
+			}
+			o_WlPin(a_weakLib, a_resource);
+		}
+
+		void hk_WlRemove(void* a_weakLib, void* a_resource)
+		{
+			if (WeakLibTrackingEnabled()) {
+				RecordWeakLibEvent(WeakLibEventKind::kRemoveOnRelease, a_resource, _ReturnAddress());
+			}
+			o_WlRemove(a_weakLib, a_resource);
+		}
+
+		void hk_WlUnpin(void* a_weakLib, void* a_resource)
+		{
+			if (WeakLibTrackingEnabled()) {
+				RecordWeakLibEvent(WeakLibEventKind::kUnpin, a_resource, _ReturnAddress());
+			}
+			o_WlUnpin(a_weakLib, a_resource);
 		}
 
 		template <class T>
@@ -427,8 +684,8 @@ namespace hs
 			InstallOne("GRefCountImpl::Release", 0, 82197, reinterpret_cast<void*>(&hk_Release), &o_Release);
 		}
 
-		// Scaleform/GFx heap (GMemoryHeapPT). AE Address Library ids only; the SE
-		// ids are not verified here, so (like the Release hook above) this is
+		// Scaleform/GFx heap (GMemoryHeapPT). AE Address Library ids only; the
+		// SE ids are not verified here, so (like the Release hook above) this is
 		// AE-only. ids 84498/84499/84501/84502/84520/84540, verified against
 		// versionlib-1-7-104-0.bin and the engine's own ??_7GMemoryHeapPT vtable.
 		if (config.scaleformHeapEnabled) {
@@ -438,6 +695,16 @@ namespace hs
 			InstallOne("GMemoryHeapPT::AllocAutoHeap(size)", 0, 84502, reinterpret_cast<void*>(&hk_SfAllocAuto1), &o_SfAllocAuto1);
 			InstallOne("GMemoryHeapPT::Realloc", 0, 84540, reinterpret_cast<void*>(&hk_SfRealloc), &o_SfRealloc);
 			InstallOne("GMemoryHeapPT::Free", 0, 84520, reinterpret_cast<void*>(&hk_SfFree), &o_SfFree);
+		}
+
+		// GFxResourceWeakLib context. These ids are re-derived (versionlib +
+		// disassembly); the prologues begin with a 5-byte mov, so MinHook's
+		// 5-byte prologue copy does not relocate the later RIP-relative calls.
+		if (config.weakLibHooksEnabled) {
+			InstallOne("GFxResource::AddRef", 0, 82783, reinterpret_cast<void*>(&hk_WlAddRef), &o_WlAddRef);
+			InstallOne("GFxResourceWeakLib::PinResource", 0, 82796, reinterpret_cast<void*>(&hk_WlPin), &o_WlPin);
+			InstallOne("GFxResourceWeakLib::RemoveResourceOnRelease", 0, 82798, reinterpret_cast<void*>(&hk_WlRemove), &o_WlRemove);
+			InstallOne("GFxResourceWeakLib::UnpinResource", 0, 82802, reinterpret_cast<void*>(&hk_WlUnpin), &o_WlUnpin);
 		}
 
 		const auto enable = MH_EnableHook(MH_ALL_HOOKS);

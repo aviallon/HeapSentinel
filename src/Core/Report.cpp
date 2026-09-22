@@ -3,6 +3,7 @@
 #include "Core/Report.h"
 #include "Core/GuardedPool.h"
 #include "Core/ModuleMap.h"
+#include "Core/PoisonQuarantine.h"
 #include "Core/ShadowLedger.h"
 #include "Config.h"
 
@@ -87,6 +88,10 @@ namespace hs
 		}
 		if (GuardedPool::Get().IsOurs(a_addr)) {
 			return "guarded-pool slot";
+		}
+		std::uint32_t poisonIndex = 0;
+		if (PoisonQuarantine::Get().DecodeFault(a_addr, poisonIndex)) {
+			return "HeapSentinel poison slot " + std::to_string(poisonIndex) + " (a withheld Scaleform free)";
 		}
 		if (a_addr == 0xFFFFFFFFFFFFFFFFull) {
 			return "0xFFFFFFFFFFFFFFFF (-1): a destroyed vtable or a bad indirect call";
