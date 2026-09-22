@@ -22,10 +22,17 @@ namespace
 		}
 		switch (a_msg->type) {
 		case SKSE::MessagingInterface::kPostLoad:
+			hs::ModuleMap::Get().Refresh();
+			hs::ModuleMap::Get().SetComplete();
+			logger::info("module map complete: {} modules", hs::ModuleMap::Get().Size());
+			break;
 		case SKSE::MessagingInterface::kDataLoaded:
 			hs::ModuleMap::Get().Refresh();
 			hs::ModuleMap::Get().SetComplete();
 			logger::info("module map complete: {} modules", hs::ModuleMap::Get().Size());
+			// Proof that the MemoryManager thunks actually ran: the ledger is only
+			// written by the Allocate/Deallocate hooks.
+			logger::info("ledger after data load: {} tracked blocks", hs::ShadowLedger::Get().Count());
 			break;
 		default:
 			break;
