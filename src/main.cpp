@@ -3,9 +3,12 @@
 #include "Config.h"
 #include "Core/GuardedPool.h"
 #include "Core/ModuleMap.h"
+#include "Core/PoisonQuarantine.h"
 #include "Core/Report.h"
+#include "Core/ScaleformFreeRing.h"
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
+#include "Core/WeakLibEvents.h"
 #include "Hooks/Hooks.h"
 #include "Veh.h"
 
@@ -45,7 +48,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	hs::SetupLog();
 
-	logger::info("HeapSentinel v0.1.1 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
+	logger::info("HeapSentinel v0.3.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
 
 	if (auto* messaging = SKSE::GetMessagingInterface()) {
 		messaging->RegisterListener("SKSE", OnMessage);
@@ -72,6 +75,32 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 		hs::GuardedPool::Get().Init(config.guardPoolSlots, config.guardPoolMaxSize, config.guardPoolSampleRate);
 	}
 
+	// The Scaleform free ring is the DURABLE provenance store: separate from the
+	// main ledger so engine allocations keep flowing, evict-oldest when full, and
+	// its occupancy/evictions are logged so a lossy run is legible.
+	if (config.scaleformHeapEnabled) {
+		hs::ScaleformFreeRing::Get().Init(config.scaleformFreeCapacity);
+	}
+
+	// Poison-on-free needs a reserved, never-committed region so every poison
+	// address faults. Address space only; no RAM until a block is withheld.
+	if (config.scaleformHeapEnabled && config.scaleformPoisonEnabled) {
+		const auto blocks = hs::PoisonQuarantine::RoundUpCapacity(config.scaleformPoisonMaxBlocks);
+		const auto bytes = blocks * 0x1000u;
+		if (auto* base = static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS))) {
+			hs::PoisonQuarantine::Get().Init(config.scaleformPoisonMaxBlocks, config.scaleformPoisonMaxBytes,
+				reinterpret_cast<std::uintptr_t>(base), 0x1000);
+			logger::info("poison region: {} blocks x 0x1000 reserved at 0x{:X}, {} MiB address space (never committed)",
+				blocks, reinterpret_cast<std::uintptr_t>(base), bytes / (1u << 20));
+		} else {
+			logger::warn("poison region reserve failed ({}); poison-on-free will fail open", ::GetLastError());
+		}
+	}
+
+	if (config.weakLibHooksEnabled) {
+		hs::WeakLibEvents::Get().Init(config.weakLibEventCapacity);
+	}
+
 	if (config.vehEnabled) {
 		hs::InstallVeh();
 	}
@@ -80,12 +109,40 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 
 	// Periodic stats so a soak test is observable: if the ledger stays bounded
 	// (and keeps changing) the hooks are live and the bounded-probe eviction is
-	// working; if it is stuck, recording has stopped.
+	// working; if it is stuck, recording has stopped. A one-shot warning the
+	// first time insert failures appear makes a saturated ledger loud instead of
+	// silently dropping the allocations the crash hunt depends on.
 	std::thread([] {
+		bool warnedSaturated = false;
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::seconds(60));
-			logger::info("stats: {} ledger entries, {} insert failures",
-				hs::ShadowLedger::Get().Count(), hs::ShadowLedger::Get().InsertFailures());
+			const auto failures = hs::ShadowLedger::Get().InsertFailures();
+			const auto drops = hs::ShadowLedger::Get().WriterDrops();
+
+			std::uint64_t oldestTick = 0;
+			std::uint64_t newestTick = 0;
+			const bool    haveWindow = hs::ScaleformFreeRing::Get().RetentionTicks(oldestTick, newestTick);
+
+			logger::info("stats: {} ledger entries, {} insert failures, {} writer drops (capacity {})",
+				hs::ShadowLedger::Get().Count(), failures, drops, hs::ShadowLedger::Get().Capacity());
+			logger::info("stats: scaleform free ring {}/{} records, {} evictions, retention {}",
+				hs::ScaleformFreeRing::Get().Count(), hs::ScaleformFreeRing::Get().Capacity(),
+				hs::ScaleformFreeRing::Get().Evictions(),
+				haveWindow ? (std::to_string((newestTick - oldestTick) / 1000) + " s") : std::string("n/a"));
+			logger::info("stats: poison quarantine {}/{} blocks, {} KiB retained, {} evictions",
+				hs::PoisonQuarantine::Get().Count(), hs::PoisonQuarantine::Get().RegionSize() / 0x1000u,
+				hs::PoisonQuarantine::Get().Bytes() / 1024u, hs::PoisonQuarantine::Get().Evictions());
+			logger::info("stats: weaklib events {} (capacity {})",
+				hs::WeakLibEvents::Get().Count(), hs::WeakLibEvents::Get().Capacity());
+			logger::info("stats: bloom filters {} KiB (ledger) + {} KiB (free ring), {} swaps",
+				hs::ShadowLedger::Get().BloomBytes() / 1024u,
+				hs::ScaleformFreeRing::Get().BloomBytes() / 1024u,
+				hs::ShadowLedger::Get().BloomSwaps() + hs::ScaleformFreeRing::Get().BloomSwaps());
+
+			if (!warnedSaturated && (failures > 0 || drops > 0)) {
+				logger::warn("ledger lossy: {} insert failures, {} writer drops; raise [Ledger] uCapacity or accept the gap", failures, drops);
+				warnedSaturated = true;
+			}
 		}
 	}).detach();
 

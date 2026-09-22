@@ -32,6 +32,40 @@ namespace hs
 		std::size_t   guardPoolMaxSize = 3072;     // larger requests pass through
 		bool          guardPoolFixUp = true;       // unprotect + continue on fault
 
+		// [ScaleformHeap] - Scaleform/GFx allocations (GMemoryHeapPT). These do
+		// NOT come from RE::MemoryManager, which is why the engine hooks are
+		// blind to the GFxResource lifetime crashes. Tier A only (ledger); the
+		// guard pool is deliberately not extended to this heap (see DESIGN).
+		bool scaleformHeapEnabled = true;
+		// Capture call stacks for Scaleform alloc/free events. The free stack is
+		// what names the culprit, so this defaults on; turn it off to trade
+		// attribution detail for lower hot-path cost.
+		bool scaleformCaptureStacks = true;
+		// Poison-on-free: on GMemoryHeapPT::Free, overwrite the block's first
+		// qword with a recognisable poison address and delay the real free briefly,
+		// so a later virtual call through the dead object faults deterministically
+		// at an address that maps back to the ledger record. Bounded and fail-open;
+		// this is the deterministic FAST PATH for recent frees, while the free ring
+		// below is the general-purpose attribution for older ones.
+		bool scaleformPoisonEnabled = true;
+		// Maximum blocks (power of two rounded up) held poisoned at once. This is
+		// address space only; a block is retained in real memory until drained.
+		std::size_t scaleformPoisonMaxBlocks = 1u << 16;  // 65536
+		// Maximum retained bytes of poisoned blocks. 64 MiB is the default budget;
+		// the oldest is really freed when it is reached.
+		std::size_t scaleformPoisonMaxBytes = 64u << 20;
+
+		// Durable Scaleform free records. Separate from the main ledger so the
+		// main table keeps flowing; evict-oldest when full, with the eviction count
+		// and retention window reported so a lossy run is legible.
+		std::size_t scaleformFreeCapacity = 1u << 20;  // 1M records (~64 MiB)
+
+		// [WeakLib] GFxResourceWeakLib context hooks (PinResource 82796,
+		// RemoveResourceOnRelease 82798, UnpinResource 82802, GFxResource::AddRef
+		// 82783). Low frequency (menu load/close), essentially free.
+		bool        weakLibHooksEnabled = true;
+		std::size_t weakLibEventCapacity = 1u << 14;  // 16384 events
+
 		// [RefCountGuard] - validate the vtable before a refcounted destructor
 		// is dispatched from GRefCountImpl::Release.
 		bool refCountGuardEnabled = true;
@@ -44,6 +78,9 @@ namespace hs
 		bool        reportScreenshot = false;  // save a BMP next to the report
 		bool        reportFreeze = false;      // modal dialog instead of continuing
 		bool        vehEnabled = true;         // catch and classify any AV
+		// Print the freeing/allocating site as module+0xOFFSET and hint that a
+		// shipped PDB resolves it to a function. Always useful; no cost.
+		bool        reportSymbolHint = true;
 		// An untracked free is not necessarily invalid: allocations made before
 		// the hooks were installed are untracked too. Off by default.
 		bool        reportUntrackedFree = false;

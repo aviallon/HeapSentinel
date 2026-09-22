@@ -78,13 +78,26 @@ namespace hs
 		refCountGuardEnabled = ReadBool("RefCountGuard", "bEnabled", refCountGuardEnabled, ini);
 		refCountGuardFailSafe = ReadBool("RefCountGuard", "bFailSafe", refCountGuardFailSafe, ini);
 
+		scaleformHeapEnabled = ReadBool("ScaleformHeap", "bEnabled", scaleformHeapEnabled, ini);
+		scaleformCaptureStacks = ReadBool("ScaleformHeap", "bCaptureStacks", scaleformCaptureStacks, ini);
+		scaleformPoisonEnabled = ReadBool("ScaleformHeap", "bPoisonOnFree", scaleformPoisonEnabled, ini);
+		scaleformPoisonMaxBlocks = ReadUInt("ScaleformHeap", "uPoisonMaxBlocks", static_cast<std::uint32_t>(scaleformPoisonMaxBlocks), ini);
+		scaleformPoisonMaxBytes = ReadUInt("ScaleformHeap", "uPoisonMaxBytes", static_cast<std::uint32_t>(scaleformPoisonMaxBytes), ini);
+		scaleformFreeCapacity = ReadUInt("ScaleformHeap", "uFreeRingCapacity", static_cast<std::uint32_t>(scaleformFreeCapacity), ini);
+
+		weakLibHooksEnabled = ReadBool("WeakLib", "bEnabled", weakLibHooksEnabled, ini);
+		weakLibEventCapacity = ReadUInt("WeakLib", "uEventCapacity", static_cast<std::uint32_t>(weakLibEventCapacity), ini);
+
 		reportScreenshot = ReadBool("Reporting", "bScreenshot", reportScreenshot, ini);
 		reportFreeze = ReadBool("Reporting", "bFreeze", reportFreeze, ini);
 		vehEnabled = ReadBool("Reporting", "bVeh", vehEnabled, ini);
 		reportUntrackedFree = ReadBool("Reporting", "bReportUntrackedFree", reportUntrackedFree, ini);
+		reportSymbolHint = ReadBool("Reporting", "bSymbolHint", reportSymbolHint, ini);
 		maxReportsPerSecond = ReadUInt("Reporting", "uMaxReportsPerSecond", static_cast<std::uint32_t>(maxReportsPerSecond), ini);
 
-		logger::info("config: enabled={} ledger={} guardPool={} (1/{}) refCountGuard={} (failSafe={})",
-			enabled, ledgerEnabled, guardPoolEnabled, guardPoolSampleRate, refCountGuardEnabled, refCountGuardFailSafe);
+		logger::info("config: enabled={} ledger={} guardPool={} (1/{}) refCountGuard={} (failSafe={}) scaleformHeap={} (stacks={}, poison={}, {} blocks/{} bytes) weaklib={}",
+			enabled, ledgerEnabled, guardPoolEnabled, guardPoolSampleRate, refCountGuardEnabled, refCountGuardFailSafe,
+			scaleformHeapEnabled, scaleformCaptureStacks, scaleformPoisonEnabled, scaleformPoisonMaxBlocks,
+			scaleformPoisonMaxBytes, weakLibHooksEnabled);
 	}
 }

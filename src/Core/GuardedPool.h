@@ -55,7 +55,7 @@ namespace hs
 			std::byte*    data = nullptr;  // start of the data page
 			std::byte*    user = nullptr;  // returned pointer
 			std::size_t   size = 0;
-			std::uint32_t state = kFree;
+			std::atomic<std::uint32_t> state{ static_cast<std::uint32_t>(kFree) };
 		};
 
 		[[nodiscard]] Slot* SlotFor(std::uintptr_t a_ptr);
@@ -80,7 +80,11 @@ namespace hs
 
 		std::atomic<std::uint64_t> _sampleCounter{ 0 };
 		std::atomic<std::uint64_t> _rng{ 0x2545F4914F6CDD1Dull };
-		std::atomic_flag           _lock{};
+		// SRWLOCK, not a spinlock: under Wine it is futex-backed, so a preempted
+		// holder parks its waiters instead of making them burn a scheduling
+		// quantum. The hot engine path does not touch this pool (it is opt-in and
+		// sampled 1/N); the lock-free per-thread-ring roadmap will remove it.
+		SRWLOCK                    _lock = SRWLOCK_INIT;
 		bool                       _ready = false;
 	};
 }
