@@ -57,6 +57,30 @@ SECTIONS = [
         ],
     },
     {
+        "name": "Hooks",
+        "keys": [
+            {
+                "name": "bVerifyTargets",
+                "kind": "bool",
+                "default": True,
+                "comment": [
+                    "Verify every hook target against the committed table for this exact game",
+                    "build (file size + PE timestamp + SizeOfImage, plus a hash of the target's",
+                    "first bytes and, for virtual targets, its vtable slot). ALL targets are",
+                    "verified BEFORE any detour is created; a mismatch refuses that hook and",
+                    "reports DEGRADED rather than patching an address we cannot name.",
+                    "",
+                    "NOTE: leave this ON unless you must not. A mod that patches the same function",
+                    "before us - EngineFixes patches MemoryManager::Allocate/Deallocate/Reallocate",
+                    "during PRELOAD - makes those targets fail the vanilla byte check, so they are",
+                    "REFUSED and the sentinel reports OVERRIDDEN and DEGRADED. Set 0 only to force",
+                    "the hooks on anyway: they are then unverified and every double-free report is",
+                    "labelled double-free-unverified.",
+                ],
+            },
+        ],
+    },
+    {
         "name": "Ledger",
         "keys": [
             {
@@ -186,7 +210,7 @@ SECTIONS = [
             {
                 "name": "bPoisonOnFree",
                 "kind": "bool",
-                "default": True,
+                "default": False,
                 "comment": [
                     "Poison-on-free: on GMemoryHeapPT::Free, overwrite the block's first qword (the",
                     "vtable pointer) with a unique poison address inside a reserved, never-committed",
@@ -196,6 +220,10 @@ SECTIONS = [
                     "the heap recycled the memory. Bounded and fail-open: over budget or not ready",
                     "calls the original immediately. This is the fast path for recent frees; the",
                     "free ring below is the general attribution for everything else.",
+                    "",
+                    "OFF by default because it CHANGES ALLOCATOR BEHAVIOUR: it withholds the real",
+                    "free for the quarantine window. Enable it only for a deliberate use-after-free",
+                    "hunt, and expect a bounded memory cost while it is on.",
                 ],
             },
             {
@@ -293,6 +321,18 @@ SECTIONS = [
                 "kind": "int",
                 "default": 20,
                 "comment": [],
+            },
+            {
+                "name": "bPreventDoubleFree",
+                "kind": "bool",
+                "default": False,
+                "comment": [
+                    "Skip the original free when a double free is suspected, instead of merely",
+                    "reporting it. OFF by default: a diagnostic must never alter the thing it",
+                    "observes, and on a FALSE POSITIVE this turns the block into a leak. The report",
+                    "is the product; prevention is not. Set to 1 only if you would rather leak than",
+                    "let a suspected double free reach the allocator.",
+                ],
             },
         ],
     },
