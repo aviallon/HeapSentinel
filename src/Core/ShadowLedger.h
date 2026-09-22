@@ -2,15 +2,23 @@
 
 #include "Core/StackCapture.h"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+
+#if defined(_MSC_VER)
+#	include <intrin.h>  // _mm_pause for the shard spinlock (HS_NO_PCH has no Windows.h)
+#endif
 
 namespace hs
 {
 	enum AllocationFlags : std::uint32_t
 	{
 		kFlagLive = 1u << 0,
-		kFlagSampled = 1u << 1,  // served from the guarded pool
+		kFlagSampled = 1u << 1,    // served from the guarded pool
 		kFlagFreed = 1u << 2,
+		kFlagScaleform = 1u << 3,  // allocated by Scaleform's GMemoryHeapPT, not RE::MemoryManager
 	};
 
 	struct AllocationInfo
@@ -52,11 +60,30 @@ namespace hs
 		// saturating and recording has stopped for new allocations.
 		[[nodiscard]] std::uint64_t InsertFailures() const { return _insertFailures.load(std::memory_order_relaxed); }
 
+		// Effective table size, so "the ledger the game actually runs" cannot be
+		// silently different from the one the operator thinks they configured
+		// (a deployed ini overrides the compiled default).
+		[[nodiscard]] std::size_t Capacity() const { return _shardCount * _shardCapacity; }
+
 		// Fixed ring of captured stacks. 0 is reserved for "none".
 		[[nodiscard]] std::uint32_t StoreStack(const Stack& a_stack);
 		[[nodiscard]] const Stack*  GetStack(std::uint32_t a_index) const;
 
 	private:
+		// Portable CPU relax for the shard spinlock. The plugin runs on x64
+		// Windows; the off-game tests also build on aarch64, where there is no
+		// pause instruction and a compiler fence is sufficient.
+		static void Relax()
+		{
+#if defined(_MSC_VER)
+			_mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+			__builtin_ia32_pause();
+#else
+			std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+		}
+
 		struct Entry
 		{
 			std::uintptr_t key = 0;  // 0 empty, 1 tombstone
@@ -73,7 +100,7 @@ namespace hs
 			void Lock() const
 			{
 				while (lock.test_and_set(std::memory_order_acquire)) {
-					::YieldProcessor();
+					Relax();
 				}
 			}
 			void Unlock() const { lock.clear(std::memory_order_release); }

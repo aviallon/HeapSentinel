@@ -35,6 +35,10 @@ target("heapsentinel-tests")
 
     add_files("main.cpp", "test_*.cpp")
     add_files("../src/Ipc/ShmRing.cpp", "../src/Ipc/ShmSession.cpp")
+    -- The shadow ledger is plain C++ (HS_NO_PCH keeps it off Windows.h and the
+    -- CommonLib precompiled header), so the new Scaleform allocation source is
+    -- exercised off-game on both platforms.
+    add_files("../src/Core/ShadowLedger.cpp")
     add_includedirs("..", "../src", ".")
 
     if is_plat("linux") or is_plat("macosx") then

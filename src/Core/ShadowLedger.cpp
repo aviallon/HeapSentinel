@@ -1,6 +1,16 @@
-#include "PCH.h"
+#if defined(HS_NO_PCH)
+// Off-game test build: no Windows/CommonLib precompiled header, no logger. The
+// ledger is plain C++ so it can be exercised on Linux and Windows by tests/.
+#	include "Core/ShadowLedger.h"
 
-#include "Core/ShadowLedger.h"
+#	include <algorithm>
+#	include <cstdint>
+#	include <memory>
+#else
+#	include "PCH.h"
+
+#	include "Core/ShadowLedger.h"
+#endif
 
 namespace hs
 {
@@ -47,6 +57,11 @@ namespace hs
 			return true;
 		}
 
+		// Re-initialising (the off-game tests do this between cases) must reset
+		// the counters as well, or a fresh table inherits stale failures.
+		_insertFailures.store(0, std::memory_order_relaxed);
+		_stackCursor.store(1, std::memory_order_relaxed);
+
 		_shardCount = NextPow2(std::max<std::size_t>(a_shards, 1));
 		_shardCapacity = NextPow2(std::max<std::size_t>(a_capacity / _shardCount, 16));
 
@@ -63,8 +78,10 @@ namespace hs
 		}
 
 		_ready.store(true, std::memory_order_release);
+#if !defined(HS_NO_PCH)
 		logger::info("ledger: {} shards x {} slots ({} entries), stack ring {}",
 			_shardCount, _shardCapacity, _shardCount * _shardCapacity, _stackCount);
+#endif
 		return true;
 	}
 
