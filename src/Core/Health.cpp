@@ -77,22 +77,6 @@ namespace hs
 			}
 		}
 
-		std::string Reasons()
-		{
-			std::lock_guard lock(g_mutex);
-			std::string out;
-			for (const auto& reason : g_reasons) {
-				if (!out.empty()) {
-					out += "; ";
-				}
-				out += reason;
-			}
-			if (g_dropped != 0) {
-				out += " (+" + std::to_string(g_dropped) + " more)";
-			}
-			return out;
-		}
-
 		std::string Line()
 		{
 			std::string reasons;

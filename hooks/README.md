@@ -90,10 +90,12 @@ Supporting a new game version is meant to be mechanical and reviewable:
 
 ```
 tools/gen-hooktable.py \
-  --exe       "<path>/SkyrimSE.exe" \
-  --versionlib "<path>/Data/SKSE/Plugins/versionlib-1-7-104-0.bin" \
-  --names     "<path>/skyrimae.rename"
+  "<path>/SkyrimSE.exe" \
+  "<path>/Data/SKSE/Plugins/versionlib-1-7-104-0.bin" \
+  "<path>/skyrimae.rename"
 ```
+
+(The same three values can be passed as `--exe` / `--versionlib` / `--names`.)
 
 It writes the table, the Address Library slice, and the embedded header
 `src/Hooks/HookTableData.gen.h`. Then review the diff (the point of committing

@@ -454,6 +454,10 @@ def emit_header(hooks_dir: str, out_path: str) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Both forms work: the documented positional one
+    #   tools/gen-hooktable.py <SkyrimSE.exe> <versionlib.bin> <skyrimae.rename>
+    # and the explicit flags.
+    ap.add_argument("positional", nargs="*", metavar="EXE VERSIONLIB NAMES")
     ap.add_argument("--exe")
     ap.add_argument("--versionlib")
     ap.add_argument("--names")
@@ -469,10 +473,16 @@ def main(argv=None) -> int:
         print(f"wrote {args.emit_header[1]} from {args.emit_header[0]}")
         return 0
 
-    if not (args.exe and args.versionlib and args.names):
-        ap.error("--exe, --versionlib and --names are required to generate a table")
+    positional = list(args.positional)
+    if positional and len(positional) != 3:
+        ap.error("expected exactly three positional arguments: EXE VERSIONLIB NAMES")
+    exe = args.exe or (positional[0] if positional else None)
+    versionlib = args.versionlib or (positional[1] if positional else None)
+    names = args.names or (positional[2] if positional else None)
+    if not (exe and versionlib and names):
+        ap.error("need <SkyrimSE.exe> <versionlib.bin> <names-file> (or the --exe/--versionlib/--names flags)")
 
-    table, slice_ = build_table(args.exe, args.versionlib, args.names, args.defs)
+    table, slice_ = build_table(exe, versionlib, names, args.defs)
     os.makedirs(args.out_dir, exist_ok=True)
 
     ident = table["identity"]

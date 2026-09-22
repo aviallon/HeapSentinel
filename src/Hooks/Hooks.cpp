@@ -744,18 +744,22 @@ namespace hs
 		[[nodiscard]] const HookTable* SelectHookTable(const ModuleIdentity& a_actual)
 		{
 			static std::vector<HookTable> tables;
+			static bool                   populated = false;
 
-			for (std::size_t i = 0; i < kEmbeddedHookTableCount; ++i) {
-				HookTable   table;
-				std::string error;
-				if (!ParseHookTable(kEmbeddedHookTables[i].json, table, error)) {
-					logger::error("hook table {}: {}", kEmbeddedHookTables[i].source, error);
-					Health::Degrade(std::string("hook table ") + kEmbeddedHookTables[i].source +
-									" failed to parse: " + error);
-					continue;
+			if (!populated) {
+				populated = true;
+				for (std::size_t i = 0; i < kEmbeddedHookTableCount; ++i) {
+					HookTable   table;
+					std::string error;
+					if (!ParseHookTable(kEmbeddedHookTables[i].json, table, error)) {
+						logger::error("hook table {}: {}", kEmbeddedHookTables[i].source, error);
+						Health::Degrade(std::string("hook table ") + kEmbeddedHookTables[i].source +
+										" failed to parse: " + error);
+						continue;
+					}
+					table.source = kEmbeddedHookTables[i].source;
+					tables.push_back(std::move(table));
 				}
-				table.source = kEmbeddedHookTables[i].source;
-				tables.push_back(std::move(table));
 			}
 
 			for (const auto& table : tables) {

@@ -27,9 +27,8 @@ namespace hs
 
 		[[nodiscard]] ipc::HealthState State();
 		[[nodiscard]] const char* StateName();
-		// "a; b; c", with a trailing " (+N more)" when the bound was hit.
-		[[nodiscard]] std::string Reasons();
-		// "GREEN: ..." / "DEGRADED: a; b" - one line for the log.
+		// "GREEN" / "DEGRADED: a; b; c", with a trailing " (+N more)" when the
+		// reason bound was hit. One line for the log.
 		[[nodiscard]] std::string Line();
 
 		void Reset();
