@@ -12,36 +12,36 @@
 SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
-	SetupLog();
+	hs::SetupLog();
 
 	logger::info("HeapSentinel v0.1.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
 
-	Config::Get().Load();
-	if (!Config::Get().enabled) {
+	hs::Config::Get().Load();
+	if (!hs::Config::Get().enabled) {
 		logger::info("disabled in HeapSentinel.ini - installing nothing");
 		return true;
 	}
 
 	// Order matters: the module map and stack capture are needed by every
 	// report, and the ledger must exist before the hooks that write to it.
-	InitStackCapture();
-	ModuleMap::Get().Refresh();
+	hs::InitStackCapture();
+	hs::ModuleMap::Get().Refresh();
 
-	const auto& config = Config::Get();
+	const auto& config = hs::Config::Get();
 
 	if (config.ledgerEnabled) {
-		ShadowLedger::Get().Init(config.ledgerCapacity, config.ledgerShards, config.ledgerStackDepth);
+		hs::ShadowLedger::Get().Init(config.ledgerCapacity, config.ledgerShards, config.ledgerStackDepth);
 	}
 
 	if (config.guardPoolEnabled) {
-		GuardedPool::Get().Init(config.guardPoolSlots, config.guardPoolMaxSize, config.guardPoolSampleRate);
+		hs::GuardedPool::Get().Init(config.guardPoolSlots, config.guardPoolMaxSize, config.guardPoolSampleRate);
 	}
 
 	if (config.vehEnabled) {
-		InstallVeh();
+		hs::InstallVeh();
 	}
 
-	InstallHooks();
+	hs::InstallHooks();
 
 	logger::info("...ready");
 	return true;
