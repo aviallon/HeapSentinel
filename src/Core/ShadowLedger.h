@@ -21,6 +21,12 @@ namespace hs
 		kFlagFreed = 1u << 2,
 		kFlagScaleform = 1u << 3,  // allocated by Scaleform's GMemoryHeapPT, not RE::MemoryManager
 		kFlagPoisoned = 1u << 4,   // real free withheld; first qword overwritten with a poison address
+		// Which hook family recorded the FIRST free. A double-free report carries
+		// both families so a reader can tell a genuine second free (MM then MM,
+		// say) from a nested observation of one logical free (SF then MM, the
+		// EngineFixes-overridden-Scaleform path that produced the v0.3.0 flood).
+		kFlagFreedByMM = 1u << 5,
+		kFlagFreedBySF = 1u << 6,
 	};
 
 	struct AllocationInfo

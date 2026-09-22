@@ -11,9 +11,24 @@ set_xmakever("3.0.0")
 includes("lib/CommonLibSSE-NG/xmake.lua")
 
 set_project("HeapSentinel")
-set_version("0.4.0")
+set_version("0.5.0")
 set_languages("c++23")
 set_license("MIT")
+
+-- Build identity stamped into the DLL and printed in the reports-log session
+-- header. xmake's script sandbox exposes only a small os API (os.iorunv is not
+-- available), so this uses the environment rather than shelling out to git:
+-- CI sets GITHUB_SHA, a developer can set HS_BUILD_ID, and a plain local build
+-- honestly reports "unknown".
+local build_id = os.getenv("HS_BUILD_ID")
+if not build_id or build_id == "" then
+    build_id = os.getenv("GITHUB_SHA")
+end
+if not build_id or build_id == "" then
+    build_id = "unknown"
+end
+build_id = build_id:sub(1, 12)
+add_defines("HS_BUILD_ID=\"" .. build_id .. "\"")
 
 set_allowedplats("windows")
 set_allowedarchs("x64")

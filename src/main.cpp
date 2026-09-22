@@ -1,6 +1,7 @@
 #include "PCH.h"
 
 #include "Config.h"
+#include "Core/BuildInfo.h"
 #include "Core/GuardedPool.h"
 #include "Core/Health.h"
 #include "Core/ModuleMap.h"
@@ -9,6 +10,7 @@
 #include "Core/ScaleformFreeRing.h"
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
+#include "Core/Stats.h"
 #include "Core/WeakLibEvents.h"
 #include "Hooks/Hooks.h"
 #include "Veh.h"
@@ -37,6 +39,14 @@ namespace
 			// Proof that the MemoryManager thunks actually ran: the ledger is only
 			// written by the Allocate/Deallocate hooks.
 			logger::info("ledger after data load: {} tracked blocks", hs::ShadowLedger::Get().Count());
+			// Module list is now complete: record it (session header) and emit the
+			// first stats line. A short session never reaches the 60 s timer, which
+			// is why the v0.3.0 run produced no stats at all.
+			hs::ReportSessionContext(hs::Config::Get().Summary(), hs::ModuleMap::Get().ModlistHash(),
+				hs::ModuleMap::Get().Size());
+			if (hs::ShouldEmitOnDataLoaded()) {
+				hs::LogStats("data-load");
+			}
 			break;
 		default:
 			break;
@@ -49,7 +59,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	hs::SetupLog();
 
-	logger::info("HeapSentinel v0.4.0 (Skyrim SE/AE, Address Library + CommonLibSSE-NG) loading");
+	logger::info("HeapSentinel v" HS_VERSION " (Skyrim SE/AE, Address Library + CommonLibSSE-NG, build " HS_BUILD_ID ") loading");
 
 	if (auto* messaging = SKSE::GetMessagingInterface()) {
 		messaging->RegisterListener("SKSE", OnMessage);
@@ -67,6 +77,11 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	// report, and the ledger must exist before the hooks that write to it.
 	hs::InitStackCapture();
 	hs::ModuleMap::Get().Refresh();
+	logger::info("config summary: {}", hs::Config::Get().Summary());
+	// Write the session context (config + module set) into the appended reports
+	// log now, and again at kDataLoaded once the module list is complete.
+	hs::ReportSessionContext(hs::Config::Get().Summary(), hs::ModuleMap::Get().ModlistHash(),
+		hs::ModuleMap::Get().Size());
 
 	const auto& config = hs::Config::Get();
 
@@ -123,26 +138,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 			const auto failures = hs::ShadowLedger::Get().InsertFailures();
 			const auto drops = hs::ShadowLedger::Get().WriterDrops();
 
-			std::uint64_t oldestTick = 0;
-			std::uint64_t newestTick = 0;
-			const bool    haveWindow = hs::ScaleformFreeRing::Get().RetentionTicks(oldestTick, newestTick);
-
-			logger::info("stats: {} ledger entries, {} insert failures, {} writer drops (capacity {})",
-				hs::ShadowLedger::Get().Count(), failures, drops, hs::ShadowLedger::Get().Capacity());
-			logger::info("stats: scaleform free ring {}/{} records, {} evictions, retention {}",
-				hs::ScaleformFreeRing::Get().Count(), hs::ScaleformFreeRing::Get().Capacity(),
-				hs::ScaleformFreeRing::Get().Evictions(),
-				haveWindow ? (std::to_string((newestTick - oldestTick) / 1000) + " s") : std::string("n/a"));
-			logger::info("stats: poison quarantine {}/{} blocks, {} KiB retained, {} evictions",
-				hs::PoisonQuarantine::Get().Count(), hs::PoisonQuarantine::Get().RegionSize() / 0x1000u,
-				hs::PoisonQuarantine::Get().Bytes() / 1024u, hs::PoisonQuarantine::Get().Evictions());
-			logger::info("stats: weaklib events {} (capacity {})",
-				hs::WeakLibEvents::Get().Count(), hs::WeakLibEvents::Get().Capacity());
-			logger::info("stats: bloom filters {} KiB (ledger) + {} KiB (free ring), {} swaps",
-				hs::ShadowLedger::Get().BloomBytes() / 1024u,
-				hs::ScaleformFreeRing::Get().BloomBytes() / 1024u,
-				hs::ShadowLedger::Get().BloomSwaps() + hs::ScaleformFreeRing::Get().BloomSwaps());
-			logger::info("stats: health {}", hs::Health::Line());
+			hs::LogStats("timer");
 
 			if (!warnedSaturated && (failures > 0 || drops > 0)) {
 				logger::warn("ledger lossy: {} insert failures, {} writer drops; raise [Ledger] uCapacity or accept the gap", failures, drops);

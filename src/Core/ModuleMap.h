@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -43,6 +44,11 @@ namespace hs
 		[[nodiscard]] bool IsExecutable(std::uintptr_t a_addr) const;
 		[[nodiscard]] std::string Describe(std::uintptr_t a_addr) const;
 		[[nodiscard]] std::size_t Size() const;
+
+		// FNV-1a over the sorted module names. A recognisability stamp for the
+		// run's loaded-module set, recorded in the reports-log session header so
+		// two runs can be compared even when their logs are appended together.
+		[[nodiscard]] std::uint64_t ModlistHash() const;
 
 	private:
 		struct ExecRange

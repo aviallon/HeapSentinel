@@ -197,6 +197,87 @@ this reason, and no signature check would have caught it). It is AE-only,
 matching the existing `RelocationID(0, ae)` convention; the SE ids in
 `HookTargets.def` are recorded, not verified. It says nothing about mod DLLs.
 
+### 3.4 Double-free reporting: do not lie, do not perturb (v0.5)
+
+v0.3.0 produced 142 `[double-free]` reports in one ~52 s session. A read-only
+investigation found the overwhelming cause was our own instrumentation, not a
+game bug: under EngineFixes' allocator replacement (`bOverrideMemoryManager`)
+one logical Scaleform free is observed TWICE - first by `hk_SfFree`, then by
+`hk_Deallocate` re-entered from the call to the original - and an address
+recycled by an allocator path we do not hook leaves a stale `kFlagFreed` record.
+Neither is a second free. The v0.5 rules below are the fix.
+
+1. **Report-only by default; always call the original.** A suspected double free
+   is reported and then `o_Deallocate` / `o_SfFree` is still called. The old
+   `return` turned a false positive into a *leak* and changed the game's
+   allocator behaviour. `[Reporting] bPreventDoubleFree=0` is the default;
+   setting it to 1 skips the original and is documented as a behaviour change.
+   `Core/FreePolicy.h` holds the decision so it is one place and one test.
+2. **Poison-on-free defaults off** (`[ScaleformHeap] bPoisonOnFree=0`). It is the
+   one path that *withholds* the real free and writes a poison qword into freed
+   memory - the strongest deterministic UAF attribution, but also the largest
+   perturbation. It becomes an explicit opt-in for a UAF hunt. The budget stays
+   bounded and fail-open (`uPoisonMaxBlocks` / `uPoisonMaxBytes`), and the
+   startup config summary names every setting that changes allocator behaviour.
+3. **Re-entrancy guard.** `Core/FreeReentrancy` is a per-thread, allocation-free
+   stack of the pointers currently being freed by a hook. A nested free hook for
+   a pointer already on the stack is the same logical free, not a second one: it
+   is neither recorded nor reported, and the original is called exactly once.
+   It fails open when the 32-entry stack is full, never blocks a free, and holds
+   no lock (the project's no-spinlock rule). This removes mechanism M1 directly.
+4. **Alloc-side evidence on every report.** The report now carries
+   `allocSite`, `allocTick`, `allocStack`, the decoded `flags` (was it
+   `kFlagScaleform`?) and the hook family that recorded the first free and the
+   one seeing the second (`MM` vs `SF`). Without this a genuine second free and
+   a recycled address are indistinguishable - which is exactly why the v0.3.0
+   reports could not be classified.
+5. **Refuse to claim unverified.** `Core/AllocatorConfidence` is set at install
+   time from the same per-target checks as §3.3. If the bytes at a
+   `MemoryManager` target are not the committed game function (the allocator has
+   been replaced), or verification was disabled or had no table, reports are
+   emitted under the distinct kind `double-free-unverified` instead of a
+   confident `double-free`, and the sentinel is `DEGRADED`. A bare `double-free`
+   is only ever emitted from a hook chain we verified for this exact build.
+6. **Stats are emitted at `kDataLoaded` and on the first report**, in addition
+   to the 60 s timer. A ~52 s session must not be able to produce no stats line
+   at all; insert failures, writer drops and free-ring evictions have to be
+   visible for a run to be diagnosable.
+7. **The reports log is appended to and rotated, never truncated**
+   (`rotating_file_sink_mt`, 16 MiB x 3), with a session header carrying the
+   version, build id, config summary and a hash of the loaded-module set. Two
+   runs must be comparable; the v0.3.0 truncate flag destroyed the previous
+   run's only evidence.
+
+**Still blind: the allocator, not the facades (deferred to a later version).**
+HeapSentinel hooks `MemoryManager` and `GMemoryHeapPT`, but EngineFixes routes
+`ScrapHeap`, Havok, RenderPassCache, the shadowmap allocator, `AllocSysDirect` /
+`FreeSysDirect` and the replaced CRT imports through the same tbbmalloc pool.
+An allocation from any of those is invisible, so a recycled address can still
+produce a stale-freed report. The real fix is to hook the tbbmalloc choke point
+(`scalable_malloc` / `scalable_free` / `scalable_aligned_*`). That is
+**deliberately not bolted on in v0.5** because it is a mod-DLL target and the
+committed table is a *SkyrimSE.exe* table:
+
+- `EngineFixes.dll` 7.0.21 exports only `SKSEPlugin_Load/Preload/Version`; its
+tbbmalloc is statically linked (vcpkg `tbbmalloc.lib`, PDB module
+`src\tbbmalloc\...\frontend.cpp.obj`), so `scalable_malloc`/`scalable_free` are
+**not exported** and there is no Address Library id for them. In 7.0.21 the
+PDB resolves `scalable_malloc` to RVA `0x966B0` and `scalable_free` /
+`scalable_aligned_free` to `0x963D0` (ICF-folded into one body), but those RVAs
+are per-EngineFixes-build and cannot be resolved generically.
+- A mod-DLL target therefore needs its **own identity and verification**: a
+  second table keyed by `{module name, size, TimeDateStamp, SizeOfImage,
+  sha256}` (the same cheap-identity + full-hash scheme as the exe table, but for
+  a mod DLL), plus per-target prologue signatures resolved by signature scan
+  (since there are no exported symbols). `tools/gen-hooktable.py` would grow a
+  mod-DLL mode and `HookTargets.def` a target kind that names the owning module.
+  Installing any tbbmalloc hook without that verification would violate the
+  §3.3 rule and is not done.
+- Until then: **M2 remains possible** and `AllocSysDirect` stays blind. The
+  v0.5 mitigations are that the reports no longer alter allocator behaviour, are
+  labelled unverified when the facade is not the game's, and carry the
+  alloc-side evidence needed to tell an unhooked re-use from a real free.
+
 ## 4. Shadow ledger
 
 The ledger maps `ptr → AllocationInfo` and is **lock-free by construction**
@@ -547,10 +628,20 @@ a watchdog thread; fail open when the ledger or quarantine is unavailable.
   DEGRADED. `tools/gen-hooktable.py` regenerates it; `tools/check-hooktable.py`
   makes "a hook with no verified signature" a CI failure. (Semantics - argument
   counts, which vtable slot means what - still comes from disassembly.)
-- **v0.5**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
+- **v0.5**: double-free reporting made honest and non-perturbing. Report-only
+  by default (the original free is always called); poison-on-free opt-in
+  (default off); a per-thread allocation-free re-entrancy guard that removes the
+  double observation of one logical free; alloc-side evidence
+  (allocSite/tick/stack/flags + hook family) on every double-free report; an
+  allocator-confidence gate that emits `double-free-unverified` when the
+  MemoryManager target is not the verified game function; stats at data-load
+  and on the first report; and an appended, rotated reports log with a session
+  header. Hooking the tbbmalloc choke point (a mod-DLL target) is designed but
+  deferred - see §3.4.
+- **v0.6**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
   (RESEARCH §7.1) instead of maintaining a parallel stack table where possible;
   payload poison + write-after-free check on `ScrapHeap` blocks.
-- **v0.6**: a "bisect" mode that narrows sampling to one size range or one
+- **v0.7**: a "bisect" mode that narrows sampling to one size range or one
   allocation site, for reproducing a specific bug.
 
 ## 12. Testing and sanitizers

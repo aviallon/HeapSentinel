@@ -1,12 +1,16 @@
 #include "PCH.h"
 
 #include "Core/Report.h"
+#include "Core/BuildInfo.h"
 #include "Core/GuardedPool.h"
 #include "Core/ModuleMap.h"
 #include "Core/PoisonQuarantine.h"
+#include "Core/ReportLog.h"
 #include "Core/ShadowLedger.h"
+#include "Core/Stats.h"
 #include "Config.h"
 
+#include <chrono>
 #include <fstream>
 
 namespace hs
@@ -74,11 +78,27 @@ namespace hs
 		log->set_pattern("[%H:%M:%S.%e] [%l] %v");
 		spdlog::set_default_logger(log);
 
-		auto reportSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>((dir / "HeapSentinel-reports.log").string(), true);
+		auto reportSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+			(dir / "HeapSentinel-reports.log").string(), static_cast<std::size_t>(kReportLogMaxBytes), kReportLogMaxFiles);
 		g_reports = std::make_shared<spdlog::logger>("HeapSentinel-reports", std::move(reportSink));
 		g_reports->set_level(spdlog::level::trace);
 		g_reports->flush_on(spdlog::level::trace);
 		g_reports->set_pattern("[%Y-%m-%d %H:%M:%S.%e] %v");
+
+		// APPEND, never truncate: the v0.3.0 truncate flag destroyed the previous
+		// run's only evidence. rotating_file_sink_mt appends and rotates at
+		// kReportLogMaxBytes keeping kReportLogMaxFiles files. The header makes two
+		// sessions in one file distinguishable.
+		const auto now = static_cast<std::uint64_t>(
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+		g_reports->info("{}", BuildSessionHeader(HS_VERSION, HS_BUILD_ID, now));
+	}
+
+	void ReportSessionContext(std::string_view a_configSummary, std::uint64_t a_modlistHash, std::size_t a_moduleCount)
+	{
+		if (g_reports) {
+			g_reports->info("{}", BuildSessionContext(a_configSummary, a_modlistHash, a_moduleCount));
+		}
 	}
 
 	std::string ClassifyAddress(std::uintptr_t a_addr)
@@ -164,6 +184,12 @@ namespace hs
 		logger::error("[{}] {}", a_kind, a_detail);
 		if (g_reports) {
 			g_reports->critical("[{}] {}", a_kind, a_detail);
+		}
+
+		// The v0.3.0 run emitted no stats at all. Emit once on the first report so
+		// a short session is observable even if it never reaches the 60 s timer.
+		if (ShouldEmitOnFirstReport()) {
+			LogStats("first-report");
 		}
 
 		if (Config::Get().reportScreenshot) {

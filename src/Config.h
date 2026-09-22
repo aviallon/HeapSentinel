@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace hs
 {
@@ -55,7 +56,13 @@ namespace hs
 		// at an address that maps back to the ledger record. Bounded and fail-open;
 		// this is the deterministic FAST PATH for recent frees, while the free ring
 		// below is the general-purpose attribution for older ones.
-		bool scaleformPoisonEnabled = true;
+		//
+		// DEFAULT OFF (0.5.0). This is the one setting that WITHHOLDS the real free
+		// and writes into freed memory, i.e. it changes the allocator's behaviour.
+		// It is the plugin's strongest deterministic-attribution mode, but it is
+		// opt-in: a diagnostic must not alter the thing it observes unless the
+		// operator explicitly asks. See DESIGN.md.
+		bool scaleformPoisonEnabled = false;
 		// Maximum blocks (power of two rounded up) held poisoned at once. This is
 		// address space only; a block is retained in real memory until drained.
 		std::size_t scaleformPoisonMaxBlocks = 1u << 16;  // 65536
@@ -92,9 +99,20 @@ namespace hs
 		// An untracked free is not necessarily invalid: allocations made before
 		// the hooks were installed are untracked too. Off by default.
 		bool        reportUntrackedFree = false;
+		// When true, a suspected double free is REPORTED and then the original free
+		// is NOT called, so the suspected second free never reaches the allocator
+		// (it leaks). This changes allocator behaviour, so a false positive becomes
+		// a leak; therefore the DEFAULT is false and the original is always called.
+		// The report is the product, not the prevention.
+		bool        preventDoubleFree = false;
 		std::size_t maxReportsPerSecond = 20;  // rate limit so a storm cannot hang the game
 
 		static Config& Get();
 		void           Load();
+
+		// One-line summary for the startup log and the reports-log session header.
+		// It names the settings that change allocator behaviour so a reader of a
+		// run can see that it was not a semantics-preserving configuration.
+		[[nodiscard]] std::string Summary() const;
 	};
 }
