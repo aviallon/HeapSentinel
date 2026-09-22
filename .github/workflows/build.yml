@@ -137,3 +137,56 @@ jobs:
             engine's MemoryManager, a GWP-ASan-style sampled guarded pool, and a
             GRefCountImpl::Release vtable guard that can fail safe instead of
             crashing. See RESEARCH.md and DESIGN.md.
+
+  # The shared-memory IPC layer (src/Ipc) is plain C++ with no Windows
+  # dependency, so it is built and RUN on both platforms. That is the point:
+  # running the same layout static_asserts under MSVC and under GCC is what
+  # makes "the plugin and the helper agree on the layout" a checked claim
+  # rather than an assumption about one compiler.
+  tests:
+    name: off-game tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tests/ is its own xmake project (the plugin is Windows-only), and
+          # xmake takes the action BEFORE -P.
+          xmake f -P tests -p ${{ matrix.platform }} -m release -y
+
+      - name: Build the test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          xmake build -P tests -y
+
+      - name: Run the off-game test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          xmake run -P tests 2>&1 | tee tests.out
+
+          # A green run is only meaningful if it actually ran something, so the
+          # contract is asserted rather than trusted: zero failures AND a
+          # non-trivial number of checks. A runner that silently ran no tests
+          # would otherwise look exactly like success.
+          grep -qE '0 failure\(s\)' tests.out || { echo "::error::the suite reported failures"; exit 1; }
+          checks=$(sed -nE 's/.*[0-9]+ test\(s\) run, ([0-9]+) check\(s\).*/\1/p' tests.out | tail -1)
+          echo "checks executed: ${checks:-<none>}"
+          test -n "$checks" || { echo "::error::could not read the check count"; exit 1; }
+          test "$checks" -gt 5000 || { echo "::error::only $checks checks ran - the suite did not really execute"; exit 1; }
