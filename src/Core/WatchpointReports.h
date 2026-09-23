@@ -30,16 +30,22 @@ namespace hs
 	{
 		std::uint64_t  seq = 0;
 		std::uint64_t  tick = 0;             // GetTickCount64 at the trap
-		std::uintptr_t watchedAddress = 0;   // the block's first 8 bytes
+		std::uintptr_t watchedAddress = 0;   // the block's first 8 bytes (the address that actually trapped)
 		std::uintptr_t valueAtArm = 0;       // first qword when the watch was armed
 		std::uintptr_t valueAfterWrite = 0;  // first qword read after the trap
 		std::uintptr_t writerRip = 0;        // RIP at the #DB (see note below)
 		std::uintptr_t allocSite = 0;        // Scaleform allocation site, when known
+		std::uintptr_t tableAddress = 0;     // what the live table slot held at the trap (0 = none); differs from `watchedAddress` for a stale arm
 		std::uint64_t  armedTick = 0;
 		std::uint32_t  slotIndex = 0;        // which DR slot fired (0..3)
 		std::uint32_t  threadId = 0;         // the writer's thread
 		std::uint32_t  dr6 = 0;
-		std::uint32_t  flags = 0;            // kWatchReportValueUnreadable | kWatchReportWriterRipAdjusted
+		std::uint32_t  armGeneration = 0;    // generation of the arm that fired
+		std::uint32_t  flags = 0;            // kWatchReport* bits below
+		// The module-map classification of `valueAtArm` taken at arming time: was
+		// the first qword a code pointer then? Stored so the drainer can apply the
+		// benign-vs-degradation rule without re-classifying old bytes.
+		bool armedWasCode = false;
 	};
 
 	inline constexpr std::uint32_t kWatchReportValueUnreadable = 1u << 0;
@@ -52,6 +58,14 @@ namespace hs
 	// The drainer can walk back to the store when the bytes decode, and sets
 	// this flag when it did. The raw trap RIP is always kept.
 	inline constexpr std::uint32_t kWatchReportWriterRipAdjusted = 1u << 1;
+	// This trap came from a DR slot on the trapping thread that still held an
+	// OLD address: the slot had since been released or re-armed for a different
+	// block, but the sweep had not yet reached that thread. `watchedAddress` is
+	// the address that actually trapped, and `tableAddress` (when non-zero) is
+	// what the live table slot holds now. This is the 0.6.1 fatal case: it must
+	// be consumed, and it is labelled so a reader can tell it apart from a
+	// current arm.
+	inline constexpr std::uint32_t kWatchReportStaleArm = 1u << 3;
 
 	class WatchpointReports
 	{

@@ -41,14 +41,19 @@ namespace hs
 
 	struct WatchSlotSnapshot
 	{
-		std::uintptr_t address = 0;     // the watched block (its first 8 bytes)
-		std::uintptr_t valueAtArm = 0;  // first qword when the watch was armed
-		std::uintptr_t allocSite = 0;   // the Scaleform allocation site, when known
+		std::uintptr_t address = 0;      // the watched block (its first 8 bytes)
+		std::uintptr_t valueAtArm = 0;   // first qword when the watch was armed
+		std::uintptr_t allocSite = 0;    // the Scaleform allocation site, when known
 		std::uint64_t  armedTick = 0;
 		std::uint32_t  generation = 0;
 		std::uint32_t  flags = 0;
 		std::uint32_t  threadId = 0;
-		bool           valid = false;
+		// The module-map classification of `valueAtArm` taken once at arming: was
+		// the first qword a code pointer then? This is the "WAS a code pointer"
+		// half of the benign-vs-degradation rule (DESIGN §13.4) and is computed on
+		// the sweeper, never in the trap path.
+		bool armedWasCode = false;
+		bool valid = false;
 	};
 
 	class WatchpointSlots
@@ -61,8 +66,11 @@ namespace hs
 		// Claim a free (empty or released) slot for `a_address`. On success
 		// `a_outIndex` is 0..3. On failure (no free slot, or every candidate
 		// entry stayed contended for all 16 attempts) ClaimDrops is incremented
-		// and false is returned -- never a stall.
-		bool Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, std::uintptr_t a_allocSite,
+		// and false is returned -- never a stall. `a_armedWasCode` is the
+		// module-map classification of `a_valueAtArm` at arming time, kept so the
+		// trap path and the drainer can apply the benign-vs-degradation rule
+		// without ever calling the locking module map themselves.
+		bool Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, bool a_armedWasCode, std::uintptr_t a_allocSite,
 			std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex) noexcept;
 
 		// Mark the slot holding `a_address` released (the block was freed). The
@@ -127,6 +135,7 @@ namespace hs
 			std::uint32_t              generation = 0;
 			std::uint32_t              flags = 0;
 			std::uint32_t              threadId = 0;
+			bool                       armedWasCode = false;
 		};
 
 		[[nodiscard]] static bool            FreeSlot(const Slot& a_slot) noexcept;

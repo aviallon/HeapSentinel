@@ -100,11 +100,30 @@ namespace hs
 
 		static constexpr std::size_t kMaxTrackedThreads = 256;
 
+		// What we last wrote into one DR slot on one thread. The trap path runs on
+		// the faulting thread and reads this without a lock; the sweeper is the
+		// only writer. It is the "we ever armed this here" record FIX 1 needed: a
+		// DR slot that still holds an address the table has since moved on from is
+		// OURS (a stale arm), not a foreign breakpoint, and must be consumed.
+		struct ThreadArm
+		{
+			std::atomic<std::uintptr_t> address{ 0 };
+			std::atomic<std::uintptr_t> valueAtArm{ 0 };
+			std::atomic<std::uintptr_t> allocSite{ 0 };
+			std::atomic<std::uint64_t>  armedAt{ 0 };
+			std::atomic<std::uint32_t>  generation{ 0 };
+			std::atomic<bool>           armedWasCode{ false };
+		};
+
 		struct ThreadEntry
 		{
-			std::uint32_t tid = 0;
-			std::uint32_t generation = 0;
-			std::uint64_t armedAt = 0;
+			std::atomic<std::uint32_t> tid{ 0 };
+			std::atomic<std::uint32_t> generation{ 0 };
+			std::atomic<std::uint64_t> armedAt{ 0 };
+			// Bit i is set once we have ever written a nonzero watch into DRi on
+			// this thread. Cleared only when the entry is reassigned to a new tid.
+			std::atomic<std::uint32_t> everArmedMask{ 0 };
+			ThreadArm                  arms[kWatchpointSlotCount];
 		};
 
 		void SweeperLoop() noexcept;
@@ -117,6 +136,14 @@ namespace hs
 		[[nodiscard]] bool AllocSiteMatches(std::uintptr_t a_site) const noexcept;
 		[[nodiscard]] bool ResolveAllocSiteFilter();
 		[[nodiscard]] ThreadEntry* FindThread(std::uint32_t a_tid) noexcept;
+		// Release a logical watch and ask the next sweep to clear it on EVERY
+		// thread, not just the trapping one (FIX 2). No OS call, no lock, no spin:
+		// the sweeper owns the suspend/set-context work and does it once per sweep.
+		void RequestDisarm() noexcept
+		{
+			BumpGeneration();
+			_forceRearm.store(true, std::memory_order_release);
+		}
 		void                       BumpGeneration() noexcept { _generation.fetch_add(1, std::memory_order_relaxed); }
 
 		WatchpointPlan      _plan;
@@ -128,6 +155,7 @@ namespace hs
 		std::atomic<std::uint64_t> _reportEvents{ 0 };
 		std::atomic<std::uint32_t> _generation{ 1 };
 		std::atomic<std::uint64_t> _lastRearmTick{ 0 };
+		std::atomic<bool>          _forceRearm{ false };
 		std::atomic<std::uint64_t> _unwatchable{ 0 };
 		std::atomic<std::uint64_t> _threadTableOverflow{ 0 };
 		std::atomic<std::uint64_t> _drained{ 0 };
@@ -140,6 +168,10 @@ namespace hs
 		std::size_t   _armAfterReports = 1;
 		bool          _armAfterTrigger = true;
 		std::size_t   _reportCapacity = 256;
+		// How long after an arm we keep a retired (stale) trap legible as a report.
+		// Consumption of a stale trap is unconditional (safety); this only bounds
+		// how long we keep emitting a report for it.
+		std::uint64_t _staleGraceMs = 30000;
 
 		// Alloc-site filter, resolved to absolute addresses at Init. Bounded.
 		static constexpr std::size_t kMaxAllocSiteFilters = 8;
@@ -147,7 +179,7 @@ namespace hs
 		std::size_t                  _filterCount = 0;
 
 		ThreadEntry  _threads[kMaxTrackedThreads];
-		std::size_t  _trackedCount = 0;  // written only by the sweeper
+		std::atomic<std::uint32_t> _trackedCount{ 0 };  // written only by the sweeper
 
 		std::size_t  _lastCheckedThreads = 0;
 		std::size_t  _lastArmedThreads = 0;

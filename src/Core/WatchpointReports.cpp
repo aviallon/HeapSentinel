@@ -161,7 +161,7 @@ namespace hs
 			return 0;
 		}
 		const auto written = std::snprintf(a_buffer, a_size,
-			"slot=%u watched=0x%llX before=0x%llX after=0x%llX%s writer_rip=0x%llX dr6=0x%X tid=%u armed_tick=%llu trap_tick=%llu",
+			"slot=%u watched=0x%llX before=0x%llX after=0x%llX%s writer_rip=0x%llX dr6=0x%X tid=%u armed_tick=%llu trap_tick=%llu stale_arm=%d table=0x%llX",
 			a_report.slotIndex,
 			static_cast<unsigned long long>(a_report.watchedAddress),
 			static_cast<unsigned long long>(a_report.valueAtArm),
@@ -171,7 +171,9 @@ namespace hs
 			a_report.dr6,
 			a_report.threadId,
 			static_cast<unsigned long long>(a_report.armedTick),
-			static_cast<unsigned long long>(a_report.tick));
+			static_cast<unsigned long long>(a_report.tick),
+			(a_report.flags & kWatchReportStaleArm) != 0 ? 1 : 0,
+			static_cast<unsigned long long>(a_report.tableAddress));
 		return static_cast<std::size_t>(written < 0 ? 0 : written);
 	}
 }
