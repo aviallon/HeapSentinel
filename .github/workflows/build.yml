@@ -197,8 +197,8 @@ jobs:
         with:
           files: |
             HeapSentinel-*.zip
-            **/HeapSentinel.dll
-            **/HeapSentinel.pdb
+            out/SKSE/Plugins/HeapSentinel.dll
+            out/SKSE/Plugins/HeapSentinel.pdb
           body: |
             HeapSentinel - an SKSE plugin that retrofits a memory sentinel onto
             a running Skyrim SE/AE process: a shadow allocation ledger on the
