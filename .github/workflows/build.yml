@@ -180,7 +180,7 @@ jobs:
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.pdb" || { echo "::error::the PDB is missing from the archive"; exit 1; }
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
-          7z l "$ZIP" | tr '\\' '/' | grep -q "^meta.ini" || { echo "::error::meta.ini is missing from the archive"; exit 1; }
+          7z l "$ZIP" | tr '\\' '/' | grep -q "meta.ini" || { echo "::error::meta.ini is missing from the archive"; exit 1; }
           sha256sum "$ZIP"
 
       - uses: actions/upload-artifact@v4
