@@ -8,8 +8,8 @@ install a mod archive, and the GUI is not required to install one: the same
 library that the GUI calls is importable. This script drives it end to end:
 
     extract -> FOMOD resolve (one profile) -> stage into the profile's mods/
-    -> write meta.ini -> re-point the deployed HeapSentinel.ini's
-    [Watchpoints] bEnabled -> drop stale HeapSentinel-* folders
+    -> write meta.ini -> preserve (and optionally override) the deployed
+    [Watchpoints] section -> drop stale HeapSentinel-* folders
     -> edit modlist.txt -> FileGraphService.refresh(profile_dir)
     -> (host) amethyst-mod-manager-cli deploy skyrim_se default -> verify
 
@@ -34,7 +34,8 @@ Run it on the HOST:
     python3 tools/install-to-amethyst.py \
         --archive HeapSentinel-0.6.1-fomod.zip \
         [--loose-dll HeapSentinel.dll] [--loose-pdb HeapSentinel.pdb] \
-        [--fomod-profile balanced] [--profile default] [--skip-deploy]
+        [--fomod-profile balanced] [--profile default] \
+        [--watchpoints-set bArmAfterTrigger=0] [--skip-deploy]
 
 It re-executes itself with `flatpak run --command=python3 io.github.Amethyst.ModManager`
 for the library-dependent part (`--inner`).
@@ -125,6 +126,26 @@ def version_from_name(path: Path) -> str | None:
 def read_ini(path: Path, section: str, key: str):
     if not path or not Path(path).is_file():
         return None
+    return ini_section(path, section).get(key)
+
+
+# The keys the user tunes for a hunt. The FOMOD profiles never vary
+# [Watchpoints], so on a reinstall the previous SECTION is the user's intent and
+# must survive; carrying only bEnabled was not enough (it silently reset
+# bArmAfterTrigger/sAllocSiteRvas and disarmed the hunt).
+WATCHPOINT_KEYS = (
+    "bEnabled", "bArmAfterTrigger", "uArmAfterReports", "uSweepMs", "uRearmMs",
+    "uHoldMs", "uMaxThreads", "uSamplePrime", "sAllocSiteRvas",
+    "bAllocSiteOnly", "uMaxPending", "uReportCapacity",
+)
+
+
+def ini_section(path, section: str) -> dict:
+    """{key: value} for one ini section, section-filtered (never by line
+    number, which has misled this project before). Empty when absent."""
+    if not path or not Path(path).is_file():
+        return {}
+    out: dict = {}
     current = None
     for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
@@ -133,9 +154,8 @@ def read_ini(path: Path, section: str, key: str):
             continue
         if current == section and "=" in line:
             k, _, v = line.partition("=")
-            if k.strip().lower() == key.lower():
-                return v.strip()
-    return None
+            out.setdefault(k.strip(), v.strip())
+    return out
 
 
 def verify_archive(archive: Path) -> dict:
@@ -189,7 +209,8 @@ def locate_deployed(game_data) -> dict:
 
 
 def verify_deployment(game_data: Path, archive: Path, expected: dict,
-                      loose_dll: Path | None, loose_pdb: Path | None) -> bool:
+                      loose_dll: Path | None, loose_pdb: Path | None,
+                      expected_watchpoints: dict | None = None) -> bool:
     deployed = locate_deployed(game_data)
     ok = True
     log("verification:")
@@ -239,14 +260,18 @@ def verify_deployment(game_data: Path, archive: Path, expected: dict,
             ok = False
 
     if deployed["ini"].is_file():
-        b_enabled = read_ini(deployed["ini"], "Watchpoints", "bEnabled")
-        log(f"  deployed ini [Watchpoints] bEnabled={b_enabled}")
-        if b_enabled != "1":
-            log("  FAIL: [Watchpoints] bEnabled is not 1 - the user's enabled "
-                "watchpoints setting did not survive the reinstall")
-            ok = False
-        else:
-            log("  ok: [Watchpoints] bEnabled=1 survived")
+        actual_watchpoints = ini_section(deployed["ini"], "Watchpoints")
+        log("  deployed ini [Watchpoints] read back through Data/: "
+            + ", ".join(f"{k}={actual_watchpoints.get(k)}"
+                         for k in sorted(actual_watchpoints)))
+        checked = expected_watchpoints or {"bEnabled": "1"}
+        for key, want in checked.items():
+            got = actual_watchpoints.get(key)
+            if got != want:
+                log(f"  FAIL: [Watchpoints] {key} is {got!r}, expected {want!r}")
+                ok = False
+        if ok:
+            log("  ok: deployed [Watchpoints] matches the requested values")
     return ok
 
 
@@ -291,10 +316,11 @@ def host_main(args) -> int:
         "--game", args.game,
         "--profile", args.profile,
         "--fomod-profile", args.fomod_profile,
-        "--watchpoints-b-enabled", args.watchpoints_b_enabled,
         "--mod-name", args.mod_name or "",
         "--data-dir", str(args.data_dir),
     ]
+    for kv in args.watchpoints_set:
+        inner_cmd += ["--watchpoints-set", kv]
     log(f"running inner installer in flatpak: {' '.join(inner_cmd)}")
     proc = subprocess.run(inner_cmd, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
@@ -338,7 +364,8 @@ def host_main(args) -> int:
     if loose_pdb is not None and not loose_pdb.is_file():
         die(f"--loose-pdb not found: {loose_pdb}")
 
-    if not verify_deployment(args.data_dir, archive, expected, loose_dll, loose_pdb):
+    if not verify_deployment(args.data_dir, archive, expected, loose_dll,
+                             loose_pdb, result.get("watchpoints")):
         die("deployment verification FAILED", 1)
     log("SUCCESS: HeapSentinel staged, indexed, deployed and verified")
     return 0
@@ -470,30 +497,22 @@ def inner_main(args) -> int:
     mod_name = args.mod_name or archive.stem
     dest_root = staging / mod_name
 
-    # Capture the user's [Watchpoints] bEnabled BEFORE replacing anything.
+    # Capture the user's whole [Watchpoints] section BEFORE replacing anything.
     # It must be read from every prior location (the currently deployed ini and
-    # every existing HeapSentinel staged install) because the first reinstall
-    # moves the value out of the old folder into the new one: reading only the
-    # destination after the copy would let the FOMOD profile default (0) win and
-    # silently disable the watchpoints the user enabled.
+    # every existing HeapSentinel staged install) because a reinstall moves the
+    # value out of the old folder into the new one: reading only the destination
+    # after the copy would let the FOMOD profile default win and silently
+    # disarm the hunt (armAfterTrigger/alloc-site filter reset).
     deployed_ini = Path(args.data_dir) / "SKSE" / "Plugins" / "HeapSentinel.ini"
-    prior_values = [
-        read_ini(cand, "Watchpoints", "bEnabled")
-        for cand in [deployed_ini]
-        + sorted(staging.glob("HeapSentinel*/SKSE/Plugins/HeapSentinel.ini"))
-    ]
-    prior_values = [v for v in prior_values if v is not None]
-    if args.watchpoints_b_enabled in ("0", "1"):
-        prior = args.watchpoints_b_enabled
-        log(f"[Watchpoints] bEnabled forced to {prior} by --watchpoints-b-enabled")
-    elif "1" in prior_values:
-        prior = "1"
-    elif prior_values:
-        prior = prior_values[0]
-    else:
-        prior = None
-    if prior_values:
-        log(f"previous [Watchpoints] bEnabled values: {sorted(set(prior_values))}")
+    prior_watchpoints: dict = {}
+    for cand in [deployed_ini] + sorted(
+            staging.glob("HeapSentinel*/SKSE/Plugins/HeapSentinel.ini")):
+        for key, value in ini_section(cand, "Watchpoints").items():
+            if key in WATCHPOINT_KEYS:
+                prior_watchpoints.setdefault(key, value)
+    if prior_watchpoints:
+        log("previous [Watchpoints]: "
+            + ", ".join(f"{k}={prior_watchpoints[k]}" for k in sorted(prior_watchpoints)))
 
     extract_dir = Path(tempfile.mkdtemp(prefix="hs-install-"))
     try:
@@ -558,14 +577,18 @@ def inner_main(args) -> int:
         log(f"wrote {dest_root / 'meta.ini'} "
             f"(version={meta.version!r}, gameName={meta.game_domain!r})")
 
-        # --- preserve the user's enabled watchpoints ----------------------
+        # --- preserve / apply the user's [Watchpoints] --------------------
         new_ini = dest_root / "SKSE" / "Plugins" / "HeapSentinel.ini"
-        if prior == "1" and read_ini(new_ini, "Watchpoints", "bEnabled") != "1":
-            patch_ini_value(new_ini, "Watchpoints", "bEnabled", "1")
-            log("carried forward [Watchpoints] bEnabled=1 into the new install")
-        else:
-            log(f"[Watchpoints] bEnabled in the new install: "
-                f"{read_ini(new_ini, 'Watchpoints', 'bEnabled')} (prior: {prior})")
+        applied: dict = dict(prior_watchpoints)
+        for kv in args.watchpoints_set:
+            key, sep, value = kv.partition("=")
+            if not sep or key not in WATCHPOINT_KEYS:
+                die(f"--watchpoints-set must be KEY=VALUE with a known key, got {kv!r}")
+            applied[key] = value
+        for key, value in applied.items():
+            patch_ini_value(new_ini, "Watchpoints", key, value)
+        log("applied [Watchpoints]: "
+            + ", ".join(f"{k}={applied[k]}" for k in sorted(applied)))
 
         # --- drop stale HeapSentinel-* mod folders ------------------------
         for entry in sorted(staging.iterdir()):
@@ -589,6 +612,7 @@ def inner_main(args) -> int:
         "mod_dir": str(dest_root),
         "fomod_profile": fomod_profile,
         "meta_ini": str(dest_root / "meta.ini"),
+        "watchpoints": applied,
     }), flush=True)
     return 0
 
@@ -608,10 +632,11 @@ def main(argv=None) -> int:
     parser.add_argument("--profile", default=DEFAULT_PROFILE)
     parser.add_argument("--fomod-profile", default=DEFAULT_FOMOD_PROFILE,
                         help="FOMOD profile flag value (default: balanced)")
-    parser.add_argument("--watchpoints-b-enabled", default="auto",
-                        choices=["auto", "0", "1"],
-                        help="[Watchpoints] bEnabled in the installed ini; auto (default) "
-                             "preserves the previous value, preferring 1")
+    parser.add_argument("--watchpoints-set", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="force a [Watchpoints] key in the installed ini "
+                             "(repeatable); the previous section is preserved "
+                             "for keys not overridden")
     parser.add_argument("--mod-name", default=None,
                         help="mod folder name (default: the archive stem)")
     parser.add_argument("--data-dir", default=None,
