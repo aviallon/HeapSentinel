@@ -10,6 +10,7 @@
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
 #include "Core/Verdict.h"
+#include "Core/Watchpoints.h"
 #include "Core/WeakLibEvents.h"
 #include "Config.h"
 
@@ -347,6 +348,14 @@ namespace hs
 		{
 			if (!a_info || !a_info->ExceptionRecord) {
 				return EXCEPTION_CONTINUE_SEARCH;
+			}
+			// Hardware data watchpoints arrive as a single-step debug exception. Only
+			// the watchpoint manager may claim one, and only when DR6's B0-B3 says
+			// one of OUR slots fired; anything else (a trap-flag single step, a
+			// foreign breakpoint) is handed to the next handler. We never swallow an
+			// exception we do not understand.
+			if (a_info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+				return Watchpoints::Get().HandleDebugException(a_info);
 			}
 			if (a_info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
 				return EXCEPTION_CONTINUE_SEARCH;

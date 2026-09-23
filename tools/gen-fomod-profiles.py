@@ -278,6 +278,124 @@ SECTIONS = [
         ],
     },
     {
+        "name": "Watchpoints",
+        "keys": [
+            {
+                "name": "bEnabled",
+                "kind": "bool",
+                "default": False,
+                "comment": [
+                    "Hardware DATA WATCHPOINTS (x86-64 DR0-DR3): the only feature that says",
+                    "WHO wrote a corrupted block, not merely that it is corrupt. It arms a",
+                    "write watchpoint on the first 8 bytes (the vtable pointer) of a small,",
+                    "moving sample of Scaleform blocks and reports the writer's RIP as",
+                    "module+0xRVA when the write happens.",
+                    "",
+                    "OPT-IN, DEFAULT OFF. Four DR slots exist and they are per-thread, so",
+                    "coverage is partial by construction; arming means briefly suspending",
+                    "every thread to write its context, which is real timing perturbation.",
+                    "A diagnostic must not alter what it observes, so this stays off unless",
+                    "you are hunting a specific write. See DESIGN.md section 13.",
+                ],
+            },
+            {
+                "name": "bArmAfterTrigger",
+                "kind": "bool",
+                "default": True,
+                "comment": [
+                    "Arm only after a report has actually been produced, so ordinary play",
+                    "with a healthy install pays nothing. 0 arms at load.",
+                ],
+            },
+            {
+                "name": "uArmAfterReports",
+                "kind": "int",
+                "default": 1,
+                "comment": ["Number of report events before the watchpoints arm."],
+            },
+            {
+                "name": "uSweepMs",
+                "kind": "int",
+                "default": 250,
+                "comment": [
+                    "Sweeper cadence: how often pending candidates, the hold timeout and",
+                    "the thread list are serviced. Bounds the latency of arming a newly",
+                    "created thread and of draining a trap into the log.",
+                ],
+            },
+            {
+                "name": "uRearmMs",
+                "kind": "int",
+                "default": 500,
+                "comment": [
+                    "Budget for rewriting every thread's context after the watched set",
+                    "changes. Suspending threads is the expensive part, so this is a floor",
+                    "on the re-arm period, not a per-allocation action.",
+                ],
+            },
+            {
+                "name": "uHoldMs",
+                "kind": "int",
+                "default": 30000,
+                "comment": [
+                    "Give up a watched block after this long even if it is never freed, so",
+                    "four immortal allocations cannot occupy the sample forever. 0 keeps a",
+                    "block until it is freed.",
+                ],
+            },
+            {
+                "name": "uMaxThreads",
+                "kind": "int",
+                "default": 256,
+                "comment": ["Bound on the tracked-thread table (a full table is counted)."],
+            },
+            {
+                "name": "uSamplePrime",
+                "kind": "int",
+                "default": 61,
+                "comment": [
+                    "Sampling modulus over Mix64(pointer). Must be a PRIME from the",
+                    "project ladder (61...163); a non-prime is refused and 61 is used. A",
+                    "power of two would lock step with the page size and the size classes.",
+                ],
+            },
+            {
+                "name": "sAllocSiteRvas",
+                "kind": "string",
+                "default": "",
+                "comment": [
+                    "Alloc-site filter: hex RVAs relative to SkyrimSE.exe, comma or space",
+                    "separated. The observed stray-write crash allocates at 0xDF49F7, e.g.",
+                    "sAllocSiteRvas=DF49F7. Empty disables the filter (sample-only).",
+                ],
+            },
+            {
+                "name": "bAllocSiteOnly",
+                "kind": "bool",
+                "default": False,
+                "comment": [
+                    "0 = matching sites bypass the sample, other blocks are still sampled",
+                    "(filter-preferred). 1 = ONLY matching sites are considered.",
+                ],
+            },
+            {
+                "name": "uMaxPending",
+                "kind": "int",
+                "default": 16,
+                "comment": ["Bounded selected-but-not-yet-armed queue (overwrite-oldest, counted)."],
+            },
+            {
+                "name": "uReportCapacity",
+                "kind": "int",
+                "default": 256,
+                "comment": [
+                    "Preallocated trap report slots. The VEH writes a POD and a watchdog",
+                    "drains it, so the trap path never allocates or logs.",
+                ],
+            },
+        ],
+    },
+    {
         "name": "Reporting",
         "keys": [
             {
@@ -505,7 +623,6 @@ def _fmt(kind: str, value) -> str:
         return "1" if value else "0"
     return str(value)
 
-
 def render_ini(profile: Profile, *, is_default: bool) -> str:
     lines: list[str] = []
     lines.append("; HeapSentinel - Data/SKSE/Plugins/HeapSentinel.ini")
@@ -564,6 +681,7 @@ What it does:
 - Keeps a shadow ledger of every tracked block, with the allocation and the free call stacks.
 - A vectored exception handler catches the fault and prints PROVENANCE: which module freed the object, and from where.
 - Optional poison-on-free overwrites a freed Scaleform object's vtable with a reserved poison address and delays the real free, so a later virtual call through the dead object faults deterministically at an address that maps back to the ledger record, with both the alloc and the free stack.
+- Ships HeapSentinel.pdb next to SKSE/Plugins/HeapSentinel.dll, so Crash Logger resolves HeapSentinel's OWN frames to function names and source lines instead of the opaque "HeapSentinel.dll+0x39C1B". Optional hardware data watchpoints can also report the writer of a corrupted block.
 
 What it is NOT:
 - It is not a crash fix and not a stability mod. It cannot repair a use-after-free; it exists to identify the mod that caused it. Install it while hunting a crash, read the report, then remove it or keep it as you prefer.
@@ -571,6 +689,7 @@ What it is NOT:
 
 Cost and privacy:
 - Memory: the profile you choose on the next page costs roughly 125-735 MiB of resident memory; the recommended Balanced profile is about 260 MiB. Each profile states its own number.
+- Symbols: HeapSentinel.pdb adds roughly 17 MB on disk next to the DLL (17,788,928 bytes in the 1.7.104 build; not resident memory). Losing it only costs legibility of HeapSentinel's own frames.
 - Per-allocation cost: every tracked allocation pays a small extra cost on the hot path (a bloom pre-filter, a sharded lock-free ledger insert, and, when stacks are on, a call-stack capture).
 - Nothing leaves the machine. Reports are written to the SKSE log next to the DLL; there is no network code.
 
@@ -584,7 +703,7 @@ def render_module_config(version: str) -> str:
     out.append('        xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">')
     out.append(f"  <moduleName>HeapSentinel {escape(version)}</moduleName>")
     out.append("  <requiredInstallFiles>")
-    for source in ("SKSE/Plugins/HeapSentinel.dll", "README.md", "RESEARCH.md", "DESIGN.md"):
+    for source in ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md"):
         out.append(f'    <file source="{source}" destination="{source}" />')
     out.append("  </requiredInstallFiles>")
 

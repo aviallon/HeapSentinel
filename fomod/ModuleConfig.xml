@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
-  <moduleName>HeapSentinel 0.5.0</moduleName>
+  <moduleName>HeapSentinel 0.6.0</moduleName>
   <requiredInstallFiles>
     <file source="SKSE/Plugins/HeapSentinel.dll" destination="SKSE/Plugins/HeapSentinel.dll" />
+    <file source="SKSE/Plugins/HeapSentinel.pdb" destination="SKSE/Plugins/HeapSentinel.pdb" />
     <file source="README.md" destination="README.md" />
     <file source="RESEARCH.md" destination="RESEARCH.md" />
     <file source="DESIGN.md" destination="DESIGN.md" />
@@ -21,6 +22,7 @@ What it does:
 - Keeps a shadow ledger of every tracked block, with the allocation and the free call stacks.
 - A vectored exception handler catches the fault and prints PROVENANCE: which module freed the object, and from where.
 - Optional poison-on-free overwrites a freed Scaleform object's vtable with a reserved poison address and delays the real free, so a later virtual call through the dead object faults deterministically at an address that maps back to the ledger record, with both the alloc and the free stack.
+- Ships HeapSentinel.pdb next to SKSE/Plugins/HeapSentinel.dll, so Crash Logger resolves HeapSentinel's OWN frames to function names and source lines instead of the opaque "HeapSentinel.dll+0x39C1B". Optional hardware data watchpoints can also report the writer of a corrupted block.
 
 What it is NOT:
 - It is not a crash fix and not a stability mod. It cannot repair a use-after-free; it exists to identify the mod that caused it. Install it while hunting a crash, read the report, then remove it or keep it as you prefer.
@@ -28,6 +30,7 @@ What it is NOT:
 
 Cost and privacy:
 - Memory: the profile you choose on the next page costs roughly 125-735 MiB of resident memory; the recommended Balanced profile is about 260 MiB. Each profile states its own number.
+- Symbols: HeapSentinel.pdb adds roughly 17 MB on disk next to the DLL (17,788,928 bytes in the 1.7.104 build; not resident memory). Losing it only costs legibility of HeapSentinel's own frames.
 - Per-allocation cost: every tracked allocation pays a small extra cost on the hot path (a bloom pre-filter, a sharded lock-free ledger insert, and, when stacks are on, a call-stack capture).
 - Nothing leaves the machine. Reports are written to the SKSE log next to the DLL; there is no network code.
 

@@ -33,7 +33,8 @@ one alone catches the crash above.
 | A | Shadow ledger on `MemoryManager::Allocate/Deallocate/Reallocate` | double free, invalid free, sized-dealloc mismatch, provenance | on |
 | A | Vtable guard on `GRefCountImpl::Release` | release through a dead/corrupt vtable — **with optional fail-safe** | on |
 | B | GWP-ASan-style sampled guarded pool | use-after-free and buffer overflow, deterministically, for sampled allocations | **off** (opt-in) |
-| — | Vectored exception handler | classifies any access violation; fixes up only faults in our own guarded pool | on |
+| B | Hardware data watchpoints (DR0-DR3) on a sampled set of Scaleform blocks | **who WROTE a corrupted block** — the writer's RIP as module+RVA — plus write-after-free | **off** (opt-in, arms only after a trigger) |
+| — | Vectored exception handler | classifies any access violation; fixes up only faults in our own guarded pool; reports watchpoint traps | on |
 
 Reports include the kind, the faulting/object address classified
 (module+offset / guarded slot / ledger-known-freed / poison / unmapped), the
@@ -41,6 +42,27 @@ pre-crash stack, the alloc and free stacks, the object bytes, and optionally a
 screenshot and a freeze.
 
 ## Status
+
+**v0.6 — who wrote it, and legible symbols.** Two additions come straight from a
+live crash investigation in which a 32-bit write landed in the low half of an
+8-byte pointer field (a live object's vtable decremented by 4 in one crash; the
+residue of a 32-bit write of `3` in a freed block's first qword in another).
+
+- **Hardware data watchpoints** (`[Watchpoints]`, default off): arm DR0-DR3
+  write watchpoints on the first 8 bytes of a moving sample of Scaleform blocks
+  (an alloc-site RVA filter and/or a prime-modulus sample) on *every* thread,
+  and report the writer's RIP at the `#DB`. Four per-thread slots means the
+  coverage is partial by construction and the arming cost is bounded by a
+  re-arm cadence; the trap path allocates nothing and the whole feature stays
+  off until a report has actually been produced. See `DESIGN.md` §13.
+- **A shipped `HeapSentinel.pdb`** next to `SKSE/Plugins/HeapSentinel.dll`, in
+  the flat archive and the FOMOD, so Crash Logger resolves HeapSentinel's own
+  frames to function names and source lines instead of `HeapSentinel.dll+0x39C1B`.
+  See `DESIGN.md` §14.
+
+Both are tested off-game (the watchpoint cores run on Linux and Windows; a
+Windows test arms a real watchpoint and catches a real write). Neither has been
+run in the game.
 
 **v0.5 — double-free reporting is honest and non-perturbing.** A suspected
 double free is reported and the original free is still called (the old
@@ -90,9 +112,10 @@ committed-table completeness check in CI).
 
 ## Install
 
-Copy `HeapSentinel.dll` to `Data/SKSE/Plugins/` and the config to
-`Data/SKSE/Plugins/HeapSentinel.ini` (or install the release archive with
-Amethyst / MO2 / Vortex). Logs go next to the other SKSE logs:
+Copy `HeapSentinel.dll` **and `HeapSentinel.pdb`** to `Data/SKSE/Plugins/` and
+the config to `Data/SKSE/Plugins/HeapSentinel.ini` (or install the release
+archive with Amethyst / MO2 / Vortex — the PDB is part of the archive so Crash
+Logger resolves HeapSentinel's own frames). Logs go next to the other SKSE logs:
 `HeapSentinel.log` and `HeapSentinel-reports.log`.
 
 Start with the defaults. Turn on `[GuardPool] bEnabled=1` only when you are
@@ -111,6 +134,12 @@ src/
     StackCapture.{h,cpp}  RtlCaptureStackBackTrace, module+offset formatting
     ShadowLedger.{h,cpp}  sharded lock-free ptr -> metadata table
     GuardedPool.{h,cpp}   GWP-ASan-style sampled guard-page pool
+    WatchpointEncoding.h  x86-64 DR0-DR3/DR6/DR7 bit layout (header-only, testable everywhere)
+    WatchpointPlan.{h,cpp}    selection policy: alloc-site filter + prime-modulus sample + bounded queue
+    WatchpointSlots.{h,cpp}   the four DR slots as a lock-free seqlock table (bounded claim/drop)
+    WatchpointReports.{h,cpp} preallocated VEH trap report ring + deterministic encoding
+    HwWatchpoint.{h,cpp}      Windows Get/SetThreadContext debug-register layer
+    Watchpoints.{h,cpp}       manager: sweeper, per-thread arming, VEH trap, drain, shutdown assert
     Report.{h,cpp}        classification, loud logging, screenshot, freeze
   Hooks/
     Hooks.{h,cpp}         MinHook install + MemoryManager / GRefCountImpl thunks

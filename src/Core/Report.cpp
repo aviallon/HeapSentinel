@@ -8,6 +8,7 @@
 #include "Core/ReportLog.h"
 #include "Core/ShadowLedger.h"
 #include "Core/Stats.h"
+#include "Core/Watchpoints.h"
 #include "Config.h"
 
 #include <chrono>
@@ -185,6 +186,12 @@ namespace hs
 		if (g_reports) {
 			g_reports->critical("[{}] {}", a_kind, a_detail);
 		}
+
+		// Watchpoint trigger. REPORT EVENTS ARM THE HARDWARE WATCHPOINTS: a
+		// diagnostic that watches everything from load costs frames, so it waits
+		// until the install has actually produced evidence. This is one relaxed
+		// atomic increment; arming itself happens on the watchdog thread.
+		Watchpoints::Get().NotifyReportEvent();
 
 		// The v0.3.0 run emitted no stats at all. Emit once on the first report so
 		// a short session is observable even if it never reaches the 60 s timer.

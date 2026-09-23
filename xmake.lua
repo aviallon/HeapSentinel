@@ -11,7 +11,7 @@ set_xmakever("3.0.0")
 includes("lib/CommonLibSSE-NG/xmake.lua")
 
 set_project("HeapSentinel")
-set_version("0.5.0")
+set_version("0.6.0")
 set_languages("c++23")
 set_license("MIT")
 
@@ -60,6 +60,18 @@ target("HeapSentinel")
     add_files("src/**.cpp")
     add_headerfiles("src/**.h")
     add_includedirs("src")
+
+    -- Symbols are a shipped FEATURE, not debug clutter. Crash Logger resolves a
+    -- frame only when HeapSentinel.pdb sits in the DLL's own directory; without
+    -- it our frames appear as "HeapSentinel.dll+0x39C1B" and nobody can resolve
+    -- them. set_symbols("debug") above already enables /Zi + /DEBUG; /DEBUG:FULL
+    -- forces the full private symbols (not a stripped PDB), which is what lets
+    -- the DIA session map an RVA to a function name and a source line. CI
+    -- asserts the PDB exists, is non-empty and carries the MSF signature, and
+    -- the release/FOMOD packaging places it next to the DLL.
+    if is_plat("windows") then
+        add_ldflags("/DEBUG:FULL", { force = true })
+    end
 
     -- MinHook: function-entry detours (the SKSE trampoline only redirects an
     -- existing branch and cannot install a prologue hook with an original-call

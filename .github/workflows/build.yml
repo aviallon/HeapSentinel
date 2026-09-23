@@ -82,6 +82,7 @@ jobs:
           xmake build HeapSentinel
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem -Recurse -Filter HeapSentinel.dll | Select-Object FullName, Length
+          Get-ChildItem -Recurse -Filter HeapSentinel.pdb | Select-Object FullName, Length
 
       - name: Assert the artifact carries the work
         shell: bash
@@ -93,10 +94,20 @@ jobs:
 
           # A green build must not come from a stub: the plugin name, the
           # config section and the report kinds have to be in the binary.
-          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "ScaleformHeap" "WeakLib" "bad-vtable-release" "double-free" "double-free-unverified" "VERDICT" "PoisonOnFree" "bPreventDoubleFree" "GFxResourceWeakLib::PinResource" "GFxResourceWeakLib::RemoveResourceOnRelease"; do
+          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "ScaleformHeap" "WeakLib" "bad-vtable-release" "double-free" "double-free-unverified" "VERDICT" "PoisonOnFree" "bPreventDoubleFree" "GFxResourceWeakLib::PinResource" "GFxResourceWeakLib::RemoveResourceOnRelease" "Watchpoints" "sAllocSiteRvas" "uSamplePrime" "watchpoint-write" "HARDWARE WATCHPOINT"; do
             strings -n 5 "$dll" | grep -q "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
           done
           echo "the DLL contains the plugin name, config sections and report kinds"
+
+          # Deliverable: symbols. CrashLogger resolves a frame only when the PDB
+          # sits next to the DLL, so a green build must actually produce it, and
+          # it must look like a Windows PDB (MSF 7.00 magic) rather than a stub.
+          pdb=$(find build -name HeapSentinel.pdb | head -1)
+          [ -n "$pdb" ] || { echo "::error::HeapSentinel.pdb was not built - CrashLogger cannot resolve HeapSentinel's own frames"; exit 1; }
+          test -s "$pdb" || { echo "::error::the built PDB is empty"; exit 1; }
+          head -c 64 "$pdb" | grep -q "MSF" || { echo "::error::$pdb is not a Windows PDB (no MSF signature)"; exit 1; }
+          ls -l "$pdb"
+          echo "HeapSentinel.pdb produced and is a Windows PDB"
 
           # Hook-target verification must actually be compiled in: the embedded
           # table, the mismatch refusal and the degraded health state are the
@@ -121,8 +132,14 @@ jobs:
         run: |
           set -euo pipefail
           dll=$(find build -name HeapSentinel.dll | head -1)
+          pdb=$(find build -name HeapSentinel.pdb | head -1)
+          [ -n "$pdb" ] || { echo "::error::HeapSentinel.pdb was not built"; exit 1; }
           mkdir -p out/SKSE/Plugins
           cp "$dll" out/SKSE/Plugins/HeapSentinel.dll
+          # The PDB MUST travel with the DLL: CrashLogger looks in the DLL's own
+          # directory. This is what makes our frames legible instead of
+          # "HeapSentinel.dll+0x39C1B".
+          cp "$pdb" out/SKSE/Plugins/HeapSentinel.pdb
           cp config/HeapSentinel.ini out/SKSE/Plugins/HeapSentinel.ini
           cp README.md RESEARCH.md DESIGN.md out/
           # Data at the archive root so Amethyst / MO2 / Vortex install it as a
@@ -130,6 +147,7 @@ jobs:
           ( cd out && 7z a -bd -y ../HeapSentinel-0.5.0.zip . >/dev/null )
           ls -l HeapSentinel-0.5.0.zip
           7z l HeapSentinel-0.5.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
+          7z l HeapSentinel-0.5.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.pdb" || { echo "::error::the PDB is missing from the archive"; exit 1; }
           7z l HeapSentinel-0.5.0.zip | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
           sha256sum HeapSentinel-0.5.0.zip
 
@@ -138,6 +156,7 @@ jobs:
           name: HeapSentinel
           path: |
             **/HeapSentinel.dll
+            **/HeapSentinel.pdb
             HeapSentinel-0.5.0.zip
 
       - name: Attach to a release when tagging
@@ -147,12 +166,17 @@ jobs:
           files: |
             HeapSentinel-0.5.0.zip
             **/HeapSentinel.dll
+            **/HeapSentinel.pdb
           body: |
             HeapSentinel - an SKSE plugin that retrofits a memory sentinel onto
             a running Skyrim SE/AE process: a shadow allocation ledger on the
             engine's MemoryManager, a GWP-ASan-style sampled guarded pool, and a
             GRefCountImpl::Release vtable guard that can fail safe instead of
             crashing. See RESEARCH.md and DESIGN.md.
+
+            Each archive ships HeapSentinel.pdb next to SKSE/Plugins/HeapSentinel.dll
+            so Crash Logger resolves HeapSentinel's own frames to function names and
+            source lines.
 
   # The committed hook-target verification table. Needs no game binary and no
   # third-party Address Library file: it checks the committed table against the
@@ -308,12 +332,16 @@ jobs:
           dll=$(find artifact -name HeapSentinel.dll | head -1)
           [ -n "$dll" ] || { echo "::error::no HeapSentinel.dll in the downloaded artifact"; exit 1; }
           test -s "$dll" || { echo "::error::the downloaded DLL is empty"; exit 1; }
+          pdb=$(find artifact -name HeapSentinel.pdb | head -1)
+          [ -n "$pdb" ] || { echo "::error::no HeapSentinel.pdb in the downloaded artifact"; exit 1; }
+          test -s "$pdb" || { echo "::error::the downloaded PDB is empty"; exit 1; }
           version=$(grep -oP 'set_version\("\K[^"]+' xmake.lua)
           [ -n "$version" ] || { echo "::error::could not read the version from xmake.lua"; exit 1; }
           echo "dll=$dll" >> "$GITHUB_OUTPUT"
+          echo "pdb=$pdb" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "using $dll for HeapSentinel $version"
-          sha256sum "$dll"
+          echo "using $dll + $pdb for HeapSentinel $version"
+          sha256sum "$dll" "$pdb"
 
       - name: Install xmllint for FOMOD schema validation
         shell: bash
@@ -334,6 +362,7 @@ jobs:
           # profile whose conditional-install flag resolves to the wrong ini.
           python3 tools/validate_fomod.py \
             --dll "${{ steps.vars.outputs.dll }}" \
+            --pdb "${{ steps.vars.outputs.pdb }}" \
             --zip "HeapSentinel-${{ steps.vars.outputs.version }}-fomod.zip" \
             --stage stage-fomod
 
@@ -342,7 +371,7 @@ jobs:
         run: |
           set -euo pipefail
           zip="HeapSentinel-${{ steps.vars.outputs.version }}-fomod.zip"
-          for f in fomod/ModuleConfig.xml fomod/info.xml SKSE/Plugins/HeapSentinel.dll; do
+          for f in fomod/ModuleConfig.xml fomod/info.xml SKSE/Plugins/HeapSentinel.dll SKSE/Plugins/HeapSentinel.pdb; do
             unzip -Z1 "$zip" | grep -qxF "$f" || { echo "::error::$f missing from $zip"; exit 1; }
           done
           unzip -Z1 "$zip" | grep -qE '^fomod/profiles/[^/]+\.ini$' || { echo "::error::no profile inis in $zip"; exit 1; }
@@ -367,7 +396,9 @@ jobs:
             caused one. Install with Amethyst: Mods -> Install mod from file...,
             then pick a memory/attribution profile in the wizard. The
             recommended "Balanced" profile costs roughly 260 MiB of resident
-            memory; every profile states its own cost in the wizard.
+            memory; every profile states its own cost in the wizard. The PDB adds
+            a few MB on disk next to the DLL so Crash Logger can resolve
+            HeapSentinel's own frames.
 
             Nothing leaves the machine. The loose SKSE/Plugins/HeapSentinel.dll
             and the flat archive remain on the CI artifact for manual install.

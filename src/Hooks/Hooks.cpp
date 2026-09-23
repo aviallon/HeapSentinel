@@ -14,6 +14,7 @@
 #include "Core/ScaleformFreeRing.h"
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
+#include "Core/Watchpoints.h"
 #include "Core/WeakLibEvents.h"
 #include "Config.h"
 #include "Hooks/HookTable.h"
@@ -338,6 +339,13 @@ namespace hs
 
 		void RecordScaleformAlloc(void* a_ptr, std::size_t a_size, void* a_site, std::uint32_t a_stack)
 		{
+			// Hardware watchpoints observe Scaleform allocations independently of the
+			// ledger (the value they need is the block's first qword, not our record).
+			// When the feature is off this is one relaxed load and a predictable
+			// branch; when it is on but not yet armed it is the same, so ordinary
+			// play is untouched until the report trigger fires.
+			Watchpoints::Get().OnScaleformAlloc(a_ptr, a_size, a_site);
+
 			if (!a_ptr || !Config::Get().ledgerEnabled) {
 				return;
 			}
@@ -577,6 +585,12 @@ namespace hs
 				return;
 			}
 
+			// Release any watchpoint on this block before the free proceeds. The
+			// slot stays in the arming snapshot until the next re-arm cycle, so a
+			// write-after-free inside that window is still caught (and reported as
+			// such).
+			Watchpoints::Get().OnScaleformFree(a_mem);
+
 			const auto site = _ReturnAddress();
 			const auto stack = Config::Get().scaleformCaptureStacks ? CaptureStackIndex(1) : 0;
 			const auto tick = NowTick();
@@ -612,6 +626,7 @@ namespace hs
 			auto*      result = o_SfRealloc(a_self, a_oldMem, a_newSize);
 			if (result) {
 				if (a_oldMem) {
+					Watchpoints::Get().OnScaleformFree(a_oldMem);
 					AllocationInfo old;
 					ShadowLedger::Get().Erase(reinterpret_cast<std::uintptr_t>(a_oldMem), old);
 				}

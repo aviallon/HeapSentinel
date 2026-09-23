@@ -55,7 +55,7 @@ SCHEMA = REPO_ROOT / "fomod" / "schema" / "ModConfig5.0.xsd"
 MODULECONFIG = REPO_ROOT / "fomod" / "ModuleConfig.xml"
 INFOXML = REPO_ROOT / "fomod" / "info.xml"
 
-REQUIRED_FILES = ("SKSE/Plugins/HeapSentinel.dll", "README.md", "RESEARCH.md", "DESIGN.md")
+REQUIRED_FILES = ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md")
 
 
 def load_generator():
@@ -109,7 +109,7 @@ def check_up_to_date(c: Checker, gen) -> None:
 
 def parser_keys() -> set[tuple[str, str]]:
     source = (REPO_ROOT / "src" / "Config.cpp").read_text(encoding="utf-8")
-    pairs = re.findall(r'Read(?:Bool|UInt)\("([^"]+)",\s*"([^"]+)"', source)
+    pairs = re.findall(r'Read(?:Bool|UInt|String)\("([^"]+)",\s*"([^"]+)"', source)
     return {(section, key) for section, key in pairs}
 
 
@@ -312,7 +312,7 @@ def check_xml(c: Checker, gen) -> None:
 # 4. package layout
 # ---------------------------------------------------------------------------
 
-def check_package(c: Checker, gen, dll: Path | None, stage: Path) -> None:
+def check_package(c: Checker, gen, dll: Path | None, pdb: Path | None, stage: Path) -> None:
     print("[4] package layout")
     if stage.exists():
         shutil.rmtree(stage)
@@ -332,6 +332,10 @@ def check_package(c: Checker, gen, dll: Path | None, stage: Path) -> None:
         dest = stage / "SKSE" / "Plugins" / "HeapSentinel.dll"
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(dll, dest)
+    if pdb is not None:
+        dest = stage / "SKSE" / "Plugins" / "HeapSentinel.pdb"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(pdb, dest)
 
     root = ET.parse(MODULECONFIG).getroot()
     sources: list[str] = []
@@ -347,6 +351,8 @@ def check_package(c: Checker, gen, dll: Path | None, stage: Path) -> None:
         if not (stage / source).is_file():
             if source == "SKSE/Plugins/HeapSentinel.dll" and dll is None:
                 c.skip(f"{source} not staged (no --dll given)")
+            elif source == "SKSE/Plugins/HeapSentinel.pdb" and pdb is None:
+                c.skip(f"{source} not staged (no --pdb given)")
             else:
                 c.fail(f"<file source={source!r}> does not exist in the package")
     if dll is not None:
@@ -354,6 +360,14 @@ def check_package(c: Checker, gen, dll: Path | None, stage: Path) -> None:
             c.fail("the DLL was not staged")
         else:
             c.ok("the DLL is staged at SKSE/Plugins/HeapSentinel.dll")
+    if pdb is not None:
+        staged = stage / "SKSE/Plugins/HeapSentinel.pdb"
+        if not staged.is_file():
+            c.fail("the PDB was not staged")
+        elif "MSF" not in staged.read_bytes()[:64].decode("latin-1", "ignore"):
+            c.fail("the staged PDB does not look like a Windows PDB (no MSF signature)")
+        else:
+            c.ok("the PDB is staged next to the DLL at SKSE/Plugins/HeapSentinel.pdb")
 
     # Every declared profile must be present as a file, and every staged profile
     # must be declared.
@@ -488,6 +502,7 @@ def build_zip(c: Checker, stage: Path, zip_path: Path) -> None:
         "fomod/ModuleConfig.xml",
         "fomod/info.xml",
         "SKSE/Plugins/HeapSentinel.dll",
+        "SKSE/Plugins/HeapSentinel.pdb",
     }
     for name in sorted(required):
         if name not in names:
@@ -503,6 +518,7 @@ def build_zip(c: Checker, stage: Path, zip_path: Path) -> None:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Validate HeapSentinel's FOMOD.")
     parser.add_argument("--dll", type=Path, default=None, help="built HeapSentinel.dll to stage")
+    parser.add_argument("--pdb", type=Path, default=None, help="built HeapSentinel.pdb to stage next to the DLL")
     parser.add_argument("--zip", type=Path, default=None, help="write the FOMOD archive here")
     parser.add_argument("--stage", type=Path, default=None, help="staging directory (default: temp)")
     args = parser.parse_args(argv)
@@ -516,7 +532,7 @@ def main(argv: list[str]) -> int:
 
     stage = args.stage or Path(tempfile.mkdtemp(prefix="hs-fomod-stage-"))
     try:
-        check_package(c, gen, args.dll, stage)
+        check_package(c, gen, args.dll, args.pdb, stage)
         check_conditional(c, gen)
         if args.zip is not None:
             build_zip(c, stage, args.zip)

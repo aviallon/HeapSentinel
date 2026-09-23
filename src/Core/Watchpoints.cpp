@@ -1,0 +1,563 @@
+#include "PCH.h"
+
+#include "Core/Watchpoints.h"
+
+#include "Config.h"
+#include "Core/Health.h"
+#include "Core/HwWatchpoint.h"
+#include "Core/ModuleMap.h"
+#include "Core/Report.h"
+#include "Core/ScaleformFreeRing.h"
+#include "Core/ShadowLedger.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+namespace hs
+{
+	namespace
+	{
+		constexpr std::uint32_t kExitEndedThread = 0xFFFFFFFFu;
+
+		// Fault-safe read of the watched qword. No C++ objects in this frame, so
+		// SEH is legal (the same rule as Veh.cpp's SafeReadQword).
+		[[nodiscard]] bool SafeReadQword(std::uintptr_t a_addr, std::uintptr_t& a_out) noexcept
+		{
+			__try {
+				a_out = *reinterpret_cast<const std::uintptr_t*>(a_addr);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				a_out = 0;
+				return false;
+			}
+		}
+
+		// Hex RVA list ("DF49F7", "0xDF49F7, 0x1234"). Kept simple and bounded:
+		// the caller's string is a startup-time input, not a hot path.
+		[[nodiscard]] std::size_t ParseHexList(const std::string& a_text, std::uint64_t* a_out, std::size_t a_capacity) noexcept
+		{
+			std::size_t count = 0;
+			const char* cursor = a_text.c_str();
+			while (*cursor != '\0' && count < a_capacity) {
+				while (*cursor == ',' || *cursor == ';' || *cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r') {
+					++cursor;
+				}
+				if (*cursor == '\0') {
+					break;
+				}
+				char* end = nullptr;
+				errno = 0;
+				const auto value = std::strtoull(cursor, &end, 16);
+				if (end == cursor || errno != 0) {
+					break;  // malformed: stop rather than guess
+				}
+				a_out[count++] = value;
+				cursor = end;
+			}
+			return count;
+		}
+	}
+
+	Watchpoints& Watchpoints::Get()
+	{
+		static Watchpoints watchpoints;
+		return watchpoints;
+	}
+
+	bool Watchpoints::ResolveAllocSiteFilter()
+	{
+		_filterCount = 0;
+		const auto& text = Config::Get().watchpointsAllocSiteRvas;
+		if (text.empty()) {
+			return true;
+		}
+
+		std::uint64_t rvas[kMaxAllocSiteFilters]{};
+		const auto    count = ParseHexList(text, rvas, kMaxAllocSiteFilters);
+
+		// The filters are RVAs relative to the game's main executable. The crash
+		// sites in the observed reports are "SkyrimSE.exe+0xDF49F7" and the
+		// GMemoryHeapPT free path, so the main module base is the right anchor.
+		const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
+		if (base == 0) {
+			logger::warn("watchpoints: cannot resolve the main module base; alloc-site filter ignored");
+			return false;
+		}
+		for (std::size_t i = 0; i < count; ++i) {
+			_filter[i] = base + static_cast<std::uintptr_t>(rvas[i]);
+			++_filterCount;
+		}
+		logger::info("watchpoints: {} alloc-site filter(s) resolved against main module 0x{:X}", _filterCount, base);
+		return _filterCount > 0;
+	}
+
+	bool Watchpoints::AllocSiteMatches(std::uintptr_t a_site) const noexcept
+	{
+		if (_filterCount == 0) {
+			return false;
+		}
+		for (std::size_t i = 0; i < _filterCount; ++i) {
+			if (_filter[i] == a_site) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Watchpoints::Init()
+	{
+		if (_initialized.load(std::memory_order_acquire)) {
+			return;
+		}
+
+		const auto& config = Config::Get();
+
+		_sweepMs = config.watchpointsSweepMs == 0 ? 250 : config.watchpointsSweepMs;
+		_rearmMs = config.watchpointsRearmMs == 0 ? 500 : config.watchpointsRearmMs;
+		_holdMs = config.watchpointsHoldMs;
+		_maxThreads = config.watchpointsMaxThreads == 0 ? kMaxTrackedThreads : config.watchpointsMaxThreads;
+		if (_maxThreads > kMaxTrackedThreads) {
+			_maxThreads = kMaxTrackedThreads;
+		}
+		_armAfterTrigger = config.watchpointsArmAfterTrigger;
+		_armAfterReports = config.watchpointsArmAfterReports == 0 ? 1 : config.watchpointsArmAfterReports;
+		_reportCapacity = config.watchpointsReportCapacity;
+
+		const bool haveFilter = ResolveAllocSiteFilter();
+
+		WatchpointMode mode = WatchpointMode::kSampleOnly;
+		if (haveFilter) {
+			mode = config.watchpointsAllocSiteOnly ? WatchpointMode::kFilterOnly : WatchpointMode::kFilterPreferred;
+		}
+		_plan.Configure(mode, config.watchpointsSamplePrime, config.watchpointsMaxPending);
+		WatchpointReports::Get().Init(_reportCapacity);
+
+		_reportEvents.store(0, std::memory_order_relaxed);
+		_generation.store(1, std::memory_order_relaxed);
+		_lastRearmTick.store(0, std::memory_order_relaxed);
+		_stop.store(false, std::memory_order_relaxed);
+		_dirty.store(false, std::memory_order_relaxed);
+		_armRequested.store(!_armAfterTrigger, std::memory_order_relaxed);
+		_active.store(false, std::memory_order_relaxed);
+		_trackedCount = 0;
+
+		_initialized.store(true, std::memory_order_release);
+
+		logger::info("watchpoints: enabled (mode={}, sample=1/{} prime, pending {}, reports {}, sweep {} ms, re-arm {} ms, hold {} ms, max threads {}, armAfterTrigger={} after {} report(s))",
+			mode == WatchpointMode::kFilterOnly ? "alloc-site-only" : (mode == WatchpointMode::kFilterPreferred ? "alloc-site-preferred" : "sample-only"),
+			config.watchpointsSamplePrime, config.watchpointsMaxPending, _reportCapacity, _sweepMs, _rearmMs, _holdMs,
+			_maxThreads, _armAfterTrigger, _armAfterReports);
+
+		_sweeper = std::thread(&Watchpoints::SweeperLoop, this);
+	}
+
+	void Watchpoints::OnScaleformAlloc(void* a_ptr, std::size_t a_size, void* a_site) noexcept
+	{
+		if (!_active.load(std::memory_order_relaxed)) {
+			return;
+		}
+		const auto address = reinterpret_cast<std::uintptr_t>(a_ptr);
+		if (!WatchableSize(a_size) || !WatchableAddress(address)) {
+			_unwatchable.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		_plan.Consider(address, AllocSiteMatches(reinterpret_cast<std::uintptr_t>(a_site)));
+	}
+
+	void Watchpoints::OnScaleformFree(void* a_ptr) noexcept
+	{
+		if (!_active.load(std::memory_order_relaxed)) {
+			return;
+		}
+		const auto address = reinterpret_cast<std::uintptr_t>(a_ptr);
+		if (address == 0) {
+			return;
+		}
+		if (WatchpointSlots::Get().Release(address, ::GetTickCount64())) {
+			BumpGeneration();
+			_dirty.store(true, std::memory_order_relaxed);
+		}
+	}
+
+	void Watchpoints::NotifyReportEvent() noexcept
+	{
+		if (!_initialized.load(std::memory_order_acquire)) {
+			return;
+		}
+		const auto events = _reportEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (_armAfterTrigger && events >= _armAfterReports) {
+			_armRequested.store(true, std::memory_order_release);
+		}
+	}
+
+	void Watchpoints::SweeperLoop() noexcept
+	{
+		while (!_stop.load(std::memory_order_acquire)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(_sweepMs));
+			if (_stop.load(std::memory_order_acquire)) {
+				break;
+			}
+			SweepOnce();
+		}
+	}
+
+	void Watchpoints::SweepOnce() noexcept
+	{
+		const auto now = ::GetTickCount64();
+
+		if (!_active.load(std::memory_order_acquire) && _armRequested.load(std::memory_order_acquire)) {
+			ArmRequested();
+		}
+		if (!_active.load(std::memory_order_acquire)) {
+			return;
+		}
+
+		PromoteCandidates(now);
+		RotateHeld(now);
+		SweepThreads(now, false);
+		DrainReports();
+	}
+
+	void Watchpoints::ArmRequested() noexcept
+	{
+		_active.store(true, std::memory_order_release);
+		logger::warn("watchpoints: ARMING - the report trigger fired ({} report event(s)); arming DR0-DR3 on every thread of the process. "
+					 "This is an opt-in diagnostic: brief thread suspensions at the {} ms re-arm cadence.",
+			_reportEvents.load(std::memory_order_relaxed), _rearmMs);
+		// Arm immediately, not on the next sweep: the object that just produced a
+		// report is the one worth watching.
+		SweepThreads(::GetTickCount64(), true);
+	}
+
+	void Watchpoints::PromoteCandidates(std::uint64_t a_now) noexcept
+	{
+		auto& slots = WatchpointSlots::Get();
+		for (int i = 0; i < static_cast<int>(kWatchpointSlotCount); ++i) {
+			if (slots.OccupiedCount() >= kWatchpointSlotCount) {
+				break;
+			}
+			std::uintptr_t candidate = 0;
+			if (!_plan.PopCandidate(candidate)) {
+				break;
+			}
+			std::uintptr_t valueAtArm = 0;
+			const bool     readable = SafeReadQword(candidate, valueAtArm);
+
+			std::size_t index = 0;
+			if (slots.Claim(candidate, readable ? valueAtArm : 0, 0, a_now, _generation.load(std::memory_order_relaxed),
+					::GetCurrentThreadId(), index)) {
+				BumpGeneration();
+				_dirty.store(true, std::memory_order_relaxed);
+				logger::info("watchpoints: slot {} armed for block 0x{:X} (first qword 0x{:X}, copied from a sampled Scaleform allocation)",
+					index, candidate, valueAtArm);
+			}
+		}
+	}
+
+	void Watchpoints::RotateHeld(std::uint64_t a_now) noexcept
+	{
+		if (_holdMs == 0) {
+			return;
+		}
+		if (WatchpointSlots::Get().RotateOldest(a_now, _holdMs)) {
+			BumpGeneration();
+			_dirty.store(true, std::memory_order_relaxed);
+		}
+	}
+
+	Watchpoints::ThreadEntry* Watchpoints::FindThread(std::uint32_t a_tid) noexcept
+	{
+		for (std::size_t i = 0; i < _trackedCount; ++i) {
+			if (_threads[i].tid == a_tid) {
+				return &_threads[i];
+			}
+		}
+		return nullptr;
+	}
+
+	void Watchpoints::SweepThreads(std::uint64_t a_now, bool a_force) noexcept
+	{
+		std::uint32_t tids[kMaxTrackedThreads]{};
+		std::size_t   total = 0;
+		const auto    copied = hw::EnumerateProcessThreads(tids, kMaxTrackedThreads, ::GetCurrentThreadId(), &total);
+		_lastCheckedThreads = total;
+
+		const auto generation = _generation.load(std::memory_order_relaxed);
+		const auto lastRearm = _lastRearmTick.load(std::memory_order_relaxed);
+		const bool throttleOpen = a_force || lastRearm == 0 || (a_now - lastRearm) >= _rearmMs;
+
+		// Read the current address set once. Snapshot excludes released/tripped
+		// slots, so BuildDr7 disables them.
+		WatchSlotSnapshot snap[kWatchpointSlotCount];
+		WatchpointSlots::Get().Snapshot(snap);
+		std::uintptr_t addresses[kWatchpointSlotCount]{};
+		for (std::size_t i = 0; i < kWatchpointSlotCount; ++i) {
+			addresses[i] = snap[i].valid ? snap[i].address : 0;
+		}
+
+		std::size_t armedNow = 0;
+		bool        rearmedAny = false;
+
+		for (std::size_t i = 0; i < copied; ++i) {
+			auto* entry = FindThread(tids[i]);
+			if (entry == nullptr) {
+				if (_trackedCount >= _maxThreads) {
+					_threadTableOverflow.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+				entry = &_threads[_trackedCount++];
+				entry->tid = tids[i];
+				entry->generation = 0;
+				entry->armedAt = 0;
+			}
+
+			const bool isNew = entry->generation == 0;
+			if (!isNew && entry->generation == generation) {
+				continue;  // already armed with the current set
+			}
+			if (!isNew && !throttleOpen) {
+				continue;  // defer the re-arm; this entry stays stale until the cadence opens
+			}
+
+			const auto thread = ::OpenThread(
+				THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, tids[i]);
+			if (!thread) {
+				// The thread ended. Free the table entry so a reused tid is armed
+				// afresh rather than assumed armed.
+				entry->tid = kExitEndedThread;
+				entry->generation = 0;
+				continue;
+			}
+			std::uint64_t dr7 = 0;
+			if (hw::ArmThread(thread, addresses, kWatchpointSlotCount, dr7)) {
+				entry->generation = generation;
+				entry->armedAt = a_now;
+				++armedNow;
+				if (!isNew) {
+					rearmedAny = true;
+				}
+			}
+			::CloseHandle(thread);
+		}
+
+		if (rearmedAny || a_force) {
+			_lastRearmTick.store(a_now, std::memory_order_relaxed);
+		}
+		_lastArmedThreads = armedNow;
+	}
+
+	void Watchpoints::DrainReports() noexcept
+	{
+		WatchpointReport reports[16];
+		const auto      count = WatchpointReports::Get().Drain(reports, 16);
+
+		for (std::size_t i = 0; i < count; ++i) {
+			const auto& report = reports[i];
+			_drained.fetch_add(1, std::memory_order_relaxed);
+
+			char encoded[512]{};
+			EncodeWatchpointReport(report, encoded, sizeof(encoded));
+
+			std::string detail = "HARDWARE WATCHPOINT: a write landed on the first 8 bytes of a watched block\n  ";
+			detail += encoded;
+			detail += "\n  watched block: ";
+			detail += ClassifyAddress(report.watchedAddress);
+
+			AllocationInfo info;
+			if (ShadowLedger::Get().Find(report.watchedAddress, info)) {
+				if (info.allocSite) {
+					detail += "\n  allocSite=";
+					detail += ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(info.allocSite));
+				}
+				detail += "\n  ledger: ";
+				detail += (info.flags & kFlagFreed) != 0 ? "freed" : "live";
+				if (info.size != 0) {
+					detail += " size=" + std::to_string(info.size);
+				}
+			}
+
+			ScaleformFreeRecord freeRecord;
+			if (ScaleformFreeRing::Get().Find(report.watchedAddress, freeRecord)) {
+				detail += "\n  Scaleform free record: freed at tick " + std::to_string(freeRecord.freeTick);
+				if (freeRecord.freeSite) {
+					detail += " by ";
+					detail += ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(freeRecord.freeSite));
+				}
+			}
+
+			detail += "\n  writer: ";
+			detail += ModuleMap::Get().Describe(report.writerRip);
+			detail += "\n  (x86 data breakpoints are TRAPS: the saved RIP is the instruction AFTER the store, so the "
+					  "writer is at or shortly before that address; the value shown is the qword read immediately after "
+					  "the write, and a racing writer could change it again)";
+
+			Report("watchpoint-write", detail);
+		}
+	}
+
+	long Watchpoints::HandleDebugException(void* a_exceptionPointers) noexcept
+	{
+		auto* info = static_cast<EXCEPTION_POINTERS*>(a_exceptionPointers);
+		if (!info || !info->ExceptionRecord || !info->ContextRecord) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		if (!_active.load(std::memory_order_acquire)) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		auto*      context = info->ContextRecord;
+		const auto dr6 = static_cast<std::uint64_t>(context->Dr6);
+		const auto dr7 = static_cast<std::uint64_t>(context->Dr7);
+
+		const std::uint64_t drAddress[kWatchpointSlotCount] = {
+			static_cast<std::uint64_t>(context->Dr0),
+			static_cast<std::uint64_t>(context->Dr1),
+			static_cast<std::uint64_t>(context->Dr2),
+			static_cast<std::uint64_t>(context->Dr3),
+		};
+
+		bool        handled = false;
+		std::uint64_t clearedDr7 = dr7;
+
+		for (std::size_t slot = 0; slot < kWatchpointSlotCount; ++slot) {
+			if ((dr6 & (1ull << slot)) == 0) {
+				continue;
+			}
+			// Only claim traps whose DRi is enabled and points at a slot we own.
+			if (!Dr7SlotEnabled(dr7, slot)) {
+				continue;
+			}
+
+			auto&       slots = WatchpointSlots::Get();
+			WatchSlotSnapshot snap;
+			const bool  known = slots.ReadSlot(slot, snap);
+			if (!known || snap.address != static_cast<std::uintptr_t>(drAddress[slot])) {
+				continue;  // not one of ours: do not touch a foreign breakpoint
+			}
+
+			const auto watched = snap.address;
+			std::uintptr_t valueAfter = 0;
+			const bool     readable = SafeReadQword(watched, valueAfter);
+
+			const auto tick = ::GetTickCount64();
+			WatchpointReport report;
+			report.tick = tick;
+			report.watchedAddress = watched;
+			report.valueAtArm = snap.valueAtArm;
+			report.valueAfterWrite = valueAfter;
+			report.writerRip = static_cast<std::uintptr_t>(context->Rip);
+			report.armedTick = snap.armedTick;
+			report.slotIndex = static_cast<std::uint32_t>(slot);
+			report.threadId = ::GetCurrentThreadId();
+			report.dr6 = static_cast<std::uint32_t>(dr6);
+			report.flags = (readable ? 0u : kWatchReportValueUnreadable) |
+				((snap.flags & kWatchSlotReleased) != 0 ? kWatchReportBlockReleased : 0u);
+			WatchpointReports::Get().Record(report);
+
+			// One report per armed watch: disable the slot in THIS thread's
+			// context and release it, so a hot loop cannot become a trap storm
+			// and the slot is available for a new candidate.
+			slots.MarkTripped(slot, tick);
+			slots.Release(watched, tick);
+			clearedDr7 = Dr7ClearSlot(clearedDr7, slot);
+			handled = true;
+		}
+
+		if (!handled) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		// The trap is a trap: the store has already completed. Resume at the next
+		// instruction and clear DR6 so the same breakpoint can fire again.
+		context->Dr7 = clearedDr7;
+		context->Dr6 = 0;
+		BumpGeneration();
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	void Watchpoints::Shutdown()
+	{
+		if (!_initialized.load(std::memory_order_acquire)) {
+			return;
+		}
+		_initialized.store(false, std::memory_order_release);
+		_active.store(false, std::memory_order_release);
+		_stop.store(true, std::memory_order_release);
+		if (_sweeper.joinable()) {
+			_sweeper.join();
+		}
+
+		// Disarm every thread we can open, then assert. The assertion is the
+		// point: "we think we cleared the DRs" is not a claim, and a stale
+		// watchpoint left armed would silently change what the game does.
+		constexpr std::size_t kMax = 4096;
+		static std::uint32_t  tids[kMax];
+		const auto            count = hw::EnumerateProcessThreads(tids, kMax, 0, nullptr);
+		std::size_t           disarmed = 0;
+		for (std::size_t i = 0; i < count; ++i) {
+			const auto thread = ::OpenThread(
+				THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, tids[i]);
+			if (!thread) {
+				continue;
+			}
+			if (hw::DisarmThread(thread)) {
+				++disarmed;
+			}
+			::CloseHandle(thread);
+		}
+		hw::DisarmCurrentThread();
+
+		std::size_t checked = 0;
+		std::size_t stillArmed = 0;
+		const bool  clear = hw::VerifyAllThreadsDisarmed(&checked, &stillArmed);
+		logger::info("watchpoints: shutdown - disarmed {} thread(s), verified {} thread(s), {} still armed", disarmed, checked, stillArmed);
+		if (!clear) {
+			// Not fatal (the process is going away), but never silent: an armed
+			// DR modifies the game's behaviour.
+			logger::error("watchpoints: ASSERTION FAILED - {} thread(s) still have DR7 set after shutdown", stillArmed);
+			Health::Degrade("watchpoints: debug registers were still armed after shutdown");
+		}
+
+		WatchpointSlots::Get().ClearAll(::GetTickCount64());
+		WatchpointReports::Get().Shutdown();
+		logger::info("watchpoints: final state: {} slot(s) occupied, {} claims, {} claim drops, {} releases, {} trips",
+			WatchpointSlots::Get().OccupiedCount(), WatchpointSlots::Get().Claims(), WatchpointSlots::Get().ClaimDrops(),
+			WatchpointSlots::Get().Releases(), WatchpointSlots::Get().Trips());
+	}
+
+	WatchpointStats Watchpoints::Stats() const noexcept
+	{
+		const auto& slots = WatchpointSlots::Get();
+		const auto& reports = WatchpointReports::Get();
+		const auto  plan = _plan.Stats();
+
+		WatchpointStats stats;
+		stats.initialized = _initialized.load(std::memory_order_relaxed);
+		stats.active = _active.load(std::memory_order_relaxed);
+		stats.armed = _lastArmedThreads > 0;
+		stats.occupied = slots.OccupiedCount();
+		stats.trackedThreads = _trackedCount;
+		stats.lastCheckedThreads = _lastCheckedThreads;
+		stats.lastArmedThreads = _lastArmedThreads;
+		stats.claims = slots.Claims();
+		stats.claimDrops = slots.ClaimDrops();
+		stats.releases = slots.Releases();
+		stats.rotations = slots.Rotations();
+		stats.trips = slots.Trips();
+		stats.reportsRecorded = reports.Recorded();
+		stats.reportsDropped = reports.Dropped();
+		stats.reportsDrained = _drained.load(std::memory_order_relaxed);
+		stats.considerCount = plan.considered;
+		stats.selectedCount = plan.selected;
+		stats.queueEvictions = plan.queueEvictions;
+		stats.unwatchable = _unwatchable.load(std::memory_order_relaxed);
+		stats.threadTableOverflow = _threadTableOverflow.load(std::memory_order_relaxed);
+		return stats;
+	}
+}
