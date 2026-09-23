@@ -453,6 +453,20 @@ def inner_main(args) -> int:
     staging = Path(resolve_target_staging(game, profile_dir))
     staging.mkdir(parents=True, exist_ok=True)
 
+    # Acquire the filegraph library lock BEFORE touching anything. The catalog
+    # is the step that must run before a deploy, and another Amethyst process
+    # (the GUI) holding the lock would refuse it - after we had already replaced
+    # the mod folder and edited modlist.txt. Failing here leaves the profile
+    # exactly as it was.
+    try:
+        library = FileGraphService.open_library(game, profile_dir, log_fn=log)
+    except Exception as exc:
+        die(
+            f"cannot open the filegraph catalog: {exc}\n"
+            "Close any other Amethyst window (the GUI holds the library lock "
+            "while it is open) and re-run. Nothing was changed."
+        )
+
     mod_name = args.mod_name or archive.stem
     dest_root = staging / mod_name
 
@@ -565,7 +579,6 @@ def inner_main(args) -> int:
 
         log("refreshing the filegraph catalog (this is the step that must not "
             "be skipped before deploy) ...")
-        library = FileGraphService.open_library(game, profile_dir, log_fn=log)
         status = library.refresh(profile_dir)
         log(f"filegraph refreshed: {status}")
     finally:
