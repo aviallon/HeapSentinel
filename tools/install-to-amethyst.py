@@ -149,6 +149,8 @@ def ini_section(path, section: str) -> dict:
     current = None
     for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
             continue
@@ -393,6 +395,8 @@ def patch_ini_value(path: Path, section: str, key: str, value: str) -> bool:
     current = None
     for i, raw in enumerate(lines):
         line = raw.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
             continue
