@@ -873,7 +873,8 @@ shipped in the same directory as the DLL, which is where CrashLogger looks:
 - CI uploads it as an artifact and attaches it to a tagged release, and asserts
   it exists, is non-empty and carries the Windows PDB (`MSF`) signature.
 
-**Cost:** a few MB on disk next to the DLL, and nothing resident. **What it
+**Cost:** 17,788,928 bytes (17.0 MiB) on disk for the 1.7.104 build, next to
+the DLL, and nothing resident. **What it
 buys:** `HeapSentinel.dll+0x39C1B` becomes a function name and a source line for
 everyone reading the log, and the `allocSite` / `freeSite` hints HeapSentinel
 prints are resolvable against the same file.

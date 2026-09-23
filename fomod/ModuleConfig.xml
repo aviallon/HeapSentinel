@@ -30,7 +30,7 @@ What it is NOT:
 
 Cost and privacy:
 - Memory: the profile you choose on the next page costs roughly 125-735 MiB of resident memory; the recommended Balanced profile is about 260 MiB. Each profile states its own number.
-- Symbols: HeapSentinel.pdb adds a few MB on disk next to the DLL (not resident memory). Losing it only costs legibility of HeapSentinel's own frames.
+- Symbols: HeapSentinel.pdb adds roughly 17 MB on disk next to the DLL (17,788,928 bytes in the 1.7.104 build; not resident memory). Losing it only costs legibility of HeapSentinel's own frames.
 - Per-allocation cost: every tracked allocation pays a small extra cost on the hot path (a bloom pre-filter, a sharded lock-free ledger insert, and, when stacks are on, a call-stack capture).
 - Nothing leaves the machine. Reports are written to the SKSE log next to the DLL; there is no network code.
 
