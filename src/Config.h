@@ -80,8 +80,16 @@ namespace hs
 		// [WeakLib] GFxResourceWeakLib context hooks (PinResource 82796,
 		// RemoveResourceOnRelease 82798, UnpinResource 82802, GFxResource::AddRef
 		// 82783). Low frequency (menu load/close), essentially free.
+		//
+		// The event ring is mask-indexed (`seq & (capacity - 1)`), so
+		// WeakLibEvents::Init rounds the capacity up to a power of two; a
+		// non-power-of-two value here is legal but silently rounded. 262144
+		// (2^18, 16x the original 16384) is ~10 MiB of slots and buys a much
+		// longer pin/remove history -- the 16384 ring reached capacity within
+		// minutes of ordinary menu traffic, so its history for a dead resource
+		// was incomplete exactly when it mattered.
 		bool        weakLibHooksEnabled = true;
-		std::size_t weakLibEventCapacity = 1u << 14;  // 16384 events
+		std::size_t weakLibEventCapacity = 1u << 18;  // 262144 events
 
 		// [Watchpoints] - x86-64 hardware data watchpoints (DR0-DR3).
 		//

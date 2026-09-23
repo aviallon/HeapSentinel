@@ -272,8 +272,13 @@ SECTIONS = [
             {
                 "name": "uEventCapacity",
                 "kind": "int",
-                "default": 16384,
-                "comment": [],
+                "default": 262144,
+                "comment": [
+                    "Slots in the WeakLib event ring. The ring is mask-indexed, so this",
+                    "is rounded up to a power of two; 262144 (2^18) is ~10 MiB. The old",
+                    "16384 ring saturated within minutes of menu traffic, leaving the",
+                    "pin/remove history of a dead resource incomplete.",
+                ],
             },
         ],
     },
