@@ -20,6 +20,16 @@ namespace hs
 			return ReadUInt(a_section, a_key, a_default ? 1u : 0u, a_ini) != 0;
 		}
 
+		// String values (the watchpoint alloc-site RVA list is a hex string, so it
+		// cannot go through GetPrivateProfileIntA). Bounded buffer; a longer value
+		// is truncated by the API, which is acceptable for a startup-time list.
+		[[nodiscard]] std::string ReadString(const char* a_section, const char* a_key, const std::string& a_default, const std::filesystem::path& a_ini)
+		{
+			char       buffer[512]{};
+			const auto length = ::GetPrivateProfileStringA(a_section, a_key, a_default.c_str(), buffer, sizeof(buffer), a_ini.string().c_str());
+			return std::string(buffer, length);
+		}
+
 		void ResolvePluginDir()
 		{
 			HMODULE self = nullptr;
@@ -90,6 +100,27 @@ namespace hs
 		weakLibHooksEnabled = ReadBool("WeakLib", "bEnabled", weakLibHooksEnabled, ini);
 		weakLibEventCapacity = ReadUInt("WeakLib", "uEventCapacity", static_cast<std::uint32_t>(weakLibEventCapacity), ini);
 
+		watchpointsEnabled = ReadBool("Watchpoints", "bEnabled", watchpointsEnabled, ini);
+		watchpointsArmAfterTrigger = ReadBool("Watchpoints", "bArmAfterTrigger", watchpointsArmAfterTrigger, ini);
+		watchpointsArmAfterReports = ReadUInt("Watchpoints", "uArmAfterReports", static_cast<std::uint32_t>(watchpointsArmAfterReports), ini);
+		watchpointsSweepMs = ReadUInt("Watchpoints", "uSweepMs", static_cast<std::uint32_t>(watchpointsSweepMs), ini);
+		watchpointsRearmMs = ReadUInt("Watchpoints", "uRearmMs", static_cast<std::uint32_t>(watchpointsRearmMs), ini);
+		watchpointsHoldMs = ReadUInt("Watchpoints", "uHoldMs", static_cast<std::uint32_t>(watchpointsHoldMs), ini);
+		watchpointsMaxThreads = ReadUInt("Watchpoints", "uMaxThreads", static_cast<std::uint32_t>(watchpointsMaxThreads), ini);
+		watchpointsSamplePrime = ReadUInt("Watchpoints", "uSamplePrime", watchpointsSamplePrime, ini);
+		watchpointsAllocSiteRvas = ReadString("Watchpoints", "sAllocSiteRvas", watchpointsAllocSiteRvas, ini);
+		watchpointsAllocSiteOnly = ReadBool("Watchpoints", "bAllocSiteOnly", watchpointsAllocSiteOnly, ini);
+		watchpointsMaxPending = ReadUInt("Watchpoints", "uMaxPending", static_cast<std::uint32_t>(watchpointsMaxPending), ini);
+		watchpointsReportCapacity = ReadUInt("Watchpoints", "uReportCapacity", static_cast<std::uint32_t>(watchpointsReportCapacity), ini);
+
+		// The modulus rule is not advisory: a power of two locks the sample to the
+		// page size and the size classes. Refuse it and say so.
+		if (!IsListedSamplePrime(watchpointsSamplePrime)) {
+			logger::warn("watchpoints: uSamplePrime={} is not a prime from the project ladder; using {} instead",
+				watchpointsSamplePrime, kDefaultSamplePrime);
+			watchpointsSamplePrime = kDefaultSamplePrime;
+		}
+
 		reportScreenshot = ReadBool("Reporting", "bScreenshot", reportScreenshot, ini);
 		reportFreeze = ReadBool("Reporting", "bFreeze", reportFreeze, ini);
 		vehEnabled = ReadBool("Reporting", "bVeh", vehEnabled, ini);
@@ -137,6 +168,7 @@ namespace hs
 			" scaleformHeap=" + std::to_string(scaleformHeapEnabled ? 1 : 0) +
 			" weaklib=" + std::to_string(weakLibHooksEnabled ? 1 : 0) +
 			" refCountGuard=" + std::to_string(refCountGuardEnabled ? 1 : 0) +
+			" watchpoints=" + std::to_string(watchpointsEnabled ? 1 : 0) +
 			" behaviourChanging=" + behaviourChanging;
 	}
 }

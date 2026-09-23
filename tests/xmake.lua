@@ -61,12 +61,23 @@ target("heapsentinel-tests")
     add_files("../src/Hooks/HookTable.cpp")
     add_files("../src/Hooks/HookVerifier.cpp")
     add_files("../src/Core/Health.cpp")
+    -- Hardware watchpoints: the selection policy, the four-slot DR table with its
+    -- bounded-claim/drop counter, and the preallocated trap report ring are plain
+    -- C++ with no Windows dependency, so they run off-game on Linux AND Windows.
+    -- The DR7 bit layout is header-only for the same reason.
+    add_files("../src/Core/WatchpointPlan.cpp")
+    add_files("../src/Core/WatchpointSlots.cpp")
+    add_files("../src/Core/WatchpointReports.cpp")
     add_includedirs("..", "../src", ".")
 
     if is_plat("linux") or is_plat("macosx") then
         add_syslinks("pthread")
     end
     if is_plat("windows") then
+        -- The one Windows-only piece: GetThreadContext/SetThreadContext. The
+        -- Windows test arms a real watchpoint, writes to the watched address
+        -- and asserts the trap fired with the writer's RIP.
+        add_files("../src/Core/HwWatchpoint.cpp")
         add_defines("WIN32_LEAN_AND_MEAN", "NOMINMAX")
     end
 target_end()

@@ -38,6 +38,16 @@ namespace hs
 		std::size_t   ringBloomKiB = 0;
 		std::uint64_t bloomSwaps = 0;
 
+		// Hardware watchpoints (opt-in). The counters come from the pure slot and
+		// report cores, so a disabled run reports zeros rather than nothing.
+		std::size_t   watchSlotsOccupied = 0;
+		std::uint64_t watchClaims = 0;
+		std::uint64_t watchClaimDrops = 0;
+		std::uint64_t watchReleases = 0;
+		std::uint64_t watchTrips = 0;
+		std::uint64_t watchReports = 0;
+		std::uint64_t watchReportDrops = 0;
+
 		std::string health;
 	};
 

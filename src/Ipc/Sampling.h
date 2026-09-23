@@ -59,6 +59,20 @@ namespace hs
 		return (Mix64(static_cast<std::uint64_t>(a_ptr)) % a_prime) == 0;
 	}
 
+	// True when `a_prime` is one of the primes the project has decided to allow.
+	// A watchpoint/sampling modulus must be prime: a power of two lands in
+	// lock-step with the page size, a common struct stride and the size classes,
+	// which turns a "sample" into a systematic slice of the address space.
+	[[nodiscard]] constexpr bool IsListedSamplePrime(std::uint32_t a_prime) noexcept
+	{
+		for (auto prime : kSamplePrimes) {
+			if (prime == a_prime) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Coarser step (fewer records kept). Returns the same value when already at
 	// the end of the ladder.
 	[[nodiscard]] constexpr std::uint32_t CoarserPrime(std::uint32_t a_prime) noexcept

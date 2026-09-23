@@ -563,6 +563,21 @@ uFreeRingCapacity=1048576  ; durable free records, evict-oldest
 bEnabled=1            ; PinResource / RemoveResourceOnRelease / Unpin / AddRef
 uEventCapacity=16384
 
+[Watchpoints]
+; Hardware DATA WATCHPOINTS (DR0-DR3): who WROTE the corruption. Opt-in, off.
+bEnabled=0
+bArmAfterTrigger=1        ; arm only after a report event, so normal play is untouched
+uArmAfterReports=1
+uSweepMs=250              ; sweeper cadence (candidate promotion, new-thread arming)
+uRearmMs=500             ; floor on the suspend+SetThreadContext re-arm period
+uHoldMs=30000           ; give up a block never freed, so 4 immortals cannot own the sample
+uMaxThreads=256
+uSamplePrime=61          ; prime only; a non-prime is refused
+uAllocSiteRvas=          ; hex RVAs vs SkyrimSE.exe, e.g. DF49F7 (the observed stray-write site)
+bAllocSiteOnly=0         ; 0 = preferred (sampled too), 1 = only matching sites
+uMaxPending=16           ; bounded selected-but-unarmed queue
+uReportCapacity=256      ; preallocated trap report slots (the VEH allocates nothing)
+
 [Reporting]
 bScreenshot=0
 bFreeze=0
@@ -641,6 +656,10 @@ a watchdog thread; fail open when the ledger or quarantine is unavailable.
 - **v0.6**: read the engine's own `HeapBlock::Used` stack-trace/checkpoint bits
   (RESEARCH §7.1) instead of maintaining a parallel stack table where possible;
   payload poison + write-after-free check on `ScrapHeap` blocks.
+- **v0.6**: hardware data watchpoints (DESIGN §13) - the writer's RIP for a
+  corrupted block, not merely the fact of corruption - and a shipped
+  `HeapSentinel.pdb` next to the DLL so Crash Logger resolves our own frames
+  (DESIGN §14).
 - **v0.7**: a "bisect" mode that narrows sampling to one size range or one
   allocation site, for reproducing a specific bug.
 
@@ -695,3 +714,166 @@ to hook. The committed table itself was verified against the real
 `SkyrimSE.exe` bytes off-game with the real verifier (14/14 targets), but the
 plugin's own load-time path has only been compiled and string-checked. In-game
 behaviour is unobserved.
+
+The hardware-watchpoint cores are held to the same bar and then some. The
+selection policy, the four-slot DR table (its bounded claim and drop counter),
+the preallocated trap report ring and the DR7/DR6 encoding are plain C++ and run
+in `tests/` on Linux AND Windows. The one Windows-only claim - that arming DR0
+actually traps a write and reports the writer - is a test that arms a real
+watchpoint, writes to the watched address, and asserts the trap fired with the
+writer's RIP; it is deliberately able to fail (break the DR7 write and the trap
+never arrives). See §13.
+
+## 13. Hardware data watchpoints (who wrote it)
+
+**Why.** Two real crashes showed the same shape: a 32-bit write landing in the
+low half of an 8-byte pointer field. In the QuickLootRE crash a LIVE 72-byte
+Scaleform object's vtable went `0x6FFFFB89DDB8` to `0x6FFFFB89DDB4` (high half
+unchanged, low half decremented by 4). A later crash had a freed Scaleform block
+whose first qword was already garbage at free time, split exactly like the
+residue of a 32-bit write of `3` into the low half. HeapSentinel's ledger can
+say the object WAS corrupted; it cannot say who wrote. x86-64 debug registers
+can, at the moment of the write.
+
+### 13.1 What is armed and what a trap reports
+
+`Core/HwWatchpoint` arms DR0-DR3 with a **write** watchpoint (`RW=01b`, `LEN=10b`,
+i.e. 8 bytes) on the first 8 bytes of a block - the object's vtable pointer. A
+read watch would trap on every ordinary dispatch through that vtable and drown
+the signal. Only 8-byte-aligned blocks at least 8 bytes long are watchable.
+
+On the `#DB` (`EXCEPTION_SINGLE_STEP`) trap the VEH reports, at minimum:
+
+- the writer's RIP as `module+0xRVA`;
+- the watched address, the first qword at arming time and the first qword read
+  immediately after the write;
+- which DR slot fired and the raw DR6.
+
+`Core/WatchpointEncoding.h` owns the bit layout and is header-only, so the
+arithmetic is checked on both toolchains even where `SetThreadContext` does not
+exist.
+
+**One caveat, stated plainly.** On x86 a data breakpoint is a *trap*: it is
+delivered **after** the store completes, so the saved RIP is the instruction
+after the writer. The report keeps that raw RIP and says so; it is the writer's
+function, and it is one instruction off the store. Reading the value after the
+trap is the same kind of approximation - a racing writer could change it again.
+The report labels the unreadable case rather than showing a zero.
+
+### 13.2 The four-slot, per-thread problem (the arming strategy)
+
+Hardware limits, not design taste:
+
+- **Four slots per thread.** 4 M live blocks exist; four can be watched.
+- **Per-thread.** A DR set on the main thread does not see a write by a worker.
+- **A context write is real work**: `SuspendThread` + `SetThreadContext` on every
+  thread. Doing that per allocation is impossible.
+
+So the strategy is a **moving sample**, in four bounded stages:
+
+1. **Selection (hot path, no OS calls).** `Core/WatchpointPlan` judges each
+   Scaleform allocation. Two modes, both selectable:
+   - *alloc-site filter*: hex RVAs relative to `SkyrimSE.exe`
+     (`sAllocSiteRvas`, e.g. the observed allocation site `0xDF49F7`).
+     `bAllocSiteOnly=1` considers only matching sites; `=0` lets a match bypass
+     the sample while every other block is still sampled.
+   - *rotating sample*: `Mix64(ptr) % prime == 0`, with `prime` a PRIME from the
+     project ladder (default 61). Mix first because heap pointers are 16-byte
+     aligned, so a raw `ptr % prime` would reach only a slice of the buckets.
+
+   A selected pointer goes into a bounded pending queue (default 16,
+   overwrite-oldest); every loss is counted. The hook does **no** allocation, no
+   lock, no OS call: a few atomics and one relaxed `_active` load when disabled.
+2. **Promotion (sweeper).** The sweeper claims a free DR slot from
+   `Core/WatchpointSlots` (the lock-free four-entry seqlock table: 16
+   pause-separated CAS attempts, then drop and count - no spinlock) and reads
+   the block's first qword for the before-value.
+3. **Arming (sweeper, throttled).** The sweeper enumerates the process's threads
+   and writes the current DR set into each thread's context. Newly created
+   threads are picked up on the next sweep (bounded by `uSweepMs`, default
+   250 ms); a changed watched set is re-applied to already-armed threads at most
+   once per `uRearmMs` (default 500 ms) because suspending threads is the
+   expensive part. Threads whose `OpenThread` fails are dropped from the table,
+   so a reused tid is armed afresh rather than assumed armed.
+4. **Release / rotation.** A watched block that is freed releases its slot on
+   the free hook (atomically, again no OS call) and the slot is reused. A block
+   that is never freed is given up after `uHoldMs` (default 30 s), so four
+   immortal allocations cannot own the sample forever. Because a released slot's
+   watch is only removed at the next re-arm, a write-after-free inside that
+   window is still caught and labelled as one.
+
+### 13.3 Trigger: a diagnostic must not alter what it observes
+
+The feature is `bEnabled=0` by default. Even enabled, it does not arm at load:
+`bArmAfterTrigger=1` makes it wait for `uArmAfterReports` report events (default
+one), so ordinary play with a healthy install pays only one relaxed atomic load
+per Scaleform allocation. `Core/Report` increments the trigger; the watchdog
+thread does the arming.
+
+Once armed, the perturbation is real and bounded: repeated `SuspendThread`/
+`SetThreadContext` at the `uRearmMs` cadence, plus one extra `#DB` on the write
+that is caught (which the VEH handles and immediately resumes). It does not
+change allocator semantics, memory contents or control flow.
+
+### 13.4 The trap path: no allocation, no locks, no strings
+
+The VEH runs on the faulting thread in a process that may already be corrupt.
+The trap path therefore does exactly one thing: it copies a POD
+(`Core/WatchpointReports`, a preallocated seqlock ring, default 256 slots) and
+then disables that slot in the faulting context and releases it. It never takes
+a lock, never allocates, never builds a `std::string` and never calls spdlog. A
+watchdog thread drains the ring, symbolises the RIP, looks up the ledger and the
+Scaleform free ring, and only then calls `Report`. Overwritten, undrained traps
+are counted (`Dropped`), not lost silently. Only `EXCEPTION_SINGLE_STEP` traps
+whose DR6 bits name one of OUR enabled slots are claimed; anything else
+continues search, so a genuine trap-flag single step or a foreign breakpoint is
+never swallowed.
+
+### 13.5 Shutdown and the final-state assertion
+
+`Shutdown` stops the sweeper, disarms every thread it can open, disarms the
+calling thread, and then **asserts** the final state with
+`VerifyAllThreadsDisarmed`: it reads DR7 on every thread and reports how many
+were checked and how many were still armed, degrading health if any were. "We
+think we cleared them" is not a claim. SKSE has no plugin-unload callback, so
+the clean path is registered with `atexit` as a best effort; a hard process exit
+clears the per-thread debug registers by definition, and a separate stale-DR
+risk within a session is handled by the trap-time disable, the release on free
+and the hold rotation.
+
+### 13.6 Coverage, honestly
+
+**Partial by construction.** Four addresses at a time, applied per thread. The
+sample is 1-in-`uSamplePrime` of the blocks that reach the Scaleform alloc
+hooks, plus every block from a filtered allocation site. A block allocated
+before the feature armed, allocated through an unhooked path, or simply not in
+the sample is invisible to the watchpoints (the ledger may still attribute its
+corruption after the fact). The health line reports slot occupancy, claims,
+claim drops, trips, rotations and report drops so a lossy run is legible. This
+is a detector for a sampled subset, not a shadow heap, and it is not presented
+as one. **It has never been run in the game**: nobody has launched Skyrim with
+this build, so in-game behaviour is unobserved; what is proven is the Linux
+suite (plan/slots/reports/encoding) and the Windows test that arms a real
+watchpoint and catches a real write.
+
+## 14. Publishing symbols (making our own frames legible)
+
+Our frames appeared in crash logs as `HeapSentinel.dll+0x39C1B` and **nobody
+could resolve them** - not CrashLogger, not us. QuickLootRE ships a `.pdb` next
+to its DLL and CrashLogger resolved its entire call path *with source lines*. A
+sentinel whose own frames are opaque is a sentinel that hides its own bugs.
+
+So the build produces `HeapSentinel.pdb` (MSVC `/Zi` + a forced `/DEBUG:FULL`,
+so the PDB is the full private-symbol one, not a stripped stub) and it is
+shipped in the same directory as the DLL, which is where CrashLogger looks:
+
+- the flat release archive puts both at `SKSE/Plugins/HeapSentinel.{dll,pdb}`;
+- the FOMOD lists the PDB as a `requiredInstallFiles` entry, so the wizard
+  installs it to `SKSE/Plugins/HeapSentinel.pdb`;
+- CI uploads it as an artifact and attaches it to a tagged release, and asserts
+  it exists, is non-empty and carries the Windows PDB (`MSF`) signature.
+
+**Cost:** a few MB on disk next to the DLL, and nothing resident. **What it
+buys:** `HeapSentinel.dll+0x39C1B` becomes a function name and a source line for
+everyone reading the log, and the `allocSite` / `freeSite` hints HeapSentinel
+prints are resolvable against the same file.

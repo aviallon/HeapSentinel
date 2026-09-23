@@ -240,10 +240,17 @@ HS_TEST(stats_format_includes_every_counter)
 	snapshot.ledgerBloomKiB = 16;
 	snapshot.ringBloomKiB = 17;
 	snapshot.bloomSwaps = 18;
+	snapshot.watchSlotsOccupied = 1;
+	snapshot.watchClaims = 19;
+	snapshot.watchClaimDrops = 20;
+	snapshot.watchReleases = 21;
+	snapshot.watchTrips = 22;
+	snapshot.watchReports = 23;
+	snapshot.watchReportDrops = 24;
 	snapshot.health = "GREEN";
 
 	const auto lines = FormatStats(snapshot);
-	HS_CHECK_EQ(lines.size(), std::size_t{ 6 });
+	HS_CHECK_EQ(lines.size(), std::size_t{ 7 });
 
 	std::string joined;
 	for (const auto& line : lines) {
@@ -258,6 +265,10 @@ HS_TEST(stats_format_includes_every_counter)
 	HS_CHECK(joined.find("retention 8 s") != std::string::npos);
 	HS_CHECK(joined.find("9/10 blocks") != std::string::npos);
 	HS_CHECK(joined.find("14") != std::string::npos);
+	HS_CHECK(joined.find("1/4 slot(s)") != std::string::npos);
+	HS_CHECK(joined.find("19 claims") != std::string::npos);
+	HS_CHECK(joined.find("20 claim drops") != std::string::npos);
+	HS_CHECK(joined.find("22 trips") != std::string::npos);
 	HS_CHECK(joined.find("health GREEN") != std::string::npos);
 }
 

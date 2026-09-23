@@ -5,6 +5,8 @@
 #	include "Core/PoisonQuarantine.h"
 #	include "Core/ScaleformFreeRing.h"
 #	include "Core/ShadowLedger.h"
+#	include "Core/WatchpointReports.h"
+#	include "Core/WatchpointSlots.h"
 #	include "Core/WeakLibEvents.h"
 
 #	include <atomic>
@@ -17,6 +19,8 @@
 #	include "Core/PoisonQuarantine.h"
 #	include "Core/ScaleformFreeRing.h"
 #	include "Core/ShadowLedger.h"
+#	include "Core/WatchpointReports.h"
+#	include "Core/WatchpointSlots.h"
 #	include "Core/WeakLibEvents.h"
 #endif
 
@@ -73,6 +77,17 @@ namespace hs
 			lines.emplace_back(buffer);
 		}
 
+		{
+			char buffer[320]{};
+			std::snprintf(buffer, sizeof(buffer),
+				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s)",
+				a_s.watchSlotsOccupied, kWatchpointSlotCount, static_cast<unsigned long long>(a_s.watchClaims),
+				static_cast<unsigned long long>(a_s.watchClaimDrops), static_cast<unsigned long long>(a_s.watchReleases),
+				static_cast<unsigned long long>(a_s.watchTrips), static_cast<unsigned long long>(a_s.watchReports),
+				static_cast<unsigned long long>(a_s.watchReportDrops));
+			lines.emplace_back(buffer);
+		}
+
 		lines.push_back("stats: health " + a_s.health);
 		return lines;
 	}
@@ -108,6 +123,14 @@ namespace hs
 
 		snapshot.weaklibCount = WeakLibEvents::Get().Count();
 		snapshot.weaklibCapacity = WeakLibEvents::Get().Capacity();
+
+		snapshot.watchSlotsOccupied = WatchpointSlots::Get().OccupiedCount();
+		snapshot.watchClaims = WatchpointSlots::Get().Claims();
+		snapshot.watchClaimDrops = WatchpointSlots::Get().ClaimDrops();
+		snapshot.watchReleases = WatchpointSlots::Get().Releases();
+		snapshot.watchTrips = WatchpointSlots::Get().Trips();
+		snapshot.watchReports = WatchpointReports::Get().Recorded();
+		snapshot.watchReportDrops = WatchpointReports::Get().Dropped();
 
 		snapshot.health = Health::Line();
 		return snapshot;

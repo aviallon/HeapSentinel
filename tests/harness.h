@@ -59,6 +59,16 @@ namespace hstest
 		return std::to_string(a_value);
 	}
 
+	// An enum class has no implicit conversion to its underlying type, so a
+	// failed HS_CHECK_EQ on one would not compile without this overload. Printing
+	// the numeric value is enough for a test diagnosis.
+	template <class T>
+		requires(std::is_enum_v<T>)
+	inline std::string ToString(T a_value)
+	{
+		return std::to_string(static_cast<std::underlying_type_t<T>>(a_value));
+	}
+
 	inline std::string ToString(const std::string& a_value)
 	{
 		return a_value;

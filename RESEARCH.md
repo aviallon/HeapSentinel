@@ -312,6 +312,13 @@ is simply not on x86.
 page protection (`VirtualAlloc`/`VirtualProtect`) plus software bookkeeping.
 Hardware watchpoints are a supplement for ≤4 pre-identified addresses.
 
+v0.6 implements that supplement (DESIGN §13). It is precisely because the four
+slots are per-thread and cannot cover a heap that the implementation is a
+*sampled* detector with an explicit arming strategy, an alloc-site filter, a
+bounded pending queue and a hold timeout - not a shadow heap. What it adds over
+page protection is the one thing page protection cannot give: the identity of
+the **writer**, at the moment of the write.
+
 ---
 
 ## 7. Pointer-integrity and lifetime mitigations (the "auto-fix" family)

@@ -11,9 +11,12 @@
 #include "Core/ShadowLedger.h"
 #include "Core/StackCapture.h"
 #include "Core/Stats.h"
+#include "Core/Watchpoints.h"
 #include "Core/WeakLibEvents.h"
 #include "Hooks/Hooks.h"
 #include "Veh.h"
+
+#include <cstdlib>
 
 namespace
 {
@@ -125,6 +128,18 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	}
 
 	hs::InstallHooks();
+
+	// Hardware data watchpoints (opt-in, default OFF). Init only allocates the
+	// bounded queues and starts the sweeper; it does NOT arm unless
+	// [Watchpoints] bArmAfterTrigger=0, because the trigger is the first report.
+	// Registered with atexit as the best-effort clean shutdown: SKSE has no unload
+	// callback, and a process exit clears the per-thread debug registers by
+	// definition, but an explicit Shutdown disarms every thread and ASSERTS DR7
+	// is zero rather than assuming it.
+	if (config.watchpointsEnabled) {
+		hs::Watchpoints::Get().Init();
+		std::atexit([] { hs::Watchpoints::Get().Shutdown(); });
+	}
 
 	// Periodic stats so a soak test is observable: if the ledger stays bounded
 	// (and keeps changing) the hooks are live and the bounded-probe eviction is
