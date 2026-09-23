@@ -146,11 +146,10 @@ namespace hs
 		if (a_tableValid && a_tableAddress == a_drAddress) {
 			return a_tableReleased ? WatchpointTrapOwner::kTableReleased : WatchpointTrapOwner::kTableCurrent;
 		}
+		// MUTATION (do not merge): the 0.6.1 behaviour - a stale arm is treated as
+		// foreign and handed to the crash handler.
 		if (a_everArmedThisSlot) {
-			if (a_threadArmValid && a_threadArmAddress == a_drAddress) {
-				return WatchpointTrapOwner::kStaleThreadArm;
-			}
-			return WatchpointTrapOwner::kStaleBareArm;
+			return WatchpointTrapOwner::kForeign;
 		}
 		return WatchpointTrapOwner::kForeign;
 	}
