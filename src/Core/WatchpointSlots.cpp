@@ -61,7 +61,7 @@ namespace hs
 		a_slot.version.store(a_claimedVersion + 2, std::memory_order_release);
 	}
 
-	bool WatchpointSlots::Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, std::uintptr_t a_allocSite,
+	bool WatchpointSlots::Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, bool a_armedWasCode, std::uintptr_t a_allocSite,
 		std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex) noexcept
 	{
 		if (a_address == 0) {
@@ -91,6 +91,7 @@ namespace hs
 
 				slot.address = a_address;
 				slot.valueAtArm = a_valueAtArm;
+				slot.armedWasCode = a_armedWasCode;
 				slot.allocSite = a_allocSite;
 				slot.armedTick = a_tick;
 				slot.generation = a_generation;
@@ -212,6 +213,7 @@ namespace hs
 			copy.generation = slot.generation;
 			copy.flags = slot.flags;
 			copy.threadId = slot.threadId;
+			copy.armedWasCode = slot.armedWasCode;
 			copy.valid = true;
 			std::atomic_signal_fence(std::memory_order_seq_cst);
 			const auto v2 = slot.version.load(std::memory_order_acquire);
@@ -247,6 +249,7 @@ namespace hs
 		copy.generation = slot.generation;
 		copy.flags = slot.flags;
 		copy.threadId = slot.threadId;
+		copy.armedWasCode = slot.armedWasCode;
 		copy.valid = true;
 		std::atomic_signal_fence(std::memory_order_seq_cst);
 		const auto v2 = slot.version.load(std::memory_order_acquire);
@@ -281,6 +284,7 @@ namespace hs
 			}
 			slot.address = 0;
 			slot.valueAtArm = 0;
+			slot.armedWasCode = false;
 			slot.allocSite = 0;
 			slot.flags = kWatchSlotReleased;
 			slot.armedTick = a_tick;
@@ -310,6 +314,7 @@ namespace hs
 			slot.version.store(0, std::memory_order_relaxed);
 			slot.address = 0;
 			slot.valueAtArm = 0;
+			slot.armedWasCode = false;
 			slot.allocSite = 0;
 			slot.armedTick = 0;
 			slot.generation = 0;

@@ -97,4 +97,101 @@ namespace hs
 	{
 		return a_size >= kWatchpointLength;
 	}
+
+	// -----------------------------------------------------------------------
+	// Trap ownership and write classification (0.6.2).
+	//
+	// Two pure decisions that used to live inside the VEH and the drainer, and
+	// whose bugs killed a session. They are kept here -- dependency-free and
+	// constexpr -- so the off-game suite checks them on EVERY toolchain, and the
+	// Windows test drives them with a real hardware #DB.
+	// -----------------------------------------------------------------------
+
+	// Who a #DB belongs to. The narrow rule the 0.6.1 crash demanded: a DR slot
+	// WE EVER ARMED on this thread is ours even when the table has moved on or
+	// the entry is gone. Only a #DB on a slot we never touched is foreign, and
+	// only that returns CONTINUE_SEARCH.
+	enum class WatchpointTrapOwner : std::uint8_t
+	{
+		kForeign,         // not ours: hand it to the next handler (CONTINUE_SEARCH)
+		kTableCurrent,    // ours; the live table slot still holds this address
+		kTableReleased,   // ours; the table slot holds this address but it was released
+		kStaleThreadArm,  // ours; the table moved on, this thread's DR is a leftover arm
+		kStaleBareArm,    // ours; we armed this slot here, but have no address record left
+	};
+
+	[[nodiscard]] constexpr bool WatchpointOwnerIsOurs(WatchpointTrapOwner a_owner) noexcept
+	{
+		return a_owner != WatchpointTrapOwner::kForeign;
+	}
+
+	[[nodiscard]] constexpr bool WatchpointOwnerIsStale(WatchpointTrapOwner a_owner) noexcept
+	{
+		return a_owner == WatchpointTrapOwner::kStaleThreadArm || a_owner == WatchpointTrapOwner::kStaleBareArm;
+	}
+
+	// Decide who owns a trapped slot from the raw debug-register state plus the
+	// two records we keep. Ordering matters: the live table is consulted first
+	// (it is authoritative while the arm is current), then the per-thread arm
+	// record (the safety net for a retired/re-armed address). A slot that is not
+	// enabled in DR7 -- or whose DRi is zero -- is never a data watchpoint.
+	[[nodiscard]] constexpr WatchpointTrapOwner ClassifyTrapOwner(
+		bool a_dr7SlotEnabled, std::uintptr_t a_drAddress,
+		bool a_everArmedThisSlot, bool a_threadArmValid, std::uintptr_t a_threadArmAddress,
+		bool a_tableValid, std::uintptr_t a_tableAddress, bool a_tableReleased) noexcept
+	{
+		if (!a_dr7SlotEnabled || a_drAddress == 0) {
+			return WatchpointTrapOwner::kForeign;
+		}
+		if (a_tableValid && a_tableAddress == a_drAddress) {
+			return a_tableReleased ? WatchpointTrapOwner::kTableReleased : WatchpointTrapOwner::kTableCurrent;
+		}
+		if (a_everArmedThisSlot) {
+			if (a_threadArmValid && a_threadArmAddress == a_drAddress) {
+				return WatchpointTrapOwner::kStaleThreadArm;
+			}
+			return WatchpointTrapOwner::kStaleBareArm;
+		}
+		return WatchpointTrapOwner::kForeign;
+	}
+
+	// Is a write to a watched qword a real DEGRADATION (a code pointer turned
+	// into something that is not code) or benign construction/rewriting?
+	//
+	// A hardware data breakpoint fires on ANY write, including the allocator's
+	// or CRT's initialisation of a freshly allocated block -- the observed trip
+	// was VCRUNTIME140 writing 0 into an already-zero qword. Reporting that is
+	// noise, and releasing the slot on it loses the watch exactly when the
+	// object is being constructed and about to receive its vtable. So the rule
+	// is deliberately narrow:
+	//
+	//   * unreadable after the write               -> benign (never claim bytes we cannot read)
+	//   * unchanged since arming                   -> benign (before == after by construction)
+	//   * the armed value was not a code pointer    -> benign (nothing to clobber)
+	//   * code -> different code                    -> benign (a legitimate vtable swap)
+	//   * code -> non-code                          -> DEGRADATION (a clobbered vtable)
+	enum class WatchpointWriteKind : std::uint8_t
+	{
+		kBenign,
+		kDegradation,
+	};
+
+	[[nodiscard]] constexpr WatchpointWriteKind ClassifyWatchedWrite(
+		std::uintptr_t a_valueAtArm, bool a_armedWasCode,
+		std::uintptr_t a_valueAfter, bool a_afterReadable, bool a_afterIsCode) noexcept
+	{
+		if (!a_afterReadable) {
+			return WatchpointWriteKind::kBenign;
+		}
+		if (a_valueAfter == a_valueAtArm) {
+			return WatchpointWriteKind::kBenign;
+		}
+		if (!a_armedWasCode) {
+			return WatchpointWriteKind::kBenign;
+		}
+		if (!a_afterIsCode) {
+			return WatchpointWriteKind::kDegradation;
+		}
+		return WatchpointWriteKind::kBenign;
+	}
 }

@@ -745,9 +745,12 @@ the signal. Only 8-byte-aligned blocks at least 8 bytes long are watchable.
 On the `#DB` (`EXCEPTION_SINGLE_STEP`) trap the VEH reports, at minimum:
 
 - the writer's RIP as `module+0xRVA`;
-- the watched address, the first qword at arming time and the first qword read
-  immediately after the write;
-- which DR slot fired and the raw DR6.
+- the watched address (the address that actually trapped), the first qword at
+  arming time and the first qword read immediately after the write;
+- which DR slot fired and the raw DR6;
+- whether the arm was **stale** (the table had moved on) and, when it was, the
+  address the live table slot holds now - so `watched=` is never contradicted by
+  the table (0.6.2; see 13.4).
 
 `Core/WatchpointEncoding.h` owns the bit layout and is header-only, so the
 arithmetic is checked on both toolchains even where `SetThreadContext` does not
@@ -798,9 +801,15 @@ So the strategy is a **moving sample**, in four bounded stages:
 4. **Release / rotation.** A watched block that is freed releases its slot on
    the free hook (atomically, again no OS call) and the slot is reused. A block
    that is never freed is given up after `uHoldMs` (default 30 s), so four
-   immortal allocations cannot own the sample forever. Because a released slot's
-   watch is only removed at the next re-arm, a write-after-free inside that
-   window is still caught and labelled as one.
+   immortal allocations cannot own the sample forever. Releasing a slot is a
+   *logical* release: it bumps the generation and sets a force flag, and the
+   next sweep re-arms **every** thread with the new set, clearing the released
+   slot on threads that had not yet seen the change (FIX 2). That forced sweep
+   is bounded to once per sweep period; there is no spin and no lock. Because a
+   released slot's watch can still be physically present on a thread the sweep
+   has not reached, a trap from that address inside the grace window is still
+   recognised as ours (FIX 1) rather than treated as foreign. A
+   write-after-free inside that window is still caught and labelled as one.
 
 ### 13.3 Trigger: a diagnostic must not alter what it observes
 
@@ -820,14 +829,60 @@ change allocator semantics, memory contents or control flow.
 The VEH runs on the faulting thread in a process that may already be corrupt.
 The trap path therefore does exactly one thing: it copies a POD
 (`Core/WatchpointReports`, a preallocated seqlock ring, default 256 slots) and
-then disables that slot in the faulting context and releases it. It never takes
-a lock, never allocates, never builds a `std::string` and never calls spdlog. A
+then clears the firing slot in the faulting context. It never takes a lock,
+never allocates, never builds a `std::string` and never calls spdlog. A
 watchdog thread drains the ring, symbolises the RIP, looks up the ledger and the
-Scaleform free ring, and only then calls `Report`. Overwritten, undrained traps
-are counted (`Dropped`), not lost silently. Only `EXCEPTION_SINGLE_STEP` traps
-whose DR6 bits name one of OUR enabled slots are claimed; anything else
-continues search, so a genuine trap-flag single step or a foreign breakpoint is
-never swallowed.
+Scaleform free ring, applies the final benign-vs-degradation call (which needs
+the locking module map) and only then calls `Report`. Overwritten, undrained
+traps are counted (`Dropped`), not lost silently.
+
+**Which `#DB`s are ours (0.6.2).** `EXCEPTION_SINGLE_STEP` is also what a
+debugger's single-step, a trap flag and a *stale* hardware watch all raise, so
+"ours" has to be decided precisely, and the rule must be narrow enough that our
+own traps can never fall through to `CONTINUE_SEARCH`:
+
+* **ours, current** - DR6 names slot *i*, DR7 enables it, and the live table
+  slot *i* holds the same address. This is an ordinary arm; `kTableCurrent`, or
+  `kTableReleased` when the free hook has already released the block (a
+  write-after-free).
+* **ours, stale** - DR6 names slot *i*, DR7 enables it, the table has moved on
+  (released or re-armed for another block), but this thread was *ever* armed
+  with slot *i*. This is `kStaleThreadArm` when the per-thread record still
+  holds the address that trapped, and `kStaleBareArm` when the record is gone.
+* **foreign** - DR6 names no enabled slot, or DRi is zero, or the thread was
+  never armed with that slot and the table does not hold the address. Only these
+  return `EXCEPTION_CONTINUE_SEARCH`, so a genuine single step or a foreign
+  breakpoint is never swallowed.
+
+The stale case is why 0.6.1 died. Debug registers are per-thread and re-arming
+reaches threads at the sweep cadence, so a thread can still hold an address the
+table retired seconds earlier. The 0.6.1 handler matched only the table, saw no
+match for the stale DR, returned `CONTINUE_SEARCH`, and let the game die of our
+own watchpoint. 0.6.2 keeps a per-thread record of the last arm in each DR slot
+and consumes any trap on a slot that record says we armed, reporting it (with
+the address that actually trapped) as a stale arm. The rule is written in
+`Core/WatchpointEncoding.h` (`ClassifyTrapOwner`) and checked off-game on both
+toolchains and on real hardware in the Windows test.
+
+**Benign writes vs a clobbered vtable (0.6.2).** A data breakpoint fires on
+*any* write, including the allocator's or CRT's initialisation of a freshly
+allocated block. The one real trip was `VCRUNTIME140` writing `0` into an
+already-zero qword - construction, not corruption - and 0.6.1 reported it and
+released the slot, losing the watch exactly while the object was being
+constructed. At arming, 0.6.2 snapshots the first qword and whether it is a code
+pointer (the existing module-map classification, taken on the sweeper, never in
+the VEH). A trap is a **degradation** only when a value that *was* a code
+pointer has become a non-code value. Everything else is benign:
+
+* `before == after` is benign by construction (the observed case);
+* a value that was not a code pointer at arming is benign whatever is written;
+* code -> different code is a legitimate vtable swap, not a clobber;
+* an unreadable value is never claimed to be a degradation.
+
+A benign trap is consumed silently and **the slot stays armed**; a data
+breakpoint is a trap, so the store itself cannot re-fire. Only a degradation is
+reported, and only then is the slot released. The rule is `ClassifyWatchedWrite`
+in `Core/WatchpointEncoding.h` and is unit-tested off-game.
 
 ### 13.5 Shutdown and the final-state assertion
 
@@ -837,9 +892,10 @@ calling thread, and then **asserts** the final state with
 were checked and how many were still armed, degrading health if any were. "We
 think we cleared them" is not a claim. SKSE has no plugin-unload callback, so
 the clean path is registered with `atexit` as a best effort; a hard process exit
-clears the per-thread debug registers by definition, and a separate stale-DR
-risk within a session is handled by the trap-time disable, the release on free
-and the hold rotation.
+clears the per-thread debug registers by definition. Within a session, a stale
+DR is now handled by three independent mechanisms rather than one: the trap-time
+per-thread record (a stale trap is consumed, not fatal - 13.4), the release on
+free plus the forced all-thread re-arm (FIX 2), and the hold rotation.
 
 ### 13.6 Coverage, honestly
 
@@ -851,10 +907,15 @@ the sample is invisible to the watchpoints (the ledger may still attribute its
 corruption after the fact). The health line reports slot occupancy, claims,
 claim drops, trips, rotations and report drops so a lossy run is legible. This
 is a detector for a sampled subset, not a shadow heap, and it is not presented
-as one. **It has never been run in the game**: nobody has launched Skyrim with
-this build, so in-game behaviour is unobserved; what is proven is the Linux
-suite (plan/slots/reports/encoding) and the Windows test that arms a real
-watchpoint and catches a real write.
+as one. **It has now been run in the game once** (0.6.1), and that single trip
+exposed four defects: a stale arm whose `#DB` was handed to the crash handler
+and killed the session, a release that only disarmed the trapping thread, a
+benign construction write reported and released as if it were corruption, and a
+report whose `watched=` address disagreed with the table. The 0.6.2 fixes are
+proven off-game on Linux and on real hardware watchpoints in the Windows test,
+but **the corrected build has not yet had a fresh in-game trip**: in-game
+correctness of the corrected path is still unobserved, and only a fresh trip can
+show it.
 
 ## 14. Publishing symbols (making our own frames legible)
 

@@ -7,7 +7,7 @@
 // --short HEAD` (with a safe fallback when git is unavailable, e.g. a shallow
 // export). It is a recognisability stamp for a run, not a security claim.
 
-#define HS_VERSION "0.6.1"
+#define HS_VERSION "0.6.2"
 
 #ifndef HS_BUILD_ID
 #	define HS_BUILD_ID "unknown"
