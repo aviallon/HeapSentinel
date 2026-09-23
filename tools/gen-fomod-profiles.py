@@ -36,6 +36,20 @@ from xml.sax.saxutils import escape
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Static mod metadata, emitted as an MO2/Amethyst-compatible ``meta.ini`` that
+# both release archives carry. Amethyst reads this file from the archive/mod
+# root (src/Nexus/nexus_meta.py: section ``[General]``). Only facts that are
+# true BEFORE an install live here: the installer stamps ``installed=`` and
+# ``fileSize=``, because those are not knowable at build time. This mod has no
+# Nexus page, so ``modid``/``fileid`` stay EMPTY - a fabricated id would make
+# the manager try to update a page that does not exist.
+PROJECT_NAME = "HeapSentinel"
+PROJECT_AUTHOR = "aviallon"
+PROJECT_URL = "https://github.com/aviallon/HeapSentinel"
+PROJECT_DESCRIPTION = (
+    "SKSE memory sentinel that tells you which mod caused a Skyrim memory crash."
+)
+
 # ---------------------------------------------------------------------------
 # The one definition: every section, key, comment and compiled default.
 # ---------------------------------------------------------------------------
@@ -649,6 +663,35 @@ def render_ini(profile: Profile, *, is_default: bool) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def render_meta_ini(version: str) -> str:
+    """MO2/Amethyst ``meta.ini`` for the release archives (flat and FOMOD).
+
+    ``installationFile`` names the flat, version-derived archive; the manager
+    rewrites it with the archive it actually installed (``_write_install_meta``
+    sets ``installation_file = archive.name``), so this is only a hint. The
+    canonical display name goes in ``nexusName`` (MO2 ``NexusModMeta.mod_name``
+    comes from the FOLDER name, which the manager chooses at install time).
+    """
+    lines = [
+        "; HeapSentinel - MO2/Amethyst meta.ini (generated; do not hand-edit)",
+        "; Static facts only. installed= / fileSize= are stamped by the installer.",
+        "; This mod has no Nexus page: modid= / fileid= are deliberately empty.",
+        "[General]",
+        "gameName=skyrimspecialedition",
+        f"version={version}",
+        f"author={PROJECT_AUTHOR}",
+        f"nexusName={PROJECT_NAME}",
+        f"nexusUrl={PROJECT_URL}",
+        f"description={PROJECT_DESCRIPTION}",
+        f"installationFile=HeapSentinel-{version}.zip",
+        "fileCategory=MAIN",
+        "modid=",
+        "fileid=",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def read_version() -> str:
     """set_version("0.3.0") from xmake.lua, so the FOMOD cannot drift from the build."""
     for line in (REPO_ROOT / "xmake.lua").read_text(encoding="utf-8").splitlines():
@@ -708,7 +751,7 @@ def render_module_config(version: str) -> str:
     out.append('        xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">')
     out.append(f"  <moduleName>HeapSentinel {escape(version)}</moduleName>")
     out.append("  <requiredInstallFiles>")
-    for source in ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md"):
+    for source in ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md", "meta.ini"):
         out.append(f'    <file source="{source}" destination="{source}" />')
     out.append("  </requiredInstallFiles>")
 
@@ -792,6 +835,7 @@ def build_outputs() -> dict[str, str]:
         outputs[f"fomod/profiles/{profile.name}.ini"] = render_ini(profile, is_default=False)
     outputs["fomod/info.xml"] = render_info_xml(version)
     outputs["fomod/ModuleConfig.xml"] = render_module_config(version)
+    outputs["meta.ini"] = render_meta_ini(version)
     return outputs
 
 

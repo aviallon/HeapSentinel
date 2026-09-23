@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate HeapSentinel's FOMOD before it becomes a release asset.
 
-This is the check that must be able to FAIL. It does six independent things,
+This is the check that must be able to FAIL. It does seven independent things,
 each of which is a real gate rather than a "well-formed" smoke test:
 
   1. UP TO DATE: regenerate every artifact from tools/gen-fomod-profiles.py and
@@ -9,26 +9,31 @@ each of which is a real gate rather than a "well-formed" smoke test:
      ModuleConfig.xml are therefore rejected. (This is the drift gate: the
      project has twice shipped a deployed ini that disagreed with the code.)
 
-  2. KEY NAMES: every key in every profile must be read by src/Config.cpp, and
+  2. META.INI: the MO2/Amethyst metadata is present, has a ``[General]``
+     section, and its ``version`` equals the ``xmake.lua`` version. A shipped
+     meta.ini that lies about the version is exactly the class of bug the
+     version-derived archive name fixed.
+
+  3. KEY NAMES: every key in every profile must be read by src/Config.cpp, and
      every key src/Config.cpp reads must appear in every profile and in the
      standalone config. A renamed key -- or a profile that forgets a whole
      section such as [ScaleformHeap] -- fails here.
 
-  3. XML: the FOMOD is well-formed, validates against the vendored FOMOD schema
+  4. XML: the FOMOD is well-formed, validates against the vendored FOMOD schema
      (fomod/schema/ModConfig5.0.xsd) when xmllint is available, and satisfies
      the structural rules the schema is vague about (one Recommended default in
      the SelectExactlyOne profile group; every profile flag has exactly one
      conditional pattern and vice versa).
 
-  4. PACKAGE LAYOUT: every <file source="..."> in ModuleConfig.xml resolves to a
+  5. PACKAGE LAYOUT: every <file source="..."> in ModuleConfig.xml resolves to a
      real file in the package, and the package carries the FOMOD, the DLL and a
      profile ini per choice.
 
-  5. CONDITIONAL LOGIC: an independent simulation of the FOMOD flag rules
+  6. CONDITIONAL LOGIC: an independent simulation of the FOMOD flag rules
      asserts that selecting each profile installs that profile's ini to
      SKSE/Plugins/HeapSentinel.ini and no other profile's ini.
 
-  6. ARCHIVE: optionally builds the installable zip and re-checks its contents.
+  7. ARCHIVE: optionally builds the installable zip and re-checks its contents.
 
 Usage:
     python3 tools/validate_fomod.py --dll path/to/HeapSentinel.dll
@@ -55,7 +60,7 @@ SCHEMA = REPO_ROOT / "fomod" / "schema" / "ModConfig5.0.xsd"
 MODULECONFIG = REPO_ROOT / "fomod" / "ModuleConfig.xml"
 INFOXML = REPO_ROOT / "fomod" / "info.xml"
 
-REQUIRED_FILES = ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md")
+REQUIRED_FILES = ("SKSE/Plugins/HeapSentinel.dll", "SKSE/Plugins/HeapSentinel.pdb", "README.md", "RESEARCH.md", "DESIGN.md", "meta.ini")
 
 
 def load_generator():
@@ -130,8 +135,39 @@ def ini_keys(text: str) -> dict[tuple[str, str], str]:
     return found
 
 
+def check_meta_ini(c: Checker, gen) -> None:
+    print("[2] meta.ini is present and tells the truth about the version")
+    path = REPO_ROOT / "meta.ini"
+    if not path.is_file():
+        c.fail("meta.ini is missing (run tools/gen-fomod-profiles.py)")
+        return
+    values = ini_keys(path.read_text(encoding="utf-8"))
+    general = {key: value for (section, key), value in values.items()
+               if section == "General"}
+    if not general:
+        c.fail("meta.ini has no [General] section")
+        return
+    version = gen.read_version()
+    if general.get("version") != version:
+        c.fail(f"meta.ini version is {general.get('version')!r}, xmake.lua says {version!r}")
+    else:
+        c.ok(f"meta.ini has [General] and version == xmake.lua ({version})")
+
+    if general.get("gameName") != "skyrimspecialedition":
+        c.fail(f"meta.ini gameName is {general.get('gameName')!r}, expected 'skyrimspecialedition'")
+    if general.get("fileCategory") != "MAIN":
+        c.fail(f"meta.ini fileCategory is {general.get('fileCategory')!r}, expected 'MAIN'")
+    if not general.get("nexusName"):
+        c.fail("meta.ini has no nexusName (canonical display name)")
+    # This mod is not on Nexus: a populated id would make the manager try to
+    # update a page that does not exist.
+    for key in ("modid", "fileid"):
+        if general.get(key, "").strip():
+            c.fail(f"meta.ini fabricates {key}={general[key]!r}; this mod has no Nexus page")
+
+
 def check_keys(c: Checker, gen) -> None:
-    print("[2] ini keys agree with src/Config.cpp")
+    print("[3] ini keys agree with src/Config.cpp")
     known = parser_keys()
     if not known:
         c.fail("no keys parsed from src/Config.cpp - the parser regex broke")
@@ -170,7 +206,7 @@ def strip_ns(tag: str) -> str:
 
 
 def check_xml(c: Checker, gen) -> None:
-    print("[3] ModuleConfig.xml / info.xml are valid FOMOD")
+    print("[4] ModuleConfig.xml / info.xml are valid FOMOD")
     try:
         root = ET.parse(MODULECONFIG).getroot()
     except ET.ParseError as exc:
@@ -313,7 +349,7 @@ def check_xml(c: Checker, gen) -> None:
 # ---------------------------------------------------------------------------
 
 def check_package(c: Checker, gen, dll: Path | None, pdb: Path | None, stage: Path) -> None:
-    print("[4] package layout")
+    print("[5] package layout")
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
@@ -327,6 +363,9 @@ def check_package(c: Checker, gen, dll: Path | None, pdb: Path | None, stage: Pa
         shutil.copyfile(REPO_ROOT / rel, dest)
     for rel in ("README.md", "RESEARCH.md", "DESIGN.md"):
         shutil.copyfile(REPO_ROOT / rel, stage / rel)
+    # The MO2/Amethyst metadata is a declared FOMOD file and must be in the
+    # package exactly as generated.
+    shutil.copyfile(REPO_ROOT / "meta.ini", stage / "meta.ini")
 
     if dll is not None:
         dest = stage / "SKSE" / "Plugins" / "HeapSentinel.dll"
@@ -379,6 +418,16 @@ def check_package(c: Checker, gen, dll: Path | None, pdb: Path | None, stage: Pa
         if not (stage / rel).is_file():
             c.fail(f"profile file {rel} is missing from the package")
     c.ok(f"{len(gen.PROFILES)} profile variants are present and declared")
+
+    if (stage / "meta.ini").is_file():
+        meta_values = ini_keys((stage / "meta.ini").read_text(encoding="utf-8"))
+        meta_general = {k: v for (s, k), v in meta_values.items() if s == "General"}
+        if meta_general.get("version") != gen.read_version():
+            c.fail("the packaged meta.ini version disagrees with xmake.lua")
+        else:
+            c.ok("the packaged meta.ini is present, has [General], and matches xmake.lua")
+    else:
+        c.fail("meta.ini is missing from the package")
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +504,7 @@ def simulate_selection(root: ET.Element, selections: dict[str, list[str]]):
 
 
 def check_conditional(c: Checker, gen) -> None:
-    print("[5] conditional-install flag simulation")
+    print("[6] conditional-install flag simulation")
     root = ET.parse(MODULECONFIG).getroot()
 
     titles = {p.title: p.name for p in gen.PROFILES}
@@ -488,7 +537,7 @@ def check_conditional(c: Checker, gen) -> None:
 # ---------------------------------------------------------------------------
 
 def build_zip(c: Checker, stage: Path, zip_path: Path) -> None:
-    print("[6] archive")
+    print("[7] archive")
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -503,6 +552,7 @@ def build_zip(c: Checker, stage: Path, zip_path: Path) -> None:
         "fomod/info.xml",
         "SKSE/Plugins/HeapSentinel.dll",
         "SKSE/Plugins/HeapSentinel.pdb",
+        "meta.ini",
     }
     for name in sorted(required):
         if name not in names:
@@ -527,6 +577,7 @@ def main(argv: list[str]) -> int:
     c = Checker()
 
     check_up_to_date(c, gen)
+    check_meta_ini(c, gen)
     check_keys(c, gen)
     check_xml(c, gen)
 

@@ -33,6 +33,24 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Assert the version string has one source of truth
+        shell: bash
+        run: |
+          set -euo pipefail
+          # HS_VERSION is printed in the banner and the reports-log session
+          # header, while xmake.lua's set_version() names the release. Two
+          # places, one truth: this guard is why a shipped plugin cannot log
+          # "v0.5.0" while being 0.6.0 content (which it did).
+          version=$(grep -oP 'set_version\("\K[^"]+' xmake.lua)
+          [ -n "$version" ] || { echo "::error::could not read the version from xmake.lua"; exit 1; }
+          hs_version=$(grep -oP '#define HS_VERSION "\K[^"]+' src/Core/BuildInfo.h)
+          [ -n "$hs_version" ] || { echo "::error::could not read HS_VERSION from src/Core/BuildInfo.h"; exit 1; }
+          if [ "$hs_version" != "$version" ]; then
+            echo "::error::src/Core/BuildInfo.h HS_VERSION=$hs_version disagrees with xmake.lua set_version($version)"
+            exit 1
+          fi
+          echo "HS_VERSION == xmake.lua version == $version"
+
       - name: Pin CommonLibSSE-NG to the format-5 revision
         shell: bash
         run: |
@@ -119,8 +137,10 @@ jobs:
           echo "the DLL contains the embedded hook table and the verification strings"
 
           # 0.5.0: the version banner, the confidence-gated kind and the
-          # re-entrancy/evidence path must all be compiled in.
-          for needle in "HeapSentinel v0.5.0" "allocator confidence" "double-free-unverified" "firstFreeBy=" "secondFreeBy=" "allocSite=" "bPreventDoubleFree"; do
+          # re-entrancy/evidence path must all be compiled in. The banner is
+          # version-derived (xmake.lua), so a stale HS_VERSION fails here too.
+          version=$(grep -oP 'set_version\("\K[^"]+' xmake.lua)
+          for needle in "HeapSentinel v${version}" "allocator confidence" "double-free-unverified" "firstFreeBy=" "secondFreeBy=" "allocSite=" "bPreventDoubleFree"; do
             strings -n 5 "$dll" | grep -qF "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
           done
           echo "the DLL carries the 0.5.0 double-free fix strings"
@@ -141,6 +161,10 @@ jobs:
           # "HeapSentinel.dll+0x39C1B".
           cp "$pdb" out/SKSE/Plugins/HeapSentinel.pdb
           cp config/HeapSentinel.ini out/SKSE/Plugins/HeapSentinel.ini
+          # MO2/Amethyst metadata at the archive root, generated from the same
+          # single source of truth as the FOMOD. Amethyst reads it as an
+          # MO2-compatible [General] section (src/Nexus/nexus_meta.py).
+          cp meta.ini out/meta.ini
           cp README.md RESEARCH.md DESIGN.md out/
           # Data at the archive root so Amethyst / MO2 / Vortex install it as a
           # mod with no manual placement.
@@ -156,6 +180,7 @@ jobs:
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.dll" || { echo "::error::the DLL is missing from the archive"; exit 1; }
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.pdb" || { echo "::error::the PDB is missing from the archive"; exit 1; }
           7z l "$ZIP" | tr '\\' '/' | grep -q "SKSE/Plugins/HeapSentinel.ini" || { echo "::error::the config is missing from the archive"; exit 1; }
+          7z l "$ZIP" | tr '\\' '/' | grep -q "meta.ini" || { echo "::error::meta.ini is missing from the archive"; exit 1; }
           sha256sum "$ZIP"
 
       - uses: actions/upload-artifact@v4
@@ -378,7 +403,7 @@ jobs:
         run: |
           set -euo pipefail
           zip="HeapSentinel-${{ steps.vars.outputs.version }}-fomod.zip"
-          for f in fomod/ModuleConfig.xml fomod/info.xml SKSE/Plugins/HeapSentinel.dll SKSE/Plugins/HeapSentinel.pdb; do
+          for f in fomod/ModuleConfig.xml fomod/info.xml SKSE/Plugins/HeapSentinel.dll SKSE/Plugins/HeapSentinel.pdb meta.ini; do
             unzip -Z1 "$zip" | grep -qxF "$f" || { echo "::error::$f missing from $zip"; exit 1; }
           done
           unzip -Z1 "$zip" | grep -qE '^fomod/profiles/[^/]+\.ini$' || { echo "::error::no profile inis in $zip"; exit 1; }

@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
-  <moduleName>HeapSentinel 0.6.0</moduleName>
+  <moduleName>HeapSentinel 0.6.1</moduleName>
   <requiredInstallFiles>
     <file source="SKSE/Plugins/HeapSentinel.dll" destination="SKSE/Plugins/HeapSentinel.dll" />
     <file source="SKSE/Plugins/HeapSentinel.pdb" destination="SKSE/Plugins/HeapSentinel.pdb" />
     <file source="README.md" destination="README.md" />
     <file source="RESEARCH.md" destination="RESEARCH.md" />
     <file source="DESIGN.md" destination="DESIGN.md" />
+    <file source="meta.ini" destination="meta.ini" />
   </requiredInstallFiles>
   <installSteps order="Explicit">
     <installStep name="HeapSentinel">
