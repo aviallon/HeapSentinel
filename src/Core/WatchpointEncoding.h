@@ -216,10 +216,7 @@ namespace hs
 	// is genuinely foreign and is passed on.
 	[[nodiscard]] constexpr bool MustConsumeDebugException(bool a_everProgrammedAnyDr) noexcept
 	{
-		// MUTATION PROOF M2 (temporary): consume even when nothing was armed, so
-		// the disabled/never-armed case masks a #DB and test (b) must fail.
-		(void)a_everProgrammedAnyDr;
-		return true;
+		return a_everProgrammedAnyDr;
 	}
 
 	// How long after a block's recorded free a first-word write is still the
@@ -240,11 +237,11 @@ namespace hs
 	[[nodiscard]] constexpr bool IsAllocatorPostFreeLink(
 		std::uint64_t a_freeTick, std::uint64_t a_trapTick, std::uint64_t a_windowMs) noexcept
 	{
-		// MUTATION PROOF M2 (temporary): never recognise the post-free link, so
-		// test (c) must fail.
+		// MUTATION PROOF M3 (temporary): treat EVERY free as an allocator link, so
+		// a delayed use-after-free is suppressed and test (d) must fail.
 		(void)a_freeTick;
 		(void)a_trapTick;
 		(void)a_windowMs;
-		return false;
+		return true;
 	}
 }
