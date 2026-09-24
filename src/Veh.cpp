@@ -349,11 +349,14 @@ namespace hs
 			if (!a_info || !a_info->ExceptionRecord) {
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
-			// Hardware data watchpoints arrive as a single-step debug exception. Only
-			// the watchpoint manager may claim one, and only when DR6's B0-B3 says
-			// one of OUR slots fired; anything else (a trap-flag single step, a
-			// foreign breakpoint) is handed to the next handler. We never swallow an
-			// exception we do not understand.
+			// Hardware data watchpoints arrive as a single-step debug exception. The
+			// watchpoint manager owns the decision. Since 0.6.3 that decision is
+			// STRUCTURAL: once this process has ever programmed a debug register, a
+			// #DB is consumed (and recorded, attributed or not) rather than handed
+			// on -- see DESIGN.md 13.4 for why survival cannot depend on classifying
+			// correctly. Before any DR has been programmed nothing can be masked and
+			// the manager returns CONTINUE_SEARCH. For every other exception code the
+			// old rule stands: we never swallow an exception we do not understand.
 			if (a_info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
 				return Watchpoints::Get().HandleDebugException(a_info);
 			}

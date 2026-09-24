@@ -94,6 +94,7 @@ namespace hs
 				slot.armedWasCode = a_armedWasCode;
 				slot.allocSite = a_allocSite;
 				slot.armedTick = a_tick;
+				slot.freeTick = 0;
 				slot.generation = a_generation;
 				slot.threadId = a_threadId;
 				slot.flags = kWatchSlotOccupied;
@@ -136,6 +137,7 @@ namespace hs
 			const auto claimed = slot.version.load(std::memory_order_relaxed) & ~1ull;
 			slot.flags |= kWatchSlotReleased;
 			slot.armedTick = a_tick;
+			slot.freeTick = a_tick;
 			Publish(slot, claimed);
 			_releases.fetch_add(1, std::memory_order_relaxed);
 			return true;
@@ -210,6 +212,7 @@ namespace hs
 			copy.valueAtArm = slot.valueAtArm;
 			copy.allocSite = slot.allocSite;
 			copy.armedTick = slot.armedTick;
+			copy.freeTick = slot.freeTick;
 			copy.generation = slot.generation;
 			copy.flags = slot.flags;
 			copy.threadId = slot.threadId;
@@ -246,6 +249,7 @@ namespace hs
 		copy.valueAtArm = slot.valueAtArm;
 		copy.allocSite = slot.allocSite;
 		copy.armedTick = slot.armedTick;
+		copy.freeTick = slot.freeTick;
 		copy.generation = slot.generation;
 		copy.flags = slot.flags;
 		copy.threadId = slot.threadId;
@@ -288,6 +292,7 @@ namespace hs
 			slot.allocSite = 0;
 			slot.flags = kWatchSlotReleased;
 			slot.armedTick = a_tick;
+			slot.freeTick = a_tick;
 			Publish(slot, claimed);
 		}
 		return cleared;
@@ -317,6 +322,7 @@ namespace hs
 			slot.armedWasCode = false;
 			slot.allocSite = 0;
 			slot.armedTick = 0;
+			slot.freeTick = 0;
 			slot.generation = 0;
 			slot.flags = 0;
 			slot.threadId = 0;

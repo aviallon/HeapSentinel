@@ -194,4 +194,55 @@ namespace hs
 		}
 		return WatchpointWriteKind::kBenign;
 	}
+
+	// -----------------------------------------------------------------------
+	// 0.6.3: the structural survival rule and the allocator post-free window.
+	// -----------------------------------------------------------------------
+
+	// Once this process has EVER programmed a debug register, a #DB is ours as a
+	// matter of STRUCTURE, not of classification. This is deliberately not a
+	// smarter ClassifyTrapOwner: the 0.6.2 fix was a correct-looking classifier
+	// with a mutation proof that reproduced the production exception class, and
+	// the game still died because a #DB reached our handler that the classifier
+	// called foreign. A camera cannot out-reason the exception it is trying to
+	// survive, so the survival decision no longer depends on classifying at all.
+	//
+	// A foreign #DB is effectively nonexistent in this process -- nothing
+	// requested one after we armed, and an escaping one kills the game anyway --
+	// so consuming is strictly better than dying. Classification is still used
+	// to decide what to RECORD and whether to release a slot, never whether the
+	// process survives. Before we have ever programmed a DR (feature disabled,
+	// or enabled but not yet past the trigger) nothing can be masked, and a #DB
+	// is genuinely foreign and is passed on.
+	[[nodiscard]] constexpr bool MustConsumeDebugException(bool a_everProgrammedAnyDr) noexcept
+	{
+		return a_everProgrammedAnyDr;
+	}
+
+	// How long after a block's recorded free a first-word write is still the
+	// allocator linking it into its free list rather than a use-after-free.
+	//
+	// The evidence (2026-09-23 21:37:41): the block was freed at tick
+	// 188333102 and the first word rewritten at 188333103 -- one
+	// GetTickCount64 tick later, microseconds in real time. GetTickCount64
+	// advances in ~15.6 ms steps, so a free near a tick boundary and its link
+	// just after it differ by one tick, and a slow free path can differ by two.
+	// 32 ms (two ticks) covers the allocator's own bookkeeping. Residual risk,
+	// stated plainly: a genuine use-after-free write landing within 32 ms of the
+	// free is treated as a link and missed. That is the price of not reporting
+	// every free-list insertion; the window is a bounded silence, not a claim of
+	// completeness.
+	inline constexpr std::uint64_t kAllocatorPostFreeLinkWindowMs = 32;
+
+	[[nodiscard]] constexpr bool IsAllocatorPostFreeLink(
+		std::uint64_t a_freeTick, std::uint64_t a_trapTick, std::uint64_t a_windowMs) noexcept
+	{
+		if (a_freeTick == 0) {
+			return false;  // no recorded free: nothing for the allocator to have linked
+		}
+		if (a_trapTick < a_freeTick) {
+			return false;  // clock moved backwards, or the write preceded the free
+		}
+		return (a_trapTick - a_freeTick) <= a_windowMs;
+	}
 }

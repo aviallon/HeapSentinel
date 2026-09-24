@@ -50,6 +50,8 @@ namespace hs
 		std::uint64_t reportsRecorded = 0;
 		std::uint64_t reportsDropped = 0;
 		std::uint64_t reportsDrained = 0;
+		std::uint64_t unattributedTraps = 0;
+		std::uint64_t postFreeLinksSuppressed = 0;
 		std::uint64_t considerCount = 0;
 		std::uint64_t selectedCount = 0;
 		std::uint64_t queueEvictions = 0;
@@ -68,6 +70,10 @@ namespace hs
 		void Init();
 		[[nodiscard]] bool Initialized() const noexcept { return _initialized.load(std::memory_order_acquire); }
 		[[nodiscard]] bool Active() const noexcept { return _active.load(std::memory_order_acquire); }
+		// 0.6.3 structural state: true once this process has ever written a DR.
+		// While false, nothing can have been masked and a #DB is passed on; once
+		// true, every #DB is consumed (MustConsumeDebugException).
+		[[nodiscard]] bool EverProgrammedAnyDr() const noexcept { return _everProgrammedAnyDr.load(std::memory_order_acquire); }
 
 		// Hot path. `a_site` is the Scaleform allocation return address. The
 		// first thing each does is one relaxed load of `_active`, so a disabled
@@ -149,6 +155,9 @@ namespace hs
 		WatchpointPlan      _plan;
 		std::atomic<bool>   _initialized{ false };
 		std::atomic<bool>   _active{ false };
+		// Monotonic: set before the first SetThreadContext that programs a DR, and
+		// never cleared. This is the structural survival rule (0.6.3).
+		std::atomic<bool>   _everProgrammedAnyDr{ false };
 		std::atomic<bool>   _armRequested{ false };
 		std::atomic<bool>   _stop{ false };
 		std::atomic<bool>   _dirty{ false };
@@ -159,6 +168,8 @@ namespace hs
 		std::atomic<std::uint64_t> _unwatchable{ 0 };
 		std::atomic<std::uint64_t> _threadTableOverflow{ 0 };
 		std::atomic<std::uint64_t> _drained{ 0 };
+		std::atomic<std::uint64_t> _unattributed{ 0 };
+		std::atomic<std::uint64_t> _postFreeSuppressed{ 0 };
 
 		// Configuration snapshot, taken once at Init.
 		std::size_t   _sweepMs = 250;

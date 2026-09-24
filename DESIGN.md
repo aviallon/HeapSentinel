@@ -836,33 +836,53 @@ Scaleform free ring, applies the final benign-vs-degradation call (which needs
 the locking module map) and only then calls `Report`. Overwritten, undrained
 traps are counted (`Dropped`), not lost silently.
 
-**Which `#DB`s are ours (0.6.2).** `EXCEPTION_SINGLE_STEP` is also what a
-debugger's single-step, a trap flag and a *stale* hardware watch all raise, so
-"ours" has to be decided precisely, and the rule must be narrow enough that our
-own traps can never fall through to `CONTINUE_SEARCH`:
+**Which `#DB`s are ours: the structural rule (0.6.3).** 0.6.2 decided
+"ours" by classification (`ClassifyTrapOwner`) and returned
+`EXCEPTION_CONTINUE_SEARCH` for anything it could not name. The 2026-09-24
+17:12:44 crash falsified that: an `EXCEPTION_SINGLE_STEP` arrived through our
+own `GMemoryHeapPT::Realloc` hook (`Hooks.cpp:626`) while the feature was armed,
+the classifier called it foreign, it was handed on, and the game died. The
+session's counters read `0 trips, 0 reports` -- our own handler had judged our
+own trap foreign. The lesson is not "classify better"; it is that a survival
+decision must not depend on classification at all.
 
-* **ours, current** - DR6 names slot *i*, DR7 enables it, and the live table
-  slot *i* holds the same address. This is an ordinary arm; `kTableCurrent`, or
-  `kTableReleased` when the free hook has already released the block (a
-  write-after-free).
-* **ours, stale** - DR6 names slot *i*, DR7 enables it, the table has moved on
-  (released or re-armed for another block), but this thread was *ever* armed
-  with slot *i*. This is `kStaleThreadArm` when the per-thread record still
-  holds the address that trapped, and `kStaleBareArm` when the record is gone.
-* **foreign** - DR6 names no enabled slot, or DRi is zero, or the thread was
-  never armed with that slot and the table does not hold the address. Only these
-  return `EXCEPTION_CONTINUE_SEARCH`, so a genuine single step or a foreign
-  breakpoint is never swallowed.
+So the survival rule is structural and lives in `MustConsumeDebugException`:
 
-The stale case is why 0.6.1 died. Debug registers are per-thread and re-arming
-reaches threads at the sweep cadence, so a thread can still hold an address the
-table retired seconds earlier. The 0.6.1 handler matched only the table, saw no
-match for the stale DR, returned `CONTINUE_SEARCH`, and let the game die of our
-own watchpoint. 0.6.2 keeps a per-thread record of the last arm in each DR slot
-and consumes any trap on a slot that record says we armed, reporting it (with
-the address that actually trapped) as a stale arm. The rule is written in
-`Core/WatchpointEncoding.h` (`ClassifyTrapOwner`) and checked off-game on both
-toolchains and on real hardware in the Windows test.
+* **before this process has ever programmed a debug register** (feature
+disabled, or enabled but not yet past the trigger) nothing can have been
+masked, so a `#DB` is genuinely foreign and is passed on -- a debugger keeps
+working on a run where we never armed;
+* **once any DR has been programmed**, ANY `#DB` is ours. It is consumed and,
+if the classifier cannot name it, *recorded as unattributed* (Deliverable 1
+below). A foreign `#DB` is effectively nonexistent in this process -- nothing
+requested one after we armed -- and an escaping one kills the game, so
+consuming is strictly better than dying. The old "unknown exceptions return
+`EXCEPTION_CONTINUE_SEARCH`" rule still applies to every other exception code.
+
+The flag is monotonic and set before the first `SetThreadContext` (an
+over-claim only means we consume a foreign `#DB`, which is the safe direction).
+**Residual risk, stated plainly:** once armed, a legitimate trap-flag
+single-step or a debugger's own hardware breakpoint is consumed rather than
+forwarded. That is a bounded, deliberate masking of a diagnostic that is not
+part of a shipping game, traded for not dying on our own watchpoint. When
+`bEnabled=0` nothing is ever armed, so nothing is masked; the off-game tests
+assert that (`BuildDr7(all-zero) == 0` and
+`MustConsumeDebugException(false) == false`), and the Windows test drives the
+real rule with a real `#DB`.
+
+Classification is still used, but only to decide what to RECORD and whether to
+release a slot: `ClassifyTrapOwner` names a current arm, a released block
+(write-after-free), or a stale per-thread arm, and the per-thread record remains
+the safety net for an arm the table has moved on from. A classification bug can
+now lose a report; it can no longer kill the process.
+
+**Unattributed traps are recorded (0.6.3, Deliverable 1).** When the classifier
+cannot attribute a `#DB`, the handler writes a record into the preallocated ring
+BEFORE dealing with it: raw DR6 and DR7, the raw DR0-DR3, the faulting thread
+id, the RIP, this thread's ever-armed slot mask, and whether any DR was ever
+programmed. No allocation, no lock, no `std::string`, no spdlog -- the same POD
+record path as every other trap. If the fatal case recurs, it leaves data
+instead of another mystery.
 
 **Benign writes vs a clobbered vtable (0.6.2).** A data breakpoint fires on
 *any* write, including the allocator's or CRT's initialisation of a freshly
@@ -883,6 +903,28 @@ A benign trap is consumed silently and **the slot stays armed**; a data
 breakpoint is a trap, so the store itself cannot re-fire. Only a degradation is
 reported, and only then is the slot released. The rule is `ClassifyWatchedWrite`
 in `Core/WatchpointEncoding.h` and is unit-tested off-game.
+
+**The allocator's post-free link (0.6.3, Deliverable 3).** The 2026-09-23
+21:37:41 event was a valid vtable replaced by a heap address one
+`GetTickCount64` tick after the block's own recorded free
+(`freed at tick 188333102`, written at `188333103`). 0.6.2's classifier was
+right that a code pointer had become non-code, but the write was the allocator
+linking the just-freed block into its free list -- normal reuse, safe by itself,
+not corruption. So `IsAllocatorPostFreeLink` suppresses a write whose trap tick
+is within `kAllocatorPostFreeLinkWindowMs` (32 ms, i.e. two timer ticks) of the
+block's recorded free. The window is derived from the evidence, not guessed: the
+observed link was one tick later, and `GetTickCount64` advances in ~15.6 ms
+steps, so a free near a boundary and its link just after it differ by one tick
+while a slow free path can differ by two. A suppressed write is silent and the
+watch stays armed; only a write to a block freed EARLIER than the window is a
+genuine use-after-free and is reported.
+
+**Residual risk, stated plainly:** a genuine use-after-free write landing within
+32 ms of the free is treated as the allocator's link and missed. The window is a
+bounded silence, not a claim of completeness. It is applied twice -- in the trap
+path (which needs the free tick and must not clear the thread's DR) and again in
+the drainer (defence in depth for the race where the free record lands after the
+trap) -- through the same pure function, which is unit-tested off-game.
 
 ### 13.5 Shutdown and the final-state assertion
 
@@ -907,15 +949,27 @@ the sample is invisible to the watchpoints (the ledger may still attribute its
 corruption after the fact). The health line reports slot occupancy, claims,
 claim drops, trips, rotations and report drops so a lossy run is legible. This
 is a detector for a sampled subset, not a shadow heap, and it is not presented
-as one. **It has now been run in the game once** (0.6.1), and that single trip
-exposed four defects: a stale arm whose `#DB` was handed to the crash handler
-and killed the session, a release that only disarmed the trapping thread, a
-benign construction write reported and released as if it were corruption, and a
-report whose `watched=` address disagreed with the table. The 0.6.2 fixes are
-proven off-game on Linux and on real hardware watchpoints in the Windows test,
-but **the corrected build has not yet had a fresh in-game trip**: in-game
-correctness of the corrected path is still unobserved, and only a fresh trip can
-show it.
+as one. **It has now been run in the game twice.** The 0.6.1 trip exposed four
+defects: a stale arm whose `#DB` was handed to the crash handler and killed the
+session, a release that only disarmed the trapping thread, a benign construction
+write reported and released as if it were corruption, and a report whose
+`watched=` address disagreed with the table. 0.6.2 fixed those four, proved them
+off-game on Linux and on real hardware watchpoints in the Windows test -- and
+then **still killed the session on 2026-09-24**, because a `#DB` reached the
+handler through our own `Realloc` hook that the classifier called foreign and
+handed on. That is the precedent for not claiming more than the evidence shows:
+a green suite with a real mutation proof did not cover the case the game hit.
+
+The 0.6.3 changes are structural rather than another classifier -- survival is
+`MustConsumeDebugException` and no longer depends on classification -- and they
+are proven off-game on Linux (the pure post-free window, the record encoding,
+the slot free tick) and on real hardware watchpoints in the Windows test
+(unattributed `#DB` consumed and recorded, disabled run not masking, post-free
+link silent, delayed use-after-free reported). But **the corrected build has not
+yet had a fresh in-game trip**: in-game correctness of the corrected path is
+still unobserved, and only a fresh trip can show it. The unattributed record
+exists precisely so that if it recurs, the next report is data instead of
+another mystery.
 
 ## 14. Publishing symbols (making our own frames legible)
 
