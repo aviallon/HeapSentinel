@@ -380,7 +380,9 @@ namespace hs
 		if (a_armedInstance == 0 || a_freeInstance == 0) {
 			return FreeInstanceMatch::kUnknown;
 		}
-		return a_armedInstance == a_freeInstance ? FreeInstanceMatch::kSame : FreeInstanceMatch::kDifferent;
+		// MUTATION M1 (temporary): every free is claimed to be this allocation's.
+	(void)a_freeInstance;
+	return FreeInstanceMatch::kSame;
 	}
 
 	[[nodiscard]] constexpr const char* FreeInstanceMatchName(FreeInstanceMatch a_match) noexcept
