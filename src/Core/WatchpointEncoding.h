@@ -277,7 +277,10 @@ namespace hs
 	// better evidence and is kept.
 	[[nodiscard]] constexpr std::uint64_t PreferNewestFreeTick(std::uint64_t a_slotFreeTick, std::uint64_t a_ringFreeTick) noexcept
 	{
-		return a_ringFreeTick > a_slotFreeTick ? a_ringFreeTick : a_slotFreeTick;
+	// MUTATION M3 (temporary): the stale slot Release tick shadows the free
+	// ring's newest record.
+	(void)a_ringFreeTick;
+	return a_slotFreeTick;
 	}
 
 	// What the recorded free says about a first-word write. The two allocator
