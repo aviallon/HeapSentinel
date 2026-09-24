@@ -51,8 +51,8 @@ namespace hs
 
 	std::uint64_t NextAllocationInstance() noexcept
 	{
-		static std::atomic<std::uint64_t> counter{ 1 };
-		return counter.fetch_add(1, std::memory_order_relaxed);
+		// MUTATION M3 (temporary): no per-allocation identity.
+		return 1;
 	}
 
 	ShadowLedger& ShadowLedger::Get()
