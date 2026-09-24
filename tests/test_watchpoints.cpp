@@ -1338,6 +1338,11 @@ namespace
 
 		// 0.6.3 structural state + the counters the new tests assert.
 		bool           anyDrProgrammed = false;
+		// A deterministic trap tick for the ordering tests: GetTickCount64's
+		// granularity (two ticks == the 32 ms bookkeeping window on Windows) makes a
+		// real-tick "the free lands one tick after the trap" case flaky. 0 = use the
+		// real clock.
+		std::uint64_t  trapTickOverride = 0;
 		int            unattributedRecorded = 0;
 		int            postFreeSuppressed = 0;
 		int            reallocSuppressed = 0;
@@ -1503,8 +1508,9 @@ namespace
 			const auto armTick = tableValid ? snap.armedTick : 0ull;
 			const auto armInstance = tableValid ? snap.allocInstance : g_model.armInstance[slot];
 			const auto instanceMatch = hs::MatchFreeInstance(armInstance, freeInstance);
+			const auto trapNow = g_model.trapTickOverride != 0 ? g_model.trapTickOverride : ::GetTickCount64();
 			const auto freeContext = hs::ClassifyWriteAgainstFreeInstance(instanceMatch, freeTick, armTick,
-				::GetTickCount64(), hs::kAllocatorBookkeepingWindowMs);
+				trapNow, hs::kAllocatorBookkeepingWindowMs);
 			// Recorded even when the write is then SUPPRESSED: "which context was it" is
 			// part of the evidence, and the suppression counter alone does not say
 			// whether it was the post-free or the realloc ordering.
@@ -1935,10 +1941,14 @@ HS_TEST(hw_watchpoint_silences_a_realloc_in_progress_write)
 	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 1000, 1, 1, index));
 	HS_CHECK_EQ(index, 0u);
 	// A stale slot Release tick, and a free ring record that lands AFTER the trap.
+	// The trap tick is pinned so the one-tick delta is deterministic: GetTickCount64
+	// only advances every ~15.6 ms, so a real clock cannot reliably place the free
+	// record inside the shipped two-tick window.
+	g_model.trapTickOverride = 10000;
 	HS_CHECK(slots.Release(watched, /*slot tick=*/1000));
 	hs::ScaleformFreeRecord future;
 	future.ptr = watched;
-	future.freeTick = ::GetTickCount64() + 100;  // the realloc's free record lands later
+	future.freeTick = 10001;  // the realloc's free record lands one tick after the trap
 	ring.Record(future);
 
 	g_model.everArmed[0] = true;
