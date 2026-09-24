@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
-  <moduleName>HeapSentinel 0.6.2</moduleName>
+  <moduleName>HeapSentinel 0.6.3</moduleName>
   <requiredInstallFiles>
     <file source="SKSE/Plugins/HeapSentinel.dll" destination="SKSE/Plugins/HeapSentinel.dll" />
     <file source="SKSE/Plugins/HeapSentinel.pdb" destination="SKSE/Plugins/HeapSentinel.pdb" />
