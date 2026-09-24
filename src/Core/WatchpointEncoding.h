@@ -247,7 +247,7 @@ namespace hs
 	// That is the price of not reporting every free-list insertion; the window is
 	// a bounded silence, not a claim of completeness. Do NOT widen it to make a
 	// test pass -- a wider window is what silenced the QuickLootIE write.
-	inline constexpr std::uint64_t kAllocatorBookkeepingWindowMs = 32;
+	inline constexpr std::uint64_t kAllocatorBookkeepingWindowMs = 250;  // MUTATION M2 (temporary)
 
 	// Which free the classifier used. The slot snapshot's Release tick and the
 	// free ring's newest record for the same address are two different events in
