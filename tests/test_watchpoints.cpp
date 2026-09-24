@@ -4,6 +4,7 @@
 #include "Core/WatchpointPlan.h"
 #include "Core/WatchpointReports.h"
 #include "Core/WatchpointSlots.h"
+#include "Core/ScaleformFreeRing.h"
 #include "Ipc/Sampling.h"
 
 #include <array>
@@ -127,6 +128,128 @@ HS_TEST(watchpoint_write_classifier_reports_only_a_clobbered_code_pointer)
 	HS_CHECK(hs::ClassifyWatchedWrite(0x6FFFFB89DDB8ull, true, 0x7FF600001234ull, true, true) == WatchpointWriteKind::kBenign);
 	// A value we cannot read is never claimed to be a degradation.
 	HS_CHECK(hs::ClassifyWatchedWrite(0x6FFFFB89DDB8ull, true, 0xDEAD, false, false) == WatchpointWriteKind::kBenign);
+}
+
+// ---------------------------------------------------------------------------
+// 0.6.3: the structural survival rule and the allocator post-free window.
+// ---------------------------------------------------------------------------
+
+HS_TEST(watchpoint_structural_consume_rule_is_independent_of_classification)
+{
+	// The 0.6.2 bug: survival depended on ClassifyTrapOwner being right about a
+	// #DB, and it was wrong for the one that killed the session. 0.6.3 makes the
+	// survival decision structural: the ONLY state that permits passing a #DB on
+	// is "this process has never programmed a debug register". No classifier is
+	// consulted, so no classification bug can be fatal.
+	HS_CHECK(!hs::MustConsumeDebugException(false));
+	HS_CHECK(hs::MustConsumeDebugException(true));
+
+	// A disabled feature arms nothing, so DR7 is zero and nothing can be masked.
+	const std::uintptr_t nothing[hs::kWatchpointSlotCount] = { 0, 0, 0, 0 };
+	HS_CHECK_EQ(hs::BuildDr7(nothing, hs::kWatchpointSlotCount), 0ull);
+}
+
+HS_TEST(watchpoint_post_free_window_matches_the_observed_link)
+{
+	using hs::IsAllocatorPostFreeLink;
+	constexpr std::uint64_t kWindow = hs::kAllocatorPostFreeLinkWindowMs;
+
+	// The evidence (2026-09-23 21:37:41): freed at 188333102, link written at
+	// 188333103 -- one tick later. That MUST be silent.
+	HS_CHECK(IsAllocatorPostFreeLink(188333102ull, 188333103ull, kWindow));
+	// Same tick and the end of the window are also the allocator linking.
+	HS_CHECK(IsAllocatorPostFreeLink(100ull, 100ull, kWindow));
+	HS_CHECK(IsAllocatorPostFreeLink(100ull, 100ull + kWindow, kWindow));
+	// One tick past the window: a genuine delayed use-after-free, reported.
+	HS_CHECK(!IsAllocatorPostFreeLink(100ull, 100ull + kWindow + 1ull, kWindow));
+	// No recorded free: not attributable to the allocator at all.
+	HS_CHECK(!IsAllocatorPostFreeLink(0ull, 12345ull, kWindow));
+	// Clock going backwards is never treated as a link.
+	HS_CHECK(!IsAllocatorPostFreeLink(500ull, 499ull, kWindow));
+}
+
+HS_TEST(watchpoint_slot_records_the_block_free_tick)
+{
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(Aligned(1), 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 100, 1, 7, index));
+
+	hs::WatchSlotSnapshot snap[hs::kWatchpointSlotCount];
+	HS_CHECK_EQ(slots.Snapshot(snap), 1u);
+	HS_CHECK_EQ(snap[0].freeTick, 0ull);  // live: no free
+
+	hs::WatchSlotSnapshot byIndex;
+	HS_CHECK(slots.ReadSlot(0, byIndex));
+	HS_CHECK_EQ(byIndex.freeTick, 0ull);
+
+	// Release records the block's own free tick, which the trap path uses to
+	// silence the allocator's post-free link.
+	HS_CHECK(slots.Release(Aligned(1), 188333102ull));
+	HS_CHECK(slots.ReadSlot(0, byIndex));
+	HS_CHECK_EQ(byIndex.freeTick, 188333102ull);
+	HS_CHECK((byIndex.flags & hs::kWatchSlotReleased) != 0u);
+
+	// A slot reclaimed for another block must not inherit the old free tick.
+	HS_CHECK(slots.Claim(Aligned(2), 0x0, false, 0, 200, 2, 7, index));
+	HS_CHECK_EQ(index, 0u);
+	HS_CHECK(slots.ReadSlot(0, byIndex));
+	HS_CHECK_EQ(byIndex.freeTick, 0ull);
+	HS_CHECK_EQ(byIndex.address, Aligned(2));
+
+	slots.ResetForTesting();
+}
+
+HS_TEST(watchpoint_unattributed_report_encoding_carries_the_raw_dr_state)
+{
+	// 0.6.3 Deliverable 1: a #DB the classifier could not attribute is recorded
+	// with DR6, DR7, this thread's ever-armed mask, whether any DR was ever
+	// programmed, the raw DR0-DR3 and the RIP -- so the fatal case leaves data.
+	hs::WatchpointReport report;
+	report.flags = hs::kWatchReportUnattributed;
+	report.slotIndex = 0;
+	report.watchedAddress = 0;
+	report.writerRip = 0x7FF6AABBCCDDull;
+	report.threadId = 4242;
+	report.dr6 = 0;
+	report.dr7 = 0x00000004ull;
+	report.everArmedMask = 0;
+	report.anyDrProgrammed = true;
+	report.freeTick = 0;
+	report.tick = 188333103ull;
+	report.drAddress[0] = 0x27D0F000ull;
+	report.drAddress[1] = 0x0;
+	report.drAddress[2] = 0x0;
+	report.drAddress[3] = 0x0;
+
+	char buffer[1024]{};
+	const auto written = hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	HS_CHECK(written > 0);
+	HS_CHECK(written < sizeof(buffer));
+
+	const std::string text{ buffer };
+	HS_CHECK(text.find("unattributed=1") != std::string::npos);
+	HS_CHECK(text.find("dr6=0x0") != std::string::npos);
+	HS_CHECK(text.find("dr7=0x4") != std::string::npos);
+	HS_CHECK(text.find("ever_armed=0x0") != std::string::npos);
+	HS_CHECK(text.find("any_dr=1") != std::string::npos);
+	HS_CHECK(text.find("tid=4242") != std::string::npos);
+	HS_CHECK(text.find("writer_rip=0x7FF6AABBCCDD") != std::string::npos);
+	HS_CHECK(text.find("dr0=0x27D0F000") != std::string::npos);
+
+	// The record survives the ring, flags and all.
+	auto& reports = hs::WatchpointReports::Get();
+	reports.Init(8);
+	reports.ResetForTesting();
+	reports.Record(report);
+	hs::WatchpointReport out[8]{};
+	HS_CHECK_EQ(reports.Drain(out, 8), 1u);
+	HS_CHECK((out[0].flags & hs::kWatchReportUnattributed) != 0u);
+	HS_CHECK_EQ(out[0].dr7, 0x4u);
+	HS_CHECK(out[0].anyDrProgrammed);
+	HS_CHECK_EQ(out[0].drAddress[0], 0x27D0F000ull);
+	reports.Shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +788,11 @@ namespace
 		std::uintptr_t armValueAtArm[hs::kWatchpointSlotCount] = {};
 		bool           armWasCode[hs::kWatchpointSlotCount] = {};
 
+		// 0.6.3 structural state + the counters the new tests assert.
+		bool           anyDrProgrammed = false;
+		int            unattributedRecorded = 0;
+		int            postFreeSuppressed = 0;
+
 		bool           consumed = false;
 		int            recorded = 0;
 		std::uintptr_t reportWatched = 0;
@@ -677,6 +805,25 @@ namespace
 		bool           reportReadable = true;
 	};
 	TrapModel g_model;
+
+	LONG g_outerSawUnattributed = 0;
+
+	// The "does the #DB escape?" witness. Registered BEFORE the model handler so
+	// it runs AFTER it (Windows calls the most recently added VEH first). If the
+	// model handler returns CONTINUE_SEARCH -- the 0.6.2 behaviour, and the exact
+	// mutation target -- this sees the exception and consumes it so the test can
+	// report a failure instead of the process dying.
+	LONG CALLBACK UnattributedOuterObserver(EXCEPTION_POINTERS* a_info)
+	{
+		if (!a_info || !a_info->ExceptionRecord || a_info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		++g_outerSawUnattributed;
+		hs::hw::DisarmCurrentThread();
+		a_info->ContextRecord->Dr6 = 0;
+		a_info->ContextRecord->EFlags &= ~0x100u;
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
 
 	[[nodiscard]] bool TestSafeRead(std::uintptr_t a_addr, std::uintptr_t& a_out) noexcept
 	{
@@ -692,6 +839,12 @@ namespace
 	LONG CALLBACK ModelTrapHandler(EXCEPTION_POINTERS* a_info)
 	{
 		if (!a_info || !a_info->ExceptionRecord || a_info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		// 0.6.3 structural gate: the PRODUCTION rule, not a classifier. Break
+		// MustConsumeDebugException or this input and an unattributed #DB escapes
+		// to the outer observer (or, without one, kills the process).
+		if (!hs::MustConsumeDebugException(g_model.anyDrProgrammed)) {
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 		auto*          context = a_info->ContextRecord;
@@ -734,9 +887,20 @@ namespace
 				valueAtArm = snap.valueAtArm;
 				armedWasCode = snap.armedWasCode;
 			}
+			std::uint64_t freeTick = tableValid ? snap.freeTick : 0;
+			if (freeTick == 0) {
+				hs::ScaleformFreeRecord freeRecord;
+				if (hs::ScaleformFreeRing::Get().Find(watched, freeRecord)) {
+					freeTick = freeRecord.freeTick;
+				}
+			}
 			std::uintptr_t after = 0;
 			const bool     readable = TestSafeRead(watched, after);
-			const bool     record = armedWasCode && readable && after != valueAtArm;
+			bool           record = armedWasCode && readable && after != valueAtArm;
+			if (record && hs::IsAllocatorPostFreeLink(freeTick, ::GetTickCount64(), hs::kAllocatorPostFreeLinkWindowMs)) {
+				record = false;
+				++g_model.postFreeSuppressed;
+			}
 			if (record) {
 				++g_model.recorded;
 				g_model.reportWatched = watched;
@@ -755,7 +919,25 @@ namespace
 		}
 
 		if (!handled) {
-			return EXCEPTION_CONTINUE_SEARCH;
+			// 0.6.3 Deliverable 1: unattributed, but structurally ours. Record
+			// the raw evidence BEFORE dealing with it, then consume.
+			++g_model.unattributedRecorded;
+			g_model.consumed = true;
+			hs::WatchpointReport report;
+			report.tick = ::GetTickCount64();
+			report.writerRip = static_cast<std::uintptr_t>(context->Rip);
+			report.threadId = ::GetCurrentThreadId();
+			report.dr6 = static_cast<std::uint32_t>(dr6);
+			report.dr7 = static_cast<std::uint32_t>(dr7);
+			report.anyDrProgrammed = g_model.anyDrProgrammed;
+			report.flags = hs::kWatchReportUnattributed;
+			for (std::size_t slot = 0; slot < hs::kWatchpointSlotCount; ++slot) {
+				report.drAddress[slot] = static_cast<std::uintptr_t>(drAddress[slot]);
+			}
+			hs::WatchpointReports::Get().Record(report);
+			context->Dr6 = 0;
+			context->EFlags &= ~0x100u;
+			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 		context->Dr7 = cleared;
 		context->Dr6 = 0;
@@ -766,6 +948,7 @@ namespace
 	void ModelArmSlotZero(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, bool a_armedWasCode)
 	{
 		g_model = TrapModel{};
+		g_model.anyDrProgrammed = true;  // we are about to write a DR
 		auto& slots = hs::WatchpointSlots::Get();
 		slots.ResetForTesting();
 		std::size_t index = 0;
@@ -868,6 +1051,183 @@ HS_TEST(hw_watchpoint_reports_a_code_pointer_clobber)
 	HS_CHECK(hs::hw::DisarmCurrentThread());
 	::RemoveVectoredExceptionHandler(handler);
 }
+
+// ---------------------------------------------------------------------------
+// 0.6.3: the four claims the new design rests on, each on a REAL hardware #DB.
+// ---------------------------------------------------------------------------
+
+HS_TEST(hw_watchpoint_unattributed_db_is_consumed_and_recorded)
+{
+	// (a) The bug that killed the session twice: a #DB the classifier cannot
+	// attribute. The structural rule must consume it (process survives) AND
+	// write a record. A real hardware watchpoint is armed but deliberately NOT
+	// registered in the per-thread model or the slot table, so the classifier
+	// genuinely cannot name it.
+	g_watchedQword = 0;
+	g_outerSawUnattributed = 0;
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;  // a DR is about to be programmed
+
+	auto& reports = hs::WatchpointReports::Get();
+	reports.Init(8);
+	reports.ResetForTesting();
+	hs::WatchpointSlots::Get().ResetForTesting();
+
+	// Outer observer registered first, model handler second: the model runs first.
+	const auto outer = ::AddVectoredExceptionHandler(1, &UnattributedOuterObserver);
+	HS_CHECK(outer != nullptr);
+	const auto inner = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(inner != nullptr);
+
+	const auto     watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+	HS_CHECK_EQ(dr7, hs::BuildDr7(addresses, hs::kWatchpointSlotCount));
+
+	g_watchedQword = 0x1;  // the real #DB, unattributable
+
+	HS_CHECK(g_model.consumed);                 // the process survived the #DB
+	HS_CHECK_EQ(g_model.unattributedRecorded, 1);
+	HS_CHECK_EQ(g_outerSawUnattributed, 0);     // it never escaped to the next handler
+
+	hs::WatchpointReport out[8]{};
+	HS_CHECK_EQ(reports.Drain(out, 8), 1u);
+	HS_CHECK((out[0].flags & hs::kWatchReportUnattributed) != 0u);
+	HS_CHECK(out[0].anyDrProgrammed);
+	HS_CHECK_EQ(out[0].drAddress[0], static_cast<std::uintptr_t>(watched));
+	HS_CHECK_NE(out[0].writerRip, 0u);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(inner);
+	::RemoveVectoredExceptionHandler(outer);
+	reports.Shutdown();
+}
+
+HS_TEST(hw_watchpoint_disabled_db_is_not_masked_and_no_dr_is_programmed)
+{
+	// (b) With the feature disabled nothing is armed, so a #DB is genuinely
+	// foreign and MUST reach the next handler. (This test drives the structural
+	// rule with anyDrProgrammed=false; the plugin calls Init only when
+	// bEnabled=1, so "disabled" == "we never programmed a DR".)
+	g_outerSawUnattributed = 0;
+	g_model = TrapModel{};  // anyDrProgrammed stays false
+
+	hs::hw::ThreadDebugState before;
+	HS_CHECK(hs::hw::ReadCurrentThread(before));
+	HS_CHECK_EQ(before.dr7, 0ull);
+	HS_CHECK_EQ(before.dr0, 0ull);
+	HS_CHECK_EQ(before.dr1, 0ull);
+	HS_CHECK_EQ(before.dr2, 0ull);
+	HS_CHECK_EQ(before.dr3, 0ull);
+
+	const auto outer = ::AddVectoredExceptionHandler(1, &UnattributedOuterObserver);
+	HS_CHECK(outer != nullptr);
+	const auto inner = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(inner != nullptr);
+
+	// A single-step with no debug register programmed: the same exception class,
+	// delivered through the same dispatcher without any hardware watch.
+	::RaiseException(EXCEPTION_SINGLE_STEP, 0, 0, nullptr);
+
+	HS_CHECK_EQ(g_outerSawUnattributed, 1);  // passed on, not masked
+	HS_CHECK(!g_model.consumed);
+	HS_CHECK_EQ(g_model.unattributedRecorded, 0);
+
+	hs::hw::ThreadDebugState after;
+	HS_CHECK(hs::hw::ReadCurrentThread(after));
+	HS_CHECK_EQ(after.dr7, 0ull);
+
+	::RemoveVectoredExceptionHandler(inner);
+	::RemoveVectoredExceptionHandler(outer);
+}
+
+HS_TEST(hw_watchpoint_silences_the_allocator_post_free_link)
+{
+	// (c) A write within the bounded window after the block's own recorded free
+	// is the free-list next pointer. Silent, and the watch stays armed.
+	g_watchedQword = 0x6FFFFB89DDB8ull;  // the vtable before the link
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;
+
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+	const auto watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 1000, 1, 1, index));
+	HS_CHECK_EQ(index, 0u);
+	// Freed now: the allocator is about to link the block one tick later.
+	const auto freeAt = ::GetTickCount64();
+	HS_CHECK(slots.Release(watched, freeAt));
+
+	g_model.everArmed[0] = true;
+	g_model.armAddress[0] = watched;
+	g_model.armValueAtArm[0] = 0x6FFFFB89DDB8ull;
+	g_model.armWasCode[0] = true;
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+
+	const auto handler = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(handler != nullptr);
+
+	g_watchedQword = 0x0;  // the allocator's free-list link, a heap address
+
+	HS_CHECK(g_model.consumed);
+	HS_CHECK_EQ(g_model.recorded, 0);            // silent
+	HS_CHECK_EQ(g_model.postFreeSuppressed, 1);  // and known to be suppressed
+	HS_CHECK_EQ(g_model.unattributedRecorded, 0);
+
+	// The slot was NOT released by us and the hardware watch is still enabled.
+	hs::hw::ThreadDebugState after;
+	HS_CHECK(hs::hw::ReadCurrentThread(after));
+	HS_CHECK((after.dr7 & hs::Dr7LocalEnableBit(0)) != 0);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(handler);
+	slots.ResetForTesting();
+}
+
+HS_TEST(hw_watchpoint_reports_a_clobber_on_a_block_freed_earlier)
+{
+	// (d) A write to a block freed EARLIER than the window is a genuine
+	// use-after-free and must still report.
+	g_watchedQword = 0x6FFFFB89DDB8ull;
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;
+
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+	const auto watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 1000, 1, 1, index));
+	HS_CHECK_EQ(index, 0u);
+	HS_CHECK(slots.Release(watched, /*old free tick=*/1u));  // long before the window
+
+	g_model.everArmed[0] = true;
+	g_model.armAddress[0] = watched;
+	g_model.armValueAtArm[0] = 0x6FFFFB89DDB8ull;
+	g_model.armWasCode[0] = true;
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+
+	const auto handler = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(handler != nullptr);
+
+	g_watchedQword = 0x0;  // a delayed use-after-free clobber
+
+	HS_CHECK(g_model.consumed);
+	HS_CHECK_EQ(g_model.recorded, 1);
+	HS_CHECK_EQ(g_model.postFreeSuppressed, 0);
+	HS_CHECK(hs::ClassifyWatchedWrite(g_model.reportValueAtArm, g_model.reportArmedWasCode,
+			g_model.reportValueAfter, g_model.reportReadable, /*afterIsCode=*/false) == hs::WatchpointWriteKind::kDegradation);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(handler);
+	slots.ResetForTesting();
+}
+
 #else
 HS_TEST(hw_watchpoint_traps_the_writer_of_a_watched_qword)
 {

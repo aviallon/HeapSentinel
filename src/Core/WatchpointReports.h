@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Core/WatchpointEncoding.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -37,11 +39,19 @@ namespace hs
 		std::uintptr_t allocSite = 0;        // Scaleform allocation site, when known
 		std::uintptr_t tableAddress = 0;     // what the live table slot held at the trap (0 = none); differs from `watchedAddress` for a stale arm
 		std::uint64_t  armedTick = 0;
+		std::uint64_t  freeTick = 0;         // the block's recorded free tick, when known (0 = none)
 		std::uint32_t  slotIndex = 0;        // which DR slot fired (0..3)
 		std::uint32_t  threadId = 0;         // the writer's thread
 		std::uint32_t  dr6 = 0;
+		std::uint32_t  dr7 = 0;              // raw DR7 at the trap (0.6.3: diagnosable foreign #DBs)
 		std::uint32_t  armGeneration = 0;    // generation of the arm that fired
 		std::uint32_t  flags = 0;            // kWatchReport* bits below
+		// 0.6.3: everything needed to diagnose a #DB the classifier did NOT
+		// attribute. Recorded before the trap is dealt with, so a recurrence of
+		// the 0.6.2 fatal case leaves data instead of another mystery.
+		std::uint32_t  everArmedMask = 0;    // slots this thread was ever armed with
+		std::uintptr_t drAddress[kWatchpointSlotCount] = {};  // raw DR0-DR3 at the trap
+		bool           anyDrProgrammed = false;  // has this process ever written a DR?
 		// The module-map classification of `valueAtArm` taken at arming time: was
 		// the first qword a code pointer then? Stored so the drainer can apply the
 		// benign-vs-degradation rule without re-classifying old bytes.
@@ -66,6 +76,13 @@ namespace hs
 	// be consumed, and it is labelled so a reader can tell it apart from a
 	// current arm.
 	inline constexpr std::uint32_t kWatchReportStaleArm = 1u << 3;
+	// 0.6.3: this #DB was NOT attributable to any slot we can name, yet it was
+	// consumed structurally because this process has programmed a DR. The record
+	// carries the raw DR6/DR7, the DR0-DR3 values, this thread's ever-armed mask
+	// and the RIP, so the next occurrence is diagnosable rather than fatal. This
+	// is measurement, not a verdict: an unattributed trap is reported as exactly
+	// that, and never as a corruption.
+	inline constexpr std::uint32_t kWatchReportUnattributed = 1u << 4;
 
 	class WatchpointReports
 	{

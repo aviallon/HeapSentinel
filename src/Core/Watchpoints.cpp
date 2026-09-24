@@ -146,6 +146,9 @@ namespace hs
 		_armRequested.store(!_armAfterTrigger, std::memory_order_relaxed);
 		_active.store(false, std::memory_order_relaxed);
 		_trackedCount.store(0, std::memory_order_relaxed);
+		_everProgrammedAnyDr.store(false, std::memory_order_relaxed);
+		_unattributed.store(0, std::memory_order_relaxed);
+		_postFreeSuppressed.store(0, std::memory_order_relaxed);
 
 		_initialized.store(true, std::memory_order_release);
 
@@ -316,6 +319,19 @@ namespace hs
 		std::size_t armedNow = 0;
 		bool        rearmedAny = false;
 
+		// 0.6.3 structural rule: the moment we are about to write ANY debug
+		// register, this process must treat every later #DB as ours. Set BEFORE
+		// ArmThread so a trap on the new watch cannot race the flag: an
+		// over-claim only means we consume a foreign #DB, which is the safe
+		// direction. It is monotonic and only reset by Init.
+		bool haveAddress = false;
+		for (std::size_t slot = 0; slot < kWatchpointSlotCount; ++slot) {
+			haveAddress = haveAddress || addresses[slot] != 0;
+		}
+		if (haveAddress) {
+			_everProgrammedAnyDr.store(true, std::memory_order_release);
+		}
+
 		for (std::size_t i = 0; i < copied; ++i) {
 			auto* entry = FindThread(tids[i]);
 			if (entry == nullptr) {
@@ -408,6 +424,43 @@ namespace hs
 		for (std::size_t i = 0; i < count; ++i) {
 			const auto& report = reports[i];
 			_drained.fetch_add(1, std::memory_order_relaxed);
+
+			// 0.6.3: a #DB the classifier could not attribute. This is a
+			// diagnosis record, not a verdict about corruption: if the 0.6.2
+			// fatal case recurs, it leaves data instead of another mystery.
+			if ((report.flags & kWatchReportUnattributed) != 0) {
+				_unattributed.fetch_add(1, std::memory_order_relaxed);
+				char encoded[1024]{};
+				EncodeWatchpointReport(report, encoded, sizeof(encoded));
+				std::string detail = "HARDWARE WATCHPOINT: a #DB was consumed structurally but could not be attributed to a watch we can name\n  ";
+				detail += encoded;
+				detail += "\n  writer: ";
+				detail += ModuleMap::Get().Describe(report.writerRip);
+				detail += "\n  (consumed because this process has programmed a debug register: see DESIGN.md 13.4. "
+						  "A foreign #DB is effectively nonexistent and an escaping one kills the game, so survival no "
+						  "longer depends on classifying correctly. The raw DR6/DR7/DRi and the ever-armed mask are above.)";
+				Report("watchpoint-unattributed", detail);
+				continue;
+			}
+
+			// 0.6.3: the allocator's own post-free link. A write that lands within
+			// the bounded window after the block's recorded free is the free-list
+			// next pointer, not corruption. Stay silent and keep the watch: only a
+			// write to a block freed EARLIER than the window is a genuine
+			// use-after-free. (Defence in depth: the trap path already suppresses
+			// these; this catches the race where the free record landed after the
+			// trap.)
+			std::uint64_t freeTick = report.freeTick;
+			if (freeTick == 0) {
+				ScaleformFreeRecord lookedUp;
+				if (ScaleformFreeRing::Get().Find(report.watchedAddress, lookedUp)) {
+					freeTick = lookedUp.freeTick;
+				}
+			}
+			if (IsAllocatorPostFreeLink(freeTick, report.tick, kAllocatorPostFreeLinkWindowMs)) {
+				_postFreeSuppressed.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
 
 			// FIX 3: the trap path records only writes that could be a
 			// degradation (a code pointer was armed and the value changed). The
@@ -522,7 +575,18 @@ namespace hs
 		if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
-		if (!_active.load(std::memory_order_acquire)) {
+
+		// 0.6.3 STRUCTURAL RULE. Survival no longer depends on classifying a
+		// #DB correctly. Once this process has programmed ANY debug register, a
+		// single-step is ours by construction: consume it and record it,
+		// attributed or not. The 0.6.2 fix was a correct-looking classifier with
+		// a real mutation proof that still let the game die, because a #DB
+		// reached this handler that the classifier called foreign. Before any DR
+		// has ever been programmed (feature disabled, or enabled but not yet
+		// armed) nothing can be masked, and a foreign #DB is passed on -- which
+		// is what lets a debugger keep working on a run where we never armed.
+		const bool everProgrammed = _everProgrammedAnyDr.load(std::memory_order_acquire);
+		if (!MustConsumeDebugException(everProgrammed)) {
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
@@ -570,7 +634,7 @@ namespace hs
 			const auto owner = ClassifyTrapOwner(enabled, drAddr, hasArmRecord, armValid, armAddress,
 				tableValid, snap.address, tableReleased);
 			if (!WatchpointOwnerIsOurs(owner)) {
-				continue;  // a genuine trap-flag single step or a foreign breakpoint
+				continue;  // cannot be attributed to a slot we named; recorded below
 			}
 			handled = true;
 
@@ -580,12 +644,14 @@ namespace hs
 			report.slotIndex = static_cast<std::uint32_t>(slot);
 			report.threadId = selfTid;
 			report.dr6 = static_cast<std::uint32_t>(dr6);
+			report.dr7 = static_cast<std::uint32_t>(dr7);
 
 			if (owner == WatchpointTrapOwner::kTableCurrent || owner == WatchpointTrapOwner::kTableReleased) {
 				report.watchedAddress = snap.address;
 				report.valueAtArm = snap.valueAtArm;
 				report.allocSite = snap.allocSite;
 				report.armedTick = snap.armedTick;
+				report.freeTick = snap.freeTick;
 				report.armGeneration = snap.generation;
 				report.armedWasCode = snap.armedWasCode;
 				if (owner == WatchpointTrapOwner::kTableReleased) {
@@ -606,6 +672,15 @@ namespace hs
 				}
 			}
 
+			// A stale arm may still name a block the free ring remembers; the slot's
+			// own free tick is authoritative for a released current slot.
+			if (report.freeTick == 0) {
+				ScaleformFreeRecord freeRecord;
+				if (ScaleformFreeRing::Get().Find(report.watchedAddress, freeRecord)) {
+					report.freeTick = freeRecord.freeTick;
+				}
+			}
+
 			std::uintptr_t valueAfter = 0;
 			const bool     readable = SafeReadQword(report.watchedAddress, valueAfter);
 			report.valueAfterWrite = valueAfter;
@@ -618,6 +693,17 @@ namespace hs
 			// was armed at snapshot time, the value changed, and the new value is
 			// readable. The drainer makes the final code/non-code call.
 			bool record = report.armedWasCode && readable && valueAfter != report.valueAtArm;
+
+			// 0.6.3: suppress the allocator's own post-free link. A write inside
+			// the bounded window after the block's recorded free is the free-list
+			// next pointer, not a use-after-free. Do NOT record it and do NOT
+			// clear this thread's DR: keep watching, stay silent. Only a write to
+			// a block freed earlier than the window is reported.
+			if (record && IsAllocatorPostFreeLink(report.freeTick, now, kAllocatorPostFreeLinkWindowMs)) {
+				record = false;
+				_postFreeSuppressed.fetch_add(1, std::memory_order_relaxed);
+			}
+
 			if (record && WatchpointOwnerIsStale(owner)) {
 				// A recently-retired arm is worth a report for a bounded grace
 				// period; older stale arms are still consumed, just not reported.
@@ -632,7 +718,8 @@ namespace hs
 			// Traps that stop watching this thread's slot: a degradation candidate
 			// (the drainer will release it) and a stale arm (the address is gone).
 			// A BENIGN write keeps the slot armed -- that is the point of FIX 3, and
-			// a data breakpoint is a trap, so the store itself cannot re-fire.
+			// a data breakpoint is a trap, so the store itself cannot re-fire. A
+			// post-free link is benign in exactly this sense and keeps the watch.
 			if (WatchpointOwnerIsStale(owner) || record) {
 				clearedDr7 = Dr7ClearSlot(clearedDr7, slot);
 			}
@@ -645,7 +732,33 @@ namespace hs
 		}
 
 		if (!handled) {
-			return EXCEPTION_CONTINUE_SEARCH;
+			// 0.6.3 DELIVERABLE 1. The classifier could not attribute this #DB,
+			// but the structural rule says consume it anyway. Record the raw
+			// evidence into the preallocated ring BEFORE dealing with it: no
+			// allocation, no lock, no std::string, no spdlog. If the 0.6.2 fatal
+			// case recurs, this is the data that was missing.
+			WatchpointReport report;
+			report.tick = now;
+			report.writerRip = static_cast<std::uintptr_t>(context->Rip);
+			report.threadId = selfTid;
+			report.dr6 = static_cast<std::uint32_t>(dr6);
+			report.dr7 = static_cast<std::uint32_t>(dr7);
+			report.everArmedMask = everMask;
+			report.anyDrProgrammed = everProgrammed;
+			report.flags = kWatchReportUnattributed;
+			for (std::size_t slot = 0; slot < kWatchpointSlotCount; ++slot) {
+				report.drAddress[slot] = static_cast<std::uintptr_t>(drAddress[slot]);
+			}
+			WatchpointReports::Get().Record(report);
+			_unattributed.fetch_add(1, std::memory_order_relaxed);
+
+			// We do not know which (if any) DR fired, so we cannot clear a slot.
+			// Clear DR6 and the trap flag: an unattributed #DB must not re-fire on
+			// the next instruction and turn one swallowed exception into a storm.
+			context->Dr6 = 0;
+			context->EFlags &= ~0x100u;  // clear TF so a trap-flag single step cannot re-fire
+			BumpGeneration();
+			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 
 		// The trap is a trap: the store has already completed. Resume at the next
@@ -701,9 +814,10 @@ namespace hs
 
 		WatchpointSlots::Get().ClearAll(::GetTickCount64());
 		WatchpointReports::Get().Shutdown();
-		logger::info("watchpoints: final state: {} slot(s) occupied, {} claims, {} claim drops, {} releases, {} trips",
+		logger::info("watchpoints: final state: {} slot(s) occupied, {} claims, {} claim drops, {} releases, {} trips, {} unattributed #DB(s) consumed, {} post-free link(s) suppressed",
 			WatchpointSlots::Get().OccupiedCount(), WatchpointSlots::Get().Claims(), WatchpointSlots::Get().ClaimDrops(),
-			WatchpointSlots::Get().Releases(), WatchpointSlots::Get().Trips());
+			WatchpointSlots::Get().Releases(), WatchpointSlots::Get().Trips(),
+			_unattributed.load(std::memory_order_relaxed), _postFreeSuppressed.load(std::memory_order_relaxed));
 	}
 
 	WatchpointStats Watchpoints::Stats() const noexcept
@@ -728,6 +842,8 @@ namespace hs
 		stats.reportsRecorded = reports.Recorded();
 		stats.reportsDropped = reports.Dropped();
 		stats.reportsDrained = _drained.load(std::memory_order_relaxed);
+		stats.unattributedTraps = _unattributed.load(std::memory_order_relaxed);
+		stats.postFreeLinksSuppressed = _postFreeSuppressed.load(std::memory_order_relaxed);
 		stats.considerCount = plan.considered;
 		stats.selectedCount = plan.selected;
 		stats.queueEvictions = plan.queueEvictions;

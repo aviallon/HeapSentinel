@@ -45,6 +45,7 @@ namespace hs
 		std::uintptr_t valueAtArm = 0;   // first qword when the watch was armed
 		std::uintptr_t allocSite = 0;    // the Scaleform allocation site, when known
 		std::uint64_t  armedTick = 0;
+		std::uint64_t  freeTick = 0;     // the tick Release() recorded the block's free (0 = not released)
 		std::uint32_t  generation = 0;
 		std::uint32_t  flags = 0;
 		std::uint32_t  threadId = 0;
@@ -132,6 +133,7 @@ namespace hs
 			std::uintptr_t             valueAtArm = 0;
 			std::uintptr_t             allocSite = 0;
 			std::uint64_t              armedTick = 0;
+			std::uint64_t              freeTick = 0;
 			std::uint32_t              generation = 0;
 			std::uint32_t              flags = 0;
 			std::uint32_t              threadId = 0;
