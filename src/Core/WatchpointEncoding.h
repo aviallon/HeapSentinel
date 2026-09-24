@@ -216,10 +216,7 @@ namespace hs
 	// is genuinely foreign and is passed on.
 	[[nodiscard]] constexpr bool MustConsumeDebugException(bool a_everProgrammedAnyDr) noexcept
 	{
-		// MUTATION PROOF (temporary, reverted): break the structural rule so an
-		// unattributed #DB escapes. The Windows tests must fail.
-		(void)a_everProgrammedAnyDr;
-		return false;
+		return a_everProgrammedAnyDr;
 	}
 
 	// How long after a block's recorded free a first-word write is still the
