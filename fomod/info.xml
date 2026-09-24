@@ -2,7 +2,7 @@
 <fomod>
   <Name>HeapSentinel</Name>
   <Author>aviallon</Author>
-  <Version>0.6.4</Version>
+  <Version>0.6.5</Version>
   <Description>HeapSentinel is an SKSE plugin that retrofits a memory sentinel onto a running Skyrim SE/AE process. It does not fix crashes: it tells you which mod caused one, by tracking the engine and Scaleform allocators, keeping a shadow ledger with alloc and free call stacks, and printing provenance from a vectored exception handler. Pick a memory / attribution profile in the installer.</Description>
   <Website>https://github.com/aviallon/HeapSentinel</Website>
 </fomod>
