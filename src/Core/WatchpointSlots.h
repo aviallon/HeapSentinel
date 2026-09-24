@@ -46,6 +46,11 @@ namespace hs
 		std::uintptr_t allocSite = 0;    // the Scaleform allocation site, when known
 		std::uint64_t  armedTick = 0;
 		std::uint64_t  freeTick = 0;     // the tick Release() recorded the block's free (0 = not released)
+		// 0.6.5: allocation-instance matching (see WatchpointEncoding.h).
+		// `allocInstance` is the allocation this watch armed (0 = unknown);
+		// `freeInstance` is the allocation the Release free belonged to (0 = unknown).
+		std::uint64_t  allocInstance = 0;
+		std::uint64_t  freeInstance = 0;
 		std::uint32_t  generation = 0;
 		std::uint32_t  flags = 0;
 		std::uint32_t  threadId = 0;
@@ -72,13 +77,14 @@ namespace hs
 		// trap path and the drainer can apply the benign-vs-degradation rule
 		// without ever calling the locking module map themselves.
 		bool Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, bool a_armedWasCode, std::uintptr_t a_allocSite,
-			std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex) noexcept;
+			std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex,
+			std::uint64_t a_allocInstance = 0) noexcept;
 
 		// Mark the slot holding `a_address` released (the block was freed). The
 		// watch can stay armed in already-armed threads until the next re-arm
 		// cycle; a stale watch is harmless and may catch a re-use. Returns true
 		// when a slot matched.
-		bool Release(std::uintptr_t a_address, std::uint64_t a_tick) noexcept;
+		bool Release(std::uintptr_t a_address, std::uint64_t a_tick, std::uint64_t a_freeInstance = 0) noexcept;
 
 		// Mark the slot with this index tripped, so it is not re-armed.
 		bool MarkTripped(std::size_t a_index, std::uint64_t a_tick) noexcept;
@@ -134,6 +140,8 @@ namespace hs
 			std::uintptr_t             allocSite = 0;
 			std::uint64_t              armedTick = 0;
 			std::uint64_t              freeTick = 0;
+			std::uint64_t              allocInstance = 0;
+			std::uint64_t              freeInstance = 0;
 			std::uint32_t              generation = 0;
 			std::uint32_t              flags = 0;
 			std::uint32_t              threadId = 0;

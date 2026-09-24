@@ -277,7 +277,7 @@ HS_TEST(stats_format_includes_every_counter)
 	// 0.6.4: the suppression and measurement counters are on the same line, so a
 	// trip's summary says WHY reports were silent and whether the debug-register
 	// state was actually measured.
-	HS_CHECK(joined.find("suppressed 25 post-free link(s) + 26 realloc-in-progress write(s), 27 free-predates-arm report(s)") !=
+	HS_CHECK(joined.find("suppressed 25 post-free link(s) + 26 realloc-in-progress write(s), 27 free-predates-arm/other-allocation report(s)") !=
 		std::string::npos);
 	HS_CHECK(joined.find("28 failed (no measurement), 29 succeeded and found no debug register") != std::string::npos);
 	HS_CHECK(joined.find("health GREEN") != std::string::npos);

@@ -357,6 +357,10 @@ namespace hs
 			info.allocSite = a_site;
 			info.allocStack = a_stack;
 			info.allocTick = NowTick();
+			// 0.6.5 (CHANGE 1): mint the per-allocation instance id. It travels with
+			// the allocation into the ledger, the watch slot and the free ring, so a
+			// free can be matched to the allocation it actually belongs to.
+			info.allocInstance = NextAllocationInstance();
 			info.vtableAtAlloc = SafeReadFirstQword(a_ptr);
 			ShadowLedger::Get().Insert(info.ptr, info);
 		}
@@ -392,14 +396,28 @@ namespace hs
 			return ShadowLedger::Get().Find(a_address, info) ? info.size : 0;
 		}
 
-		void RecordScaleformFree(void* a_mem, std::size_t a_size, std::uintptr_t a_vtableAtFree, void* a_site,
-			std::uint32_t a_stack, std::uint64_t a_tick, std::uint32_t a_poisonIndex)
+		// Mark the ledger's record for this block freed and return the allocation
+		// instance it belonged to. Split from the durable free record (0.6.5,
+		// CHANGE 2) because the ledger update must happen BEFORE the original free:
+		// after o_SfFree returns, a concurrent allocation of the same address could
+		// already be in the ledger, and marking THAT one freed would be a false
+		// record. The free RING record, by contrast, is published after the free so
+		// its tick is the allocator's own (see PublishScaleformFreeRecord).
+		std::uint64_t MarkScaleformFreeInLedger(void* a_mem, std::size_t a_size, std::uintptr_t a_vtableAtFree,
+			void* a_site, std::uint32_t a_stack, std::uint64_t a_tick, std::uint32_t a_poisonIndex)
 		{
 			const auto address = reinterpret_cast<std::uintptr_t>(a_mem);
+
+			// 0.6.5 (CHANGE 1): the allocation instance this free belongs to, read
+			// BEFORE the ledger record is marked freed. It travels into the free ring
+			// so the classifier can tell this block's own free from a stale record of
+			// a PREVIOUS incarnation of a recycled address.
+			std::uint64_t allocInstance = 0;
 
 			if (Config::Get().ledgerEnabled) {
 				AllocationInfo info;
 				if (ShadowLedger::Get().Find(address, info)) {
+					allocInstance = info.allocInstance;
 					info.flags |= kFlagFreed | kFlagScaleform | kFlagFreedBySF;
 					if (a_poisonIndex != 0) {
 						info.flags |= kFlagPoisoned;
@@ -427,18 +445,38 @@ namespace hs
 					ShadowLedger::Get().Insert(address, fresh);
 				}
 			}
+			return allocInstance;
+		}
 
-			// Durable provenance, evict-oldest and separately budgeted.
+		// Publish the durable free record. 0.6.5 (CHANGE 2) calls this AFTER the
+		// original free returns, so `a_tick` is the allocator's own free time and the
+		// allocator's link write lands at or just before it: that is what lets the
+		// bookkeeping window be two ticks instead of 250 ms. `a_allocInstance` is
+		// carried from MarkScaleformFreeInLedger, read before the free.
+		void PublishScaleformFreeRecord(void* a_mem, std::size_t a_size, std::uintptr_t a_vtableAtFree, void* a_site,
+			std::uint32_t a_stack, std::uint64_t a_tick, std::uint32_t a_poisonIndex, std::uint64_t a_allocInstance)
+		{
 			ScaleformFreeRecord record;
-			record.ptr = address;
+			record.ptr = reinterpret_cast<std::uintptr_t>(a_mem);
 			record.vtableAtFree = a_vtableAtFree;
 			record.size = a_size;
 			record.freeSite = a_site;
 			record.freeStack = a_stack;
 			record.poisonIndex = a_poisonIndex;
 			record.freeTick = a_tick;
+			record.allocInstance = a_allocInstance;
 			record.threadId = ::GetCurrentThreadId();
 			ScaleformFreeRing::Get().Record(record);
+		}
+
+		// The combined form, for the paths where there is no original free call to
+		// bracket (a withheld/poisoned free): both phases run with the same tick.
+		void RecordScaleformFree(void* a_mem, std::size_t a_size, std::uintptr_t a_vtableAtFree, void* a_site,
+			std::uint32_t a_stack, std::uint64_t a_tick, std::uint32_t a_poisonIndex)
+		{
+			const auto allocInstance =
+				MarkScaleformFreeInLedger(a_mem, a_size, a_vtableAtFree, a_site, a_stack, a_tick, a_poisonIndex);
+			PublishScaleformFreeRecord(a_mem, a_size, a_vtableAtFree, a_site, a_stack, a_tick, a_poisonIndex, allocInstance);
 		}
 
 		// Really free one withheld block. The heap pointer is validated before we
@@ -612,8 +650,19 @@ namespace hs
 				return;  // real free withheld; a later call through the block hits poison
 			}
 
-			RecordScaleformFree(a_mem, size, vtableAtFree, site, stack, tick, 0);
+			// 0.6.5 (CHANGE 2): mark the ledger record freed BEFORE the original free
+			// (so a concurrent re-allocation of the same address cannot be mistaken
+			// for this one), then call the original, then publish the free RING record
+			// with a tick taken AFTER it returns. The allocator's free-list link write
+			// happens INSIDE o_SfFree, so recording after it returns puts the record AT
+			// or AFTER the write instead of up to 114 ms before it. That is what lets
+			// the allocator-bookkeeping window shrink from 250 ms to two ticks without
+			// reporting the allocator's own bookkeeping. OnScaleformFree above still
+			// marks the slot released BEFORE the free, so a write-after-free in the gap
+			// is still recognised from the slot's own release evidence.
+			const auto allocInstance = MarkScaleformFreeInLedger(a_mem, size, vtableAtFree, site, stack, tick, 0);
 			o_SfFree(a_self, a_mem);
+			PublishScaleformFreeRecord(a_mem, size, vtableAtFree, site, stack, NowTick(), 0, allocInstance);
 		}
 
 		void* hk_SfRealloc(void* a_self, void* a_oldMem, std::size_t a_newSize)

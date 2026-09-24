@@ -124,6 +124,7 @@ namespace hs
 			std::atomic<std::uintptr_t> valueAtArm{ 0 };
 			std::atomic<std::uintptr_t> allocSite{ 0 };
 			std::atomic<std::uint64_t>  armedAt{ 0 };
+			std::atomic<std::uint64_t>  allocInstance{ 0 };  // 0.6.5: allocation instance armed here
 			std::atomic<std::uint32_t>  generation{ 0 };
 			std::atomic<bool>           armedWasCode{ false };
 		};
@@ -146,12 +147,16 @@ namespace hs
 		void RotateHeld(std::uint64_t a_now) noexcept;
 		void SweepThreads(std::uint64_t a_now, bool a_force) noexcept;
 		void DrainReports() noexcept;
-		// 0.6.4 FIX B: resolve the free tick the classifier must use. ALWAYS
-		// consults ScaleformFreeRing and prefers its newest record for the address
-		// over the slot snapshot's Release tick (which was the 0.6.3 shadowing bug).
-		// Lock-free (Bloom + seqlock), so the trap path may call it; `a_outSource`
-		// receives the FreeTickSource that won, for the record and the log.
-		[[nodiscard]] static std::uint64_t ResolveFreeTick(std::uint64_t a_slotFreeTick, std::uintptr_t a_address,
+		// 0.6.5 (CHANGE 1+2): resolve the free EVIDENCE the classifier must use.
+		// ALWAYS consults ScaleformFreeRing and prefers its newest record for the
+		// address over the slot snapshot's Release tick (the 0.6.3 shadowing bug),
+		// and returns the allocation INSTANCE paired with the tick that won -- the
+		// ring never invalidates a record on recycling, so a tick alone cannot say
+		// whether the free belongs to this allocation. Lock-free (Bloom + seqlock),
+		// so the trap path may call it; `a_outInstance` and `a_outSource` receive the
+		// instance and FreeTickSource that won, for the record and the log.
+		[[nodiscard]] static std::uint64_t ResolveFreeEvidence(std::uint64_t a_slotFreeTick,
+			std::uint64_t a_slotFreeInstance, std::uintptr_t a_address, std::uint64_t* a_outInstance,
 			std::uint32_t* a_outSource) noexcept;
 		[[nodiscard]] bool AllocSiteMatches(std::uintptr_t a_site) const noexcept;
 		[[nodiscard]] bool ResolveAllocSiteFilter();

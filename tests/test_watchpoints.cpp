@@ -5,6 +5,7 @@
 #include "Core/WatchpointReports.h"
 #include "Core/WatchpointSlots.h"
 #include "Core/ScaleformFreeRing.h"
+#include "Core/ShadowLedger.h"
 #include "Ipc/Sampling.h"
 
 #include <array>
@@ -171,10 +172,13 @@ HS_TEST(watchpoint_free_classifier_keeps_the_two_allocator_cases_apart)
 	// RECALL vs FORWARD: the free record landing AFTER the trap is the realloc
 	// case (hk_SfRealloc calls o_SfRealloc first), a DIFFERENT context from the
 	// post-free link -- forcing it through the post-free window is the 0.6.3 bug.
-	// The 17:56:55 corpus rows: trap 261486322 / 261486342, ring free 261486289.
-	HS_CHECK(ClassifyWriteAgainstFree(261486289ull, 0, 261486322ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
-	HS_CHECK(ClassifyWriteAgainstFree(261486322ull, 0, 261486289ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
-	HS_CHECK(ClassifyWriteAgainstFree(261486289ull, 0, 261486289ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	// (The 17:56:55 corpus rows logged trap 261486322/261486342 against ring free
+	// 261486289, a 33 ms gap that the 0.6.4 recording produced and that the 0.6.5
+	// two-tick window deliberately no longer calls bookkeeping. The ORDERING is
+	// what this test pins, so the ticks are synthetic and inside the window.)
+	HS_CHECK(ClassifyWriteAgainstFree(100ull, 0, 110ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	HS_CHECK(ClassifyWriteAgainstFree(110ull, 0, 100ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
+	HS_CHECK(ClassifyWriteAgainstFree(100ull, 0, 100ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
 	// A free far in the future is not a realloc: it is not bookkeeping, so it is
 	// never suppressed.
 	HS_CHECK(ClassifyWriteAgainstFree(100ull + kWindow + 1ull, 0, 100ull, kWindow) == WatchpointFreeContext::kDelayedWriteAfterFree);
@@ -184,6 +188,7 @@ HS_TEST(watchpoint_free_classifier_keeps_the_two_allocator_cases_apart)
 	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kPostFreeLink));
 	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kReallocInProgress));
 	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kFreePredatesArm));
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kFreePredatesAllocation));
 	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kDelayedWriteAfterFree));
 	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kLive));
 
@@ -193,12 +198,17 @@ HS_TEST(watchpoint_free_classifier_keeps_the_two_allocator_cases_apart)
 	HS_CHECK(ClassifyWriteAgainstFree(1000ull, 2000ull, 9000ull, kWindow) == WatchpointFreeContext::kFreePredatesArm);
 	// ...but a write before the arm that is ALSO before the free is the realloc
 	// ordering, because the free is not older than the arm in that case.
-	HS_CHECK(ClassifyWriteAgainstFree(2000ull, 1000ull, 1900ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
+	HS_CHECK(ClassifyWriteAgainstFree(1000ull, 500ull, 990ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
 
-	// The window is one bound, used on BOTH sides (0.6.4). It is larger than the
-	// 0.6.3 32 ms because the trip measured our own free hook's latency between
-	// the tick we record and the original free call / o_SfRealloc return.
-	HS_CHECK(hs::kAllocatorBookkeepingWindowMs >= 165ull);
+	// The window is one bound, used on BOTH sides. 0.6.4 widened it to 250 ms to
+	// cover our own hook latency (the free was recorded BEFORE the original free
+	// call). 0.6.5 records the free AFTER the call, so the window shrinks back to
+	// the allocator's own bookkeeping: a couple of ticks. The bound that matters
+	// is that it is SMALLER than the 174 ms gap of the QuickLootIE write 0.6.4
+	// silenced -- a window >= 174 would silence that write again.
+	HS_CHECK(hs::kAllocatorBookkeepingWindowMs >= 16ull);   // at least one Windows timer tick
+	HS_CHECK(hs::kAllocatorBookkeepingWindowMs <= 32ull);   // two ticks, not the 0.6.4 250
+	HS_CHECK(hs::kAllocatorBookkeepingWindowMs < 174ull);   // does not silence the QuickLootIE write
 }
 
 HS_TEST(watchpoint_prefers_the_free_rings_newest_record_over_the_slot_tick)
@@ -221,11 +231,13 @@ HS_TEST(watchpoint_prefers_the_free_rings_newest_record_over_the_slot_tick)
 	hs::ScaleformFreeRecord record;
 	record.ptr = 0xA3AC1410ull;
 	record.freeTick = 261487115ull;
+	record.allocInstance = 99ull;
 	ring.Record(record);
 
 	hs::ScaleformFreeRecord found;
 	HS_CHECK(ring.Find(0xA3AC1410ull, found));
 	HS_CHECK_EQ(found.freeTick, 261487115ull);
+	HS_CHECK_EQ(found.allocInstance, 99ull);  // 0.6.5: the instance travels with the free
 
 	const auto slotTick = 261486289ull;                 // the stale slot Release tick
 	const auto trap = 261487115ull;                     // the run's trap tick
@@ -250,6 +262,114 @@ HS_TEST(watchpoint_prefers_the_free_rings_newest_record_over_the_slot_tick)
 	HS_CHECK(std::string{ hs::WatchpointFreeContextName(hs::WatchpointFreeContext::kFreePredatesArm) } == "free-predates-arm");
 
 	ring.Shutdown();
+}
+
+HS_TEST(watchpoint_instance_match_proves_a_free_belongs_to_this_allocation)
+{
+	using hs::FreeInstanceMatch;
+	using hs::WatchpointFreeContext;
+	constexpr std::uint64_t kWindow = hs::kAllocatorBookkeepingWindowMs;
+
+	// Unknown on either side is not a proof either way (the allocation may have
+	// been evicted, the ledger may be off, or the record predates the field).
+	HS_CHECK(hs::MatchFreeInstance(0, 0) == FreeInstanceMatch::kUnknown);
+	HS_CHECK(hs::MatchFreeInstance(7, 0) == FreeInstanceMatch::kUnknown);
+	HS_CHECK(hs::MatchFreeInstance(0, 7) == FreeInstanceMatch::kUnknown);
+	// Both known and equal: this IS the armed allocation's own free.
+	HS_CHECK(hs::MatchFreeInstance(7, 7) == FreeInstanceMatch::kSame);
+	// Both known and different: the free belongs to another incarnation.
+	HS_CHECK(hs::MatchFreeInstance(7, 8) == FreeInstanceMatch::kDifferent);
+
+	// THE POINT OF CHANGE 1. This is the recycled-address hazard the tick test
+	// cannot see: a free recorded AFTER the arm (so the tick test would treat it
+	// as the allocator's own post-free link and SILENCE the write) that belongs to
+	// a DIFFERENT allocation. A known mismatch reports it instead.
+	HS_CHECK(hs::ClassifyWriteAgainstFree(2000ull, 1000ull, 2010ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(FreeInstanceMatch::kDifferent, 2000ull, 1000ull, 2010ull, kWindow) ==
+		WatchpointFreeContext::kFreePredatesAllocation);
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kFreePredatesAllocation));
+	// A same-instance free is still matched, and an unknown one falls back to the
+	// tick classifier rather than inventing a mismatch we cannot prove.
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(FreeInstanceMatch::kSame, 2000ull, 1000ull, 2010ull, kWindow) ==
+		WatchpointFreeContext::kPostFreeLink);
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(FreeInstanceMatch::kUnknown, 2000ull, 1000ull, 2010ull, kWindow) ==
+		WatchpointFreeContext::kPostFreeLink);
+
+	// A free tick that predates the arm keeps the free-predates-arm label even
+	// when the instances also disagree: the tick is the logged evidence, and the
+	// corpus's six free-predates-arm rows must not be relabelled by the instance
+	// refinement.
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(FreeInstanceMatch::kDifferent, 1000ull, 2000ull, 9000ull, kWindow) ==
+		WatchpointFreeContext::kFreePredatesArm);
+	// No free record at all is still kLive, not a mismatch.
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(FreeInstanceMatch::kDifferent, 0ull, 2000ull, 9000ull, kWindow) ==
+		WatchpointFreeContext::kLive);
+
+	// Every outcome has a name (the log prints it).
+	HS_CHECK(std::string{ hs::FreeInstanceMatchName(FreeInstanceMatch::kSame) } == "same-allocation");
+	HS_CHECK(std::string{ hs::FreeInstanceMatchName(FreeInstanceMatch::kDifferent) } == "different-allocation");
+	HS_CHECK(std::string{ hs::FreeInstanceMatchName(FreeInstanceMatch::kUnknown) } == "unproven");
+	HS_CHECK(std::string{ hs::WatchpointFreeContextName(WatchpointFreeContext::kFreePredatesAllocation) } ==
+		"free-predates-allocation");
+}
+
+HS_TEST(watchpoint_allocation_instance_ids_are_monotonic_and_non_zero)
+{
+	// 0 is reserved for "unknown", so the counter starts at 1 and never repeats.
+	const auto a = hs::NextAllocationInstance();
+	const auto b = hs::NextAllocationInstance();
+	const auto c = hs::NextAllocationInstance();
+	HS_CHECK(a != 0u);
+	HS_CHECK(b > a);
+	HS_CHECK(c > b);
+
+	// The ledger carries the id with the allocation, so the free hook can read it
+	// back when the block is freed.
+	auto& ledger = hs::ShadowLedger::Get();
+	ledger.Init(256, 4, 8);
+	hs::AllocationInfo info;
+	info.ptr = Aligned(1);
+	info.size = 72;
+	info.flags = hs::kFlagLive | hs::kFlagScaleform;
+	info.allocInstance = hs::NextAllocationInstance();
+	ledger.Insert(info.ptr, info);
+
+	hs::AllocationInfo found;
+	HS_CHECK(ledger.Find(info.ptr, found));
+	HS_CHECK_EQ(found.allocInstance, info.allocInstance);
+	ledger.Shutdown();
+}
+
+HS_TEST(watchpoint_slot_records_the_allocation_instance_and_the_free_instance)
+{
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+
+	// The arm carries the instance of the allocation it watched.
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(Aligned(1), 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 100, 1, 7, index,
+		/*allocInstance=*/4242));
+	hs::WatchSlotSnapshot snap{};
+	HS_CHECK(slots.ReadSlot(0, snap));
+	HS_CHECK_EQ(snap.allocInstance, 4242ull);
+	HS_CHECK_EQ(snap.freeInstance, 0ull);  // live: no free
+
+	// Release pairs the free tick with the instance of the allocation freed.
+	HS_CHECK(slots.Release(Aligned(1), 188333102ull, /*freeInstance=*/4242));
+	HS_CHECK(slots.ReadSlot(0, snap));
+	HS_CHECK_EQ(snap.freeTick, 188333102ull);
+	HS_CHECK_EQ(snap.freeInstance, 4242ull);
+	HS_CHECK_EQ(snap.allocInstance, 4242ull);  // the arm instance is kept through the release
+	HS_CHECK(hs::MatchFreeInstance(snap.allocInstance, snap.freeInstance) == hs::FreeInstanceMatch::kSame);
+
+	// A slot reclaimed for another block must not inherit the old instances.
+	HS_CHECK(slots.Claim(Aligned(2), 0x0, false, 0, 200, 2, 7, index, /*allocInstance=*/5150));
+	HS_CHECK(slots.ReadSlot(0, snap));
+	HS_CHECK_EQ(snap.allocInstance, 5150ull);
+	HS_CHECK_EQ(snap.freeInstance, 0ull);
+	HS_CHECK_EQ(snap.freeTick, 0ull);
+
+	slots.ResetForTesting();
 }
 
 HS_TEST(watchpoint_debug_register_measurement_distinguishes_failed_from_zero)
@@ -783,17 +903,15 @@ HS_TEST(watchpoint_slots_clear_all_reports_what_it_cleared)
 
 HS_TEST(watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_designed)
 {
-	// The v0.6.3 in-game trip (2026-09-24, build 4f409330007c) produced 21
-	// watchpoint-write reports. 18 of them share the allocator-bookkeeping shape:
-	// the armed value was a genuine vtable in the exe range and the value after
-	// the write was a heap pointer or 0. The ticks below are the run's own
-	// numbers, read out of HeapSentinel.log / HeapSentinel-reports.log:
+	// The v0.6.3 in-game trip (2026-09-24, build 4f409330007c) produced 26
+	// watchpoint-write reports; the same reports log also holds two earlier ones
+	// (a v0.6.1 write and the v0.6.2 post-free link), so the whole live corpus is
+	// 28 reports. The ticks below are the run's own numbers, read out of
+	// HeapSentinel.log / HeapSentinel-reports.log:
 	//   trapTick      = trap_tick
-	//   slotFreeTick  = the 0.6.3 report's free_tick (the slot's Release tick)
+	//   slotFreeTick  = the report's free_tick (the slot's Release tick)
 	//   ringFreeTick  = "Scaleform free record: freed at tick X" (the free ring)
 	//   armTick       = armed_tick
-	// The expectation is the 0.6.4 rule: free = max(slot, ring), one bounded
-	// window on both sides, and only the two ALLOCATOR orderings suppressed.
 	struct Row
 	{
 		std::uint64_t           trap;
@@ -802,101 +920,172 @@ HS_TEST(watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_design
 		std::uint64_t           arm;
 		bool                    staleArm;
 		const char*             writer;
+		// 0.6.5 (CHANGE 1). The run did not log allocation-instance ids, so the
+		// relation is MODELLED from the logged ordering, which is the only evidence
+		// the corpus has: a free record recorded before the arm cannot be this
+		// allocation's free (it is a previous incarnation of a recycled address),
+		// and a free recorded at/after the arm of a block we watched is modelled as
+		// the same allocation. That is stated as a model, not as a measurement.
+		hs::FreeInstanceMatch   instanceMatch;
+		// 0.6.5 (CHANGE 2). True for the allocator-bookkeeping shapes: the write is
+		// the allocator's free-list link, which happens INSIDE the free/realloc call
+		// that the 0.6.5 hook now brackets, so the recorded free lands at or after
+		// the trap. The corpus models the recorded-after-the-call tick as the trap
+		// tick. False for a write whose free is a separate, earlier event.
+		bool                    allocatorShape;
 		hs::WatchpointFreeContext expected;
 	};
 
 	const Row rows[] = {
-		{ 261331396ull, 261331347ull, 261331427ull, 261331347ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261343708ull, 261331329ull, 261331329ull, 261332401ull, false, "VCRUNTIME140.dll+0x1294B", hs::WatchpointFreeContext::kFreePredatesArm },
-		{ 261350107ull, 261350022ull, 261350022ull, 261350022ull, false, "SkyrimSE.exe+0x1191FD6", hs::WatchpointFreeContext::kPostFreeLink },
-		{ 261373926ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::WatchpointFreeContext::kPostFreeLink },
-		{ 261373974ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::WatchpointFreeContext::kPostFreeLink },
-		{ 261418699ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11918CE", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261418718ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11920CA", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261420558ull, 261418700ull, 261418700ull, 261418808ull, false, "SkyrimSE.exe+0x11922AB", hs::WatchpointFreeContext::kFreePredatesArm },
-		{ 261423083ull, 261423031ull, 261423177ull, 261423031ull, false, "SkyrimSE.exe+0x11920F4", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452716ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452719ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452740ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452748ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452793ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261452824ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261486322ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x119234E", hs::WatchpointFreeContext::kPostFreeLink },
-		{ 261486342ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x11922D0", hs::WatchpointFreeContext::kPostFreeLink },
-		// The case named in the 0.6.3 report: the stale slot Release tick (826 ms
-		// early) shadowed the ring's newest record, so a delta of 0 was reported
-		// with a delta of 826.
-		{ 261487115ull, 261486289ull, 261487115ull, 261486555ull, false, "SkyrimSE.exe+0x119214E", hs::WatchpointFreeContext::kPostFreeLink },
-		{ 261745821ull, 261745750ull, 261745985ull, 261745750ull, false, "SkyrimSE.exe+0x11917BA", hs::WatchpointFreeContext::kReallocInProgress },
-		{ 261788348ull, 261788288ull, 261788288ull, 261788288ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kPostFreeLink },
+		// The two reports from earlier sessions in the same log.
+		{ 183400104ull, 0ull, 0ull, 183386401ull, false, "VCRUNTIME140.dll+0x1282E", hs::FreeInstanceMatch::kUnknown, false, hs::WatchpointFreeContext::kLive },
+		{ 188333103ull, 188333102ull, 188333102ull, 188333102ull, false, "SkyrimSE.exe+0x11917BA", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		// The 21 reports of the 17:53-18:02 window (the v0.6.3 trip proper).
+		{ 261331396ull, 261331347ull, 261331427ull, 261331347ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261343708ull, 261331329ull, 261331329ull, 261332401ull, false, "VCRUNTIME140.dll+0x1294B", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 261350107ull, 261350022ull, 261350022ull, 261350022ull, false, "SkyrimSE.exe+0x1191FD6", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261373926ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261373974ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261418699ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11918CE", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261418718ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11920CA", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261420558ull, 261418700ull, 261418700ull, 261418808ull, false, "SkyrimSE.exe+0x11922AB", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 261423083ull, 261423031ull, 261423177ull, 261423031ull, false, "SkyrimSE.exe+0x11920F4", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452716ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452719ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452740ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452748ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452793ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261452824ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261486322ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x119234E", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261486342ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x11922D0", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261487115ull, 261486289ull, 261487115ull, 261486555ull, false, "SkyrimSE.exe+0x119214E", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261745821ull, 261745750ull, 261745985ull, 261745750ull, false, "SkyrimSE.exe+0x11917BA", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261788348ull, 261788288ull, 261788288ull, 261788288ull, false, "SkyrimSE.exe+0x1193AD5", hs::FreeInstanceMatch::kSame, true, hs::WatchpointFreeContext::kPostFreeLink },
 		// 12.4 s after the free, and its `after` value is a code pointer, so the
-		// drainer's benign shape rule drops it anyway. It is kept here as the
-		// corpus's genuine delayed-write row.
-		{ 261826937ull, 261817722ull, 261817722ull, 261817722ull, false, "SkyrimSE.exe+0x140D177B5", hs::WatchpointFreeContext::kDelayedWriteAfterFree },
+		// drainer's benign shape rule drops it anyway. Kept as the genuine
+		// delayed-write row.
+		{ 261826937ull, 261817722ull, 261817722ull, 261817722ull, false, "SkyrimSE.exe+0x140D177B5", hs::FreeInstanceMatch::kSame, false, hs::WatchpointFreeContext::kDelayedWriteAfterFree },
+		// The five later reports (18:10), which include the two third-party
+		// writers. Four have a free record that PREDATES the arm; the fifth (the
+		// QuickLootIE write at 18:10:34) is the one the 0.6.4 250 ms window
+		// silenced, d = +174 ms.
+		{ 262291339ull, 262279211ull, 262279211ull, 262281394ull, false, "SkyrimSE.exe+0xD5A843", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 262304442ull, 262303166ull, 262303166ull, 262303456ull, false, "QuickLootIE.dll+0x9ADB9", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 262304461ull, 262303166ull, 262303166ull, 262303456ull, false, "SkyrimSE.exe+0xD0500C", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 262304547ull, 262303166ull, 262303166ull, 262303456ull, false, "SkyrimSE.exe+0xD0500C", hs::FreeInstanceMatch::kDifferent, false, hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 262304616ull, 262304442ull, 262303166ull, 262304442ull, false, "QuickLootIE.dll+0x9ADB9", hs::FreeInstanceMatch::kSame, false, hs::WatchpointFreeContext::kDelayedWriteAfterFree },
 	};
 
-	std::size_t suppressed = 0;
-	std::size_t delayed = 0;
-	std::size_t predatesArm = 0;
-	std::size_t postFree = 0;
-	std::size_t reallocInProgress = 0;
+	// ------------------------------------------------------------------
+	// Part A: the HISTORICAL replay. The 21 rows of the v0.6.3 trip, through the
+	// rules 0.6.4 shipped (the ticks the 0.6.3 build logged, and the 250 ms
+	// window). This documents the split the 0.6.4 release notes state -- 18
+	// allocator bookkeeping (7 post-free + 11 realloc-in-progress), 2
+	// free-predates-arm, 1 delayed -- and must not drift. The window literal is
+	// 250 because that IS the v0.6.4 value; the shipped constant is now 32.
+	// ------------------------------------------------------------------
+	constexpr std::uint64_t kV064Window = 250;
+	std::size_t             v064Suppressed = 0;
+	std::size_t             v064PostFree = 0;
+	std::size_t             v064Realloc = 0;
+	std::size_t             v064Predates = 0;
+	std::size_t             v064Delayed = 0;
+	std::size_t             v063Rows = 0;
 	for (const auto& row : rows) {
+		if (row.trap < 260000000ull || row.trap >= 262000000ull) {
+			continue;  // the two pre-v0.6.3 reports, and the five later (18:10) rows
+		}
+		++v063Rows;
 		const auto freeTick = hs::PreferNewestFreeTick(row.slotFree, row.ringFree);
-		const auto got = hs::ClassifyWriteAgainstFree(freeTick, row.arm, row.trap, hs::kAllocatorBookkeepingWindowMs);
-		// HS_CHECK_EQ on the enum would not say which row failed, so compare the
-		// names and let a failure print the row's identity.
+		const auto got = hs::ClassifyWriteAgainstFree(freeTick, row.arm, row.trap, kV064Window);
+		if (hs::FreeContextIsAllocatorBookkeeping(got)) {
+			++v064Suppressed;
+			if (got == hs::WatchpointFreeContext::kReallocInProgress) {
+				++v064Realloc;
+			} else {
+				++v064PostFree;
+			}
+		} else if (got == hs::WatchpointFreeContext::kFreePredatesArm) {
+			++v064Predates;
+		} else if (got == hs::WatchpointFreeContext::kDelayedWriteAfterFree) {
+			++v064Delayed;
+		}
+	}
+	HS_CHECK_EQ(v063Rows, std::size_t{ 21 });
+	HS_CHECK_EQ(v064Suppressed, std::size_t{ 18 });
+	HS_CHECK_EQ(v064PostFree, std::size_t{ 7 });
+	HS_CHECK_EQ(v064Realloc, std::size_t{ 11 });
+	HS_CHECK_EQ(v064Predates, std::size_t{ 2 });
+	HS_CHECK_EQ(v064Delayed, std::size_t{ 1 });
+
+	// ------------------------------------------------------------------
+	// Part B: the v0.6.5 rules over the WHOLE 28-report corpus. An
+	// allocator-shape row's free is recorded inside the call the hook now
+	// brackets, so its tick is modelled as the trap tick; every other row keeps
+	// the logged free tick. The classification is the shipped
+	// ClassifyWriteAgainstFreeInstance, with the 32 ms window.
+	// ------------------------------------------------------------------
+	std::size_t suppressed = 0;
+	std::size_t predates = 0;
+	std::size_t delayed = 0;
+	std::size_t live = 0;
+	std::size_t quickLootRows = 0;
+	std::size_t quickLootReported = 0;
+	for (const auto& row : rows) {
+		const auto freeTick = row.allocatorShape ? row.trap : hs::PreferNewestFreeTick(row.slotFree, row.ringFree);
+		const auto got = hs::ClassifyWriteAgainstFreeInstance(row.instanceMatch, freeTick, row.arm, row.trap,
+			hs::kAllocatorBookkeepingWindowMs);
 		HS_CHECK_MSG(std::string{ hs::WatchpointFreeContextName(got) } ==
 				std::string{ hs::WatchpointFreeContextName(row.expected) },
 			std::string{ "corpus row trap=" } + std::to_string(row.trap) + " writer=" + row.writer + " expected=" +
 				hs::WatchpointFreeContextName(row.expected) + " got=" + hs::WatchpointFreeContextName(got));
 		if (hs::FreeContextIsAllocatorBookkeeping(got)) {
 			++suppressed;
-			if (got == hs::WatchpointFreeContext::kReallocInProgress) {
-				++reallocInProgress;
-			} else {
-				++postFree;
-			}
+		} else if (got == hs::WatchpointFreeContext::kFreePredatesArm ||
+				   got == hs::WatchpointFreeContext::kFreePredatesAllocation) {
+			++predates;
 		} else if (got == hs::WatchpointFreeContext::kDelayedWriteAfterFree) {
 			++delayed;
-		} else if (got == hs::WatchpointFreeContext::kFreePredatesArm) {
-			++predatesArm;
+		} else if (got == hs::WatchpointFreeContext::kLive) {
+			++live;
+		}
+		const std::string writer{ row.writer };
+		if (writer.rfind("QuickLootIE.dll+0x9ADB9", 0) == 0) {
+			++quickLootRows;
+			if (!hs::FreeContextIsAllocatorBookkeeping(got) && got != hs::WatchpointFreeContext::kLive) {
+				++quickLootReported;
+			}
 		}
 	}
+	HS_CHECK_EQ(sizeof(rows) / sizeof(rows[0]), std::size_t{ 28 });
+	HS_CHECK_EQ(suppressed, std::size_t{ 19 });
+	HS_CHECK_EQ(predates, std::size_t{ 6 });
+	HS_CHECK_EQ(delayed, std::size_t{ 2 });
+	HS_CHECK_EQ(live, std::size_t{ 1 });
 
-	// The honest headline, asserted as a NUMBER so it cannot drift silently: of
-	// the 21 writes the trip produced, 18 are allocator bookkeeping and go silent
-	// (7 post-free links and 11 realloc-in-progress writes, a split DESIGN 13.4
-	// states), 2 report because their free evidence predates the arm, and 1 is a
-	// genuine delayed write (which the shape rule drops in the drainer).
-	HS_CHECK_EQ(suppressed, std::size_t{ 18 });
-	HS_CHECK_EQ(postFree, std::size_t{ 7 });
-	HS_CHECK_EQ(reallocInProgress, std::size_t{ 11 });
-	HS_CHECK_EQ(predatesArm, std::size_t{ 2 });
-	HS_CHECK_EQ(delayed, std::size_t{ 1 });
-	HS_CHECK_EQ(sizeof(rows) / sizeof(rows[0]), std::size_t{ 21 });
+	// The headline the whole v0.6.5 change exists for: BOTH third-party writes
+	// survive. One is free-predates-arm, the other is a delayed write whose free
+	// is 174 ms earlier -- the one the 0.6.4 window silenced.
+	HS_CHECK_EQ(quickLootRows, std::size_t{ 2 });
+	HS_CHECK_EQ(quickLootReported, std::size_t{ 2 });
 
-	// The 18 shape-conforming, non-stale rows named in the task: 16 go silent and
-	// 2 remain (the two whose free record predates the arm). This is stated as a
-	// check rather than left implicit, because "the 18 should go silent" was the
-	// expectation and the truth is 16 + 2 labelled.
-	std::size_t shapeConforming = 0;
-	std::size_t shapeConformingSuppressed = 0;
-	for (const auto& row : rows) {
-		if (row.staleArm) {
-			continue;
-		}
-		if (std::string{ row.writer }.rfind("SkyrimSE.exe+0x140D", 0) == 0) {
-			continue;  // the one row whose `after` was a code pointer, not heap/0
-		}
-		++shapeConforming;
-		if (hs::FreeContextIsAllocatorBookkeeping(
-				hs::ClassifyWriteAgainstFree(hs::PreferNewestFreeTick(row.slotFree, row.ringFree), row.arm, row.trap,
-					hs::kAllocatorBookkeepingWindowMs))) {
-			++shapeConformingSuppressed;
-		}
-	}
-	HS_CHECK_EQ(shapeConforming, std::size_t{ 18 });
-	HS_CHECK_EQ(shapeConformingSuppressed, std::size_t{ 16 });
+	// The concrete residual risk v0.6.4 documented, asserted both ways. The
+	// QuickLootIE write at 18:10:34: slot Release tick 262304442, trap 262304616,
+	// d = +174 ms. 0.6.4's 250 ms window called it allocator bookkeeping and
+	// silenced it; the shipped 32 ms window reports it.
+	const auto quickLootFree = hs::PreferNewestFreeTick(262304442ull, 262303166ull);
+	HS_CHECK_EQ(quickLootFree, 262304442ull);
+	HS_CHECK_EQ(262304616ull - quickLootFree, 174ull);
+	HS_CHECK(hs::ClassifyWriteAgainstFree(quickLootFree, 262304442ull, 262304616ull, kV064Window) ==
+		hs::WatchpointFreeContext::kPostFreeLink);  // 0.6.4: silenced
+	HS_CHECK(hs::ClassifyWriteAgainstFree(quickLootFree, 262304442ull, 262304616ull,
+				hs::kAllocatorBookkeepingWindowMs) == hs::WatchpointFreeContext::kDelayedWriteAfterFree);  // 0.6.5: reported
+	// ...and the instance-aware entry point agrees (its free instance is this
+	// allocation's: the 262304442 free is the slot's own Release, not the ring's
+	// stale 262303166 record).
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(hs::FreeInstanceMatch::kSame, quickLootFree, 262304442ull,
+				262304616ull, hs::kAllocatorBookkeepingWindowMs) ==
+		hs::WatchpointFreeContext::kDelayedWriteAfterFree);
 }
 
 HS_TEST(watchpoint_reports_drain_oldest_first)
@@ -1005,6 +1194,21 @@ HS_TEST(watchpoint_report_encoding_carries_the_writer_and_the_value)
 	const auto labelled = hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
 	HS_CHECK(labelled > 0);
 	HS_CHECK(std::string{ buffer }.find("(unreadable)") != std::string::npos);
+
+	// 0.6.5 CHANGE 1: the allocation-instance evidence is in the encoded record, so
+	// a reader can tell whether a free was provably this block's own.
+	report.armedInstance = 4242;
+	report.freeInstance = 4242;
+	report.freeInstanceMatch = static_cast<std::uint32_t>(hs::FreeInstanceMatch::kSame);
+	(void)hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	const std::string instanceText{ buffer };
+	HS_CHECK(instanceText.find("armed_inst=4242") != std::string::npos);
+	HS_CHECK(instanceText.find("free_inst=4242") != std::string::npos);
+	HS_CHECK(instanceText.find("free_inst_match=same-allocation") != std::string::npos);
+	report.freeInstance = 9999;
+	report.freeInstanceMatch = static_cast<std::uint32_t>(hs::FreeInstanceMatch::kDifferent);
+	(void)hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	HS_CHECK(std::string{ buffer }.find("free_inst_match=different-allocation") != std::string::npos);
 
 	// A truncated buffer must still be NUL-terminated and must not overrun.
 	char small[8]{};
@@ -1130,6 +1334,7 @@ namespace
 		std::uintptr_t armAddress[hs::kWatchpointSlotCount] = {};
 		std::uintptr_t armValueAtArm[hs::kWatchpointSlotCount] = {};
 		bool           armWasCode[hs::kWatchpointSlotCount] = {};
+		std::uint64_t  armInstance[hs::kWatchpointSlotCount] = {};  // 0.6.5: allocation instance armed
 
 		// 0.6.3 structural state + the counters the new tests assert.
 		bool           anyDrProgrammed = false;
@@ -1160,6 +1365,9 @@ namespace
 		bool           reportReadable = true;
 		hs::WatchpointFreeContext reportFreeContext = hs::WatchpointFreeContext::kLive;
 		hs::FreeTickSource        reportFreeSource = hs::FreeTickSource::kNone;
+		// 0.6.5 CHANGE 1: the instance evidence for the report.
+		std::uint64_t             reportFreeInstance = 0;
+		hs::FreeInstanceMatch     reportInstanceMatch = hs::FreeInstanceMatch::kUnknown;
 	};
 	TrapModel g_model;
 
@@ -1277,26 +1485,33 @@ namespace
 				valueAtArm = snap.valueAtArm;
 				armedWasCode = snap.armedWasCode;
 			}
-			// 0.6.4 FIX B, the PRODUCTION resolution: always consult the free ring and
-			// prefer its newest record over the slot's Release tick.
+			// 0.6.4 FIX B + 0.6.5 CHANGE 1, the PRODUCTION resolution: always consult
+			// the free ring, prefer its newest record over the slot's Release tick, and
+			// take the allocation instance paired with the tick that won.
 			std::uint64_t         freeTick = tableValid ? snap.freeTick : 0;
+			std::uint64_t         freeInstance = tableValid ? snap.freeInstance : 0;
 			hs::FreeTickSource    freeSource = freeTick != 0 ? hs::FreeTickSource::kSlotSnapshot : hs::FreeTickSource::kNone;
 			hs::ScaleformFreeRecord freeRecord;
 			if (hs::ScaleformFreeRing::Get().Find(watched, freeRecord) && freeRecord.freeTick != 0) {
 				const auto preferred = hs::PreferNewestFreeTick(freeTick, freeRecord.freeTick);
 				if (preferred != freeTick || freeSource == hs::FreeTickSource::kNone) {
 					freeSource = hs::FreeTickSource::kFreeRing;
+					freeInstance = freeRecord.allocInstance;
 				}
 				freeTick = preferred;
 			}
 			const auto armTick = tableValid ? snap.armedTick : 0ull;
-			const auto freeContext = hs::ClassifyWriteAgainstFree(freeTick, armTick, ::GetTickCount64(),
-				hs::kAllocatorBookkeepingWindowMs);
+			const auto armInstance = tableValid ? snap.allocInstance : g_model.armInstance[slot];
+			const auto instanceMatch = hs::MatchFreeInstance(armInstance, freeInstance);
+			const auto freeContext = hs::ClassifyWriteAgainstFreeInstance(instanceMatch, freeTick, armTick,
+				::GetTickCount64(), hs::kAllocatorBookkeepingWindowMs);
 			// Recorded even when the write is then SUPPRESSED: "which context was it" is
 			// part of the evidence, and the suppression counter alone does not say
 			// whether it was the post-free or the realloc ordering.
 			g_model.reportFreeContext = freeContext;
 			g_model.reportFreeSource = freeSource;
+			g_model.reportFreeInstance = freeInstance;
+			g_model.reportInstanceMatch = instanceMatch;
 			std::uintptr_t after = 0;
 			const bool     readable = TestSafeRead(watched, after);
 			bool           record = armedWasCode && readable && after != valueAtArm;
@@ -1308,7 +1523,8 @@ namespace
 					++g_model.postFreeSuppressed;
 				}
 			}
-			if (record && freeContext == hs::WatchpointFreeContext::kFreePredatesArm) {
+			if (record && (freeContext == hs::WatchpointFreeContext::kFreePredatesArm ||
+							  freeContext == hs::WatchpointFreeContext::kFreePredatesAllocation)) {
 				++g_model.freePredatesArm;
 			}
 			if (record) {
@@ -1379,12 +1595,13 @@ namespace
 		auto& slots = hs::WatchpointSlots::Get();
 		slots.ResetForTesting();
 		std::size_t index = 0;
-		HS_CHECK(slots.Claim(a_address, a_valueAtArm, a_armedWasCode, 0, 1000, 1, 1, index));
+		HS_CHECK(slots.Claim(a_address, a_valueAtArm, a_armedWasCode, 0, 1000, 1, 1, index, 1000));
 		HS_CHECK_EQ(index, 0u);
 		g_model.everArmed[0] = true;
 		g_model.armAddress[0] = a_address;
 		g_model.armValueAtArm[0] = a_valueAtArm;
 		g_model.armWasCode[0] = a_armedWasCode;
+		g_model.armInstance[0] = 1000;
 
 		std::uintptr_t addresses[hs::kWatchpointSlotCount] = { a_address, 0, 0, 0 };
 		std::uint64_t  dr7 = 0;
@@ -1802,6 +2019,64 @@ HS_TEST(hw_watchpoint_reports_a_write_whose_free_predates_the_arm)
 	slots.ResetForTesting();
 }
 
+HS_TEST(hw_watchpoint_reports_a_write_whose_free_belongs_to_another_allocation)
+{
+	// (g) 0.6.5 CHANGE 1 on REAL hardware. The free ring's newest record for the
+	// address is NOT older than the arm (so the tick test alone would call it the
+	// allocator's own post-free link and SILENCE the write), but its allocation
+	// instance differs from the one this watch armed: the address was recycled and
+	// the record is a PREVIOUS incarnation's. That must be REPORTED and labelled.
+	g_watchedQword = 0x6FFFFB89DDB8ull;
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;
+
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+	auto& ring = hs::ScaleformFreeRing::Get();
+	ring.Init(64);
+
+	const auto  watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, /*arm tick=*/5000, 1, 1, index,
+		/*allocInstance=*/7001));
+	HS_CHECK_EQ(index, 0u);
+	// The record lands at the trap tick (the post-free shape) but freed allocation
+	// 7000, not the 7001 we armed.
+	hs::ScaleformFreeRecord other;
+	other.ptr = watched;
+	other.freeTick = ::GetTickCount64();
+	other.allocInstance = 7000;
+	ring.Record(other);
+
+	g_model.everArmed[0] = true;
+	g_model.armAddress[0] = watched;
+	g_model.armValueAtArm[0] = 0x6FFFFB89DDB8ull;
+	g_model.armWasCode[0] = true;
+	g_model.armInstance[0] = 7001;
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+
+	const auto handler = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(handler != nullptr);
+
+	g_watchedQword = 0x0;
+
+	HS_CHECK(g_model.consumed);
+	HS_CHECK_EQ(g_model.recorded, 1);            // reported, NOT silenced as a post-free link
+	HS_CHECK_EQ(g_model.postFreeSuppressed, 0);
+	HS_CHECK_EQ(g_model.freePredatesArm, 1);
+	HS_CHECK(g_model.reportInstanceMatch == hs::FreeInstanceMatch::kDifferent);
+	HS_CHECK(g_model.reportFreeContext == hs::WatchpointFreeContext::kFreePredatesAllocation);
+	HS_CHECK(hs::ClassifyWatchedWrite(g_model.reportValueAtArm, g_model.reportArmedWasCode,
+			g_model.reportValueAfter, g_model.reportReadable, /*afterIsCode=*/false) == hs::WatchpointWriteKind::kDegradation);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(handler);
+	ring.Shutdown();
+	slots.ResetForTesting();
+}
+
 #else
 HS_TEST(hw_watchpoint_traps_the_writer_of_a_watched_qword)
 {
@@ -1833,7 +2108,7 @@ HS_TEST(hw_watchpoint_silences_a_realloc_in_progress_write)
 {
 	hstest::Note("Windows-only: needs a real #DB; ClassifyWriteAgainstFree above is the Linux-checkable half");
 	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(
-		hs::ClassifyWriteAgainstFree(20000ull, 10000ull, 19900ull, hs::kAllocatorBookkeepingWindowMs)));
+		hs::ClassifyWriteAgainstFree(10000ull, 5000ull, 9990ull, hs::kAllocatorBookkeepingWindowMs)));
 }
 
 HS_TEST(hw_watchpoint_reports_a_write_whose_free_predates_the_arm)
@@ -1841,5 +2116,14 @@ HS_TEST(hw_watchpoint_reports_a_write_whose_free_predates_the_arm)
 	hstest::Note("Windows-only: needs a real #DB; ClassifyWriteAgainstFree above is the Linux-checkable half");
 	HS_CHECK(hs::ClassifyWriteAgainstFree(1000ull, 5000ull, 90000ull, hs::kAllocatorBookkeepingWindowMs) ==
 		hs::WatchpointFreeContext::kFreePredatesArm);
+}
+
+HS_TEST(hw_watchpoint_reports_a_write_whose_free_belongs_to_another_allocation)
+{
+	hstest::Note("Windows-only: needs a real #DB; ClassifyWriteAgainstFreeInstance above is the Linux-checkable half");
+	// A free at/after the arm (the post-free shape) that belongs to a different
+	// allocation is NOT the allocator's bookkeeping for this write.
+	HS_CHECK(hs::ClassifyWriteAgainstFreeInstance(hs::FreeInstanceMatch::kDifferent, 10000ull, 5000ull, 10000ull,
+				hs::kAllocatorBookkeepingWindowMs) == hs::WatchpointFreeContext::kFreePredatesAllocation);
 }
 #endif

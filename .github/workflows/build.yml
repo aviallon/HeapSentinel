@@ -112,7 +112,7 @@ jobs:
 
           # A green build must not come from a stub: the plugin name, the
           # config section and the report kinds have to be in the binary.
-          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "ScaleformHeap" "WeakLib" "bad-vtable-release" "double-free" "double-free-unverified" "VERDICT" "PoisonOnFree" "bPreventDoubleFree" "GFxResourceWeakLib::PinResource" "GFxResourceWeakLib::RemoveResourceOnRelease" "Watchpoints" "sAllocSiteRvas" "uSamplePrime" "watchpoint-write" "HARDWARE WATCHPOINT" "watchpoint-unattributed" "dr_read=" "DEBUG REGISTER MEASUREMENT" "allocator-realloc-in-progress" "free-predates-arm"; do
+          for needle in "HeapSentinel" "GuardPool" "RefCountGuard" "ScaleformHeap" "WeakLib" "bad-vtable-release" "double-free" "double-free-unverified" "VERDICT" "PoisonOnFree" "bPreventDoubleFree" "GFxResourceWeakLib::PinResource" "GFxResourceWeakLib::RemoveResourceOnRelease" "Watchpoints" "sAllocSiteRvas" "uSamplePrime" "watchpoint-write" "HARDWARE WATCHPOINT" "watchpoint-unattributed" "dr_read=" "DEBUG REGISTER MEASUREMENT" "allocator-realloc-in-progress" "free-predates-arm" "free-predates-allocation" "different-allocation" "armed_alloc_instance=" "free_inst_match="; do
             strings -n 5 "$dll" | grep -q "$needle" || { echo "::error::$needle missing from the DLL"; exit 1; }
           done
           echo "the DLL contains the plugin name, config sections and report kinds"

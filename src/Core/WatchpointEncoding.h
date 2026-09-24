@@ -222,26 +222,32 @@ namespace hs
 	// How long after a block's recorded free a first-word write is still the
 	// allocator's own bookkeeping rather than a use-after-free.
 	//
-	// 0.6.3 used 32 ms derived from ONE event (the 2026-09-23 21:37:41 link write,
-	// one GetTickCount64 tick after the recorded free). The 2026-09-24 in-game trip
-	// falsified that derivation: our free hook records the free tick BEFORE it
-	// calls the original free, so the allocator's link write follows the record by
-	// the duration of our own remaining hook work (a stack capture and ledger
-	// lookups), and hk_SfRealloc records the free of the old block only AFTER
-	// o_SfRealloc returns, so the write can precede the record by the same kind of
-	// latency. The trip measures those gaps directly: 0-114 ms after the recorded
-	// free and 1-165 ms before it. 250 ms is the next round bound above the
-	// observed worst case, and the two genuine delayed writes in the same corpus
-	// are 1858 ms and 12379 ms later -- an order of magnitude outside it.
+	// 0.6.3 used 32 ms derived from ONE event; 0.6.4 widened it to 250 ms because
+	// the free hook recorded the free tick BEFORE it called the original free, so
+	// the allocator's link write followed the RECORD by however long our own
+	// remaining hook work (a stack capture and ledger lookups) took. The trip
+	// measured those gaps directly: 0-114 ms after the recorded free and 1-165 ms
+	// before it. That window is instrumentation latency, not allocator behaviour.
+	//
+	// 0.6.5 (CHANGE 2) records the free tick AFTER the original free call returns,
+	// so the link write now lands at or just BEFORE the record and the window only
+	// has to cover the allocator's own bookkeeping: a couple of GetTickCount64
+	// ticks. 32 ms is two ticks on the Windows timer, which is the bound the
+	// recorded-after-the-call ordering needs. The 0.6.4 250 ms window silenced a
+	// real write 174 ms after its free (a QuickLootIE write, the one writer that
+	// matters); shrinking it to two ticks is what stops that. The two genuine
+	// delayed writes in the 2026-09-24 corpus are 1858 ms and 12379 ms after their
+	// free, still an order of magnitude outside it.
 	//
 	// The window is applied on BOTH sides of the recorded free (see
 	// ClassifyWriteAgainstFree), because both directions are the allocator's own
 	// operation; only a write outside it is a genuine delayed write-after-free.
 	// Residual risk, stated plainly: a genuine use-after-free write landing within
-	// 250 ms of the free is treated as allocator bookkeeping and missed. That is
-	// the price of not reporting every free-list insertion; the window is a
-	// bounded silence, not a claim of completeness.
-	inline constexpr std::uint64_t kAllocatorBookkeepingWindowMs = 250;
+	// a couple of ticks of the free is treated as allocator bookkeeping and missed.
+	// That is the price of not reporting every free-list insertion; the window is
+	// a bounded silence, not a claim of completeness. Do NOT widen it to make a
+	// test pass -- a wider window is what silenced the QuickLootIE write.
+	inline constexpr std::uint64_t kAllocatorBookkeepingWindowMs = 32;
 
 	// Which free the classifier used. The slot snapshot's Release tick and the
 	// free ring's newest record for the same address are two different events in
@@ -289,7 +295,8 @@ namespace hs
 		kLive,                   // no free recorded for this address: a free explains nothing
 		kPostFreeLink,           // free <= trap, within the window: the allocator linking it
 		kReallocInProgress,      // trap < free, within the window: the free lands after the write
-		kFreePredatesArm,        // the free predates THIS arm: stale evidence about a recycled address
+		kFreePredatesArm,        // the free tick predates THIS arm: stale evidence about a recycled address
+		kFreePredatesAllocation, // 0.6.5: the free's allocation INSTANCE is not this allocation's
 		kDelayedWriteAfterFree,  // free >= arm and outside the window: a genuine delayed UAF
 	};
 
@@ -302,6 +309,8 @@ namespace hs
 			return "allocator-realloc-in-progress";
 		case WatchpointFreeContext::kFreePredatesArm:
 			return "free-predates-arm";
+		case WatchpointFreeContext::kFreePredatesAllocation:
+			return "free-predates-allocation";
 		case WatchpointFreeContext::kDelayedWriteAfterFree:
 			return "delayed-write-after-free";
 		default:
@@ -309,11 +318,11 @@ namespace hs
 		}
 	}
 
-	// Only these two are the allocator's own bookkeeping. `kFreePredatesArm` is
-	// deliberately NOT one of them: when the free ring's only record for the
-	// address is older than the arm, the write is real and unclassified (the
-	// address was recycled, or a watch was armed on an already-freed block), and
-	// silencing it would hide a write to a freed block.
+	// Only these two are the allocator's own bookkeeping. `kFreePredatesArm` and
+	// `kFreePredatesAllocation` are deliberately NOT: when the free evidence is
+	// older than the arm, or belongs to a DIFFERENT allocation of a recycled
+	// address, the write is real and unclassified, and silencing it would hide a
+	// write to a freed block.
 	[[nodiscard]] constexpr bool FreeContextIsAllocatorBookkeeping(WatchpointFreeContext a_context) noexcept
 	{
 		return a_context == WatchpointFreeContext::kPostFreeLink || a_context == WatchpointFreeContext::kReallocInProgress;
@@ -339,4 +348,69 @@ namespace hs
 		return (a_freeTick - a_trapTick) <= a_windowMs ? WatchpointFreeContext::kReallocInProgress
 													: WatchpointFreeContext::kDelayedWriteAfterFree;
 	}
+
+	// -----------------------------------------------------------------------
+	// 0.6.5 (CHANGE 1): allocation-instance matching.
+	//
+	// The honest caveat on the 2026-09-24 third-party-writer lead is that the
+	// free ring never invalidates a record when an address is recycled, so a free
+	// record may belong to a PREVIOUS incarnation of the same address. The tick
+	// comparison above cannot always tell: for a RELEASED slot the snapshot's
+	// armedTick has already been overwritten by the release tick, so the
+	// predates-arm test is a no-op exactly where the recycled-address case lives.
+	//
+	// So the slot and the free record both carry the allocation instance id that
+	// was minted when the block was allocated, and a free is matched to the slot
+	// only when the two agree. A KNOWN mismatch is a free that predates this
+	// allocation: it is REPORTED and labelled, never silently matched.
+	// `kUnknown` (an id is 0 because the allocation was evicted, the ledger was
+	// off, or the record predates the field) falls back to the tick classifier
+	// rather than inventing a mismatch we cannot prove.
+	// -----------------------------------------------------------------------
+	enum class FreeInstanceMatch : std::uint8_t
+	{
+		kUnknown,    // one or both ids are 0: the free cannot be proven to be this allocation's
+		kSame,       // both known and equal: this IS the armed allocation's own free
+		kDifferent,  // both known and different: the free belongs to another incarnation
+	};
+
+	[[nodiscard]] constexpr FreeInstanceMatch MatchFreeInstance(
+		std::uint64_t a_armedInstance, std::uint64_t a_freeInstance) noexcept
+	{
+		if (a_armedInstance == 0 || a_freeInstance == 0) {
+			return FreeInstanceMatch::kUnknown;
+		}
+		return a_armedInstance == a_freeInstance ? FreeInstanceMatch::kSame : FreeInstanceMatch::kDifferent;
+	}
+
+	[[nodiscard]] constexpr const char* FreeInstanceMatchName(FreeInstanceMatch a_match) noexcept
+	{
+		switch (a_match) {
+		case FreeInstanceMatch::kSame:
+			return "same-allocation";
+		case FreeInstanceMatch::kDifferent:
+			return "different-allocation";
+		default:
+			return "unproven";
+		}
+	}
+
+	// The instance-aware classifier: the tick test first (a free recorded before
+	// the arm already proves the free predates this allocation, and keeps the
+	// corpus's free-predates-arm rows under that label), then a KNOWN instance
+	// mismatch (the same statement made structurally, for a recycled address
+	// whose ring record is not older than the arm), then the ordering window.
+	[[nodiscard]] constexpr WatchpointFreeContext ClassifyWriteAgainstFreeInstance(
+		FreeInstanceMatch a_match, std::uint64_t a_freeTick, std::uint64_t a_armTick, std::uint64_t a_trapTick,
+		std::uint64_t a_windowMs) noexcept
+	{
+		if (a_freeTick != 0 && a_armTick != 0 && a_freeTick < a_armTick) {
+			return WatchpointFreeContext::kFreePredatesArm;
+		}
+		if (a_freeTick != 0 && a_match == FreeInstanceMatch::kDifferent) {
+			return WatchpointFreeContext::kFreePredatesAllocation;
+		}
+		return ClassifyWriteAgainstFree(a_freeTick, a_armTick, a_trapTick, a_windowMs);
+	}
+
 }

@@ -62,7 +62,8 @@ namespace hs
 	}
 
 	bool WatchpointSlots::Claim(std::uintptr_t a_address, std::uintptr_t a_valueAtArm, bool a_armedWasCode, std::uintptr_t a_allocSite,
-		std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex) noexcept
+		std::uint64_t a_tick, std::uint32_t a_generation, std::uint32_t a_threadId, std::size_t& a_outIndex,
+		std::uint64_t a_allocInstance) noexcept
 	{
 		if (a_address == 0) {
 			return false;
@@ -95,6 +96,8 @@ namespace hs
 				slot.allocSite = a_allocSite;
 				slot.armedTick = a_tick;
 				slot.freeTick = 0;
+				slot.allocInstance = a_allocInstance;
+				slot.freeInstance = 0;
 				slot.generation = a_generation;
 				slot.threadId = a_threadId;
 				slot.flags = kWatchSlotOccupied;
@@ -118,7 +121,7 @@ namespace hs
 		return false;
 	}
 
-	bool WatchpointSlots::Release(std::uintptr_t a_address, std::uint64_t a_tick) noexcept
+	bool WatchpointSlots::Release(std::uintptr_t a_address, std::uint64_t a_tick, std::uint64_t a_freeInstance) noexcept
 	{
 		if (a_address == 0) {
 			return false;
@@ -138,6 +141,7 @@ namespace hs
 			slot.flags |= kWatchSlotReleased;
 			slot.armedTick = a_tick;
 			slot.freeTick = a_tick;
+			slot.freeInstance = a_freeInstance;
 			Publish(slot, claimed);
 			_releases.fetch_add(1, std::memory_order_relaxed);
 			return true;
@@ -213,6 +217,8 @@ namespace hs
 			copy.allocSite = slot.allocSite;
 			copy.armedTick = slot.armedTick;
 			copy.freeTick = slot.freeTick;
+			copy.allocInstance = slot.allocInstance;
+			copy.freeInstance = slot.freeInstance;
 			copy.generation = slot.generation;
 			copy.flags = slot.flags;
 			copy.threadId = slot.threadId;
@@ -250,6 +256,8 @@ namespace hs
 		copy.allocSite = slot.allocSite;
 		copy.armedTick = slot.armedTick;
 		copy.freeTick = slot.freeTick;
+		copy.allocInstance = slot.allocInstance;
+		copy.freeInstance = slot.freeInstance;
 		copy.generation = slot.generation;
 		copy.flags = slot.flags;
 		copy.threadId = slot.threadId;
@@ -293,6 +301,7 @@ namespace hs
 			slot.flags = kWatchSlotReleased;
 			slot.armedTick = a_tick;
 			slot.freeTick = a_tick;
+			slot.freeInstance = 0;
 			Publish(slot, claimed);
 		}
 		return cleared;
@@ -323,6 +332,8 @@ namespace hs
 			slot.allocSite = 0;
 			slot.armedTick = 0;
 			slot.freeTick = 0;
+			slot.allocInstance = 0;
+			slot.freeInstance = 0;
 			slot.generation = 0;
 			slot.flags = 0;
 			slot.threadId = 0;

@@ -80,7 +80,7 @@ namespace hs
 		{
 			char buffer[512]{};
 			std::snprintf(buffer, sizeof(buffer),
-				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s); suppressed %llu post-free link(s) + %llu realloc-in-progress write(s), %llu free-predates-arm report(s); unattributed #DB debug-register reads: %llu failed (no measurement), %llu succeeded and found no debug register",
+				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s); suppressed %llu post-free link(s) + %llu realloc-in-progress write(s), %llu free-predates-arm/other-allocation report(s); unattributed #DB debug-register reads: %llu failed (no measurement), %llu succeeded and found no debug register",
 				a_s.watchSlotsOccupied, kWatchpointSlotCount, static_cast<unsigned long long>(a_s.watchClaims),
 				static_cast<unsigned long long>(a_s.watchClaimDrops), static_cast<unsigned long long>(a_s.watchReleases),
 				static_cast<unsigned long long>(a_s.watchTrips), static_cast<unsigned long long>(a_s.watchReports),
