@@ -80,16 +80,11 @@ namespace hs
 		{
 			char buffer[512]{};
 			std::snprintf(buffer, sizeof(buffer),
-				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s); suppressed %llu post-free link(s) + %llu realloc-in-progress write(s), %llu free-predates-arm report(s); unattributed #DB debug-register reads: %llu failed (no measurement), %llu succeeded and found no debug register",
+				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s)",  // MUTATION M5 (temporary)
 				a_s.watchSlotsOccupied, kWatchpointSlotCount, static_cast<unsigned long long>(a_s.watchClaims),
 				static_cast<unsigned long long>(a_s.watchClaimDrops), static_cast<unsigned long long>(a_s.watchReleases),
 				static_cast<unsigned long long>(a_s.watchTrips), static_cast<unsigned long long>(a_s.watchReports),
-				static_cast<unsigned long long>(a_s.watchReportDrops),
-				static_cast<unsigned long long>(a_s.watchPostFreeSuppressed),
-				static_cast<unsigned long long>(a_s.watchReallocSuppressed),
-				static_cast<unsigned long long>(a_s.watchFreePredatesArm),
-				static_cast<unsigned long long>(a_s.watchDrReadFailed),
-				static_cast<unsigned long long>(a_s.watchDrReadZero));
+				static_cast<unsigned long long>(a_s.watchReportDrops));
 			lines.emplace_back(buffer);
 		}
 

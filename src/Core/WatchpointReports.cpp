@@ -202,7 +202,10 @@ namespace hs
 		if (written < 0) {
 			return 0;
 		}
-		const auto haveDr = a_report.drReadSource != kDrSourceNone || a_report.drReadStatus != kDrReadNotAttempted;
+		// MUTATION M5 (temporary): never emit the provenance line.
+		const auto haveDr = false;
+		(void)a_report.drReadSource;
+		(void)a_report.drReadStatus;
 		const auto haveFreeSource = a_report.freeTickSource != 0;  // FreeTickSource::kNone == 0
 		if (!haveDr && !haveFreeSource) {
 			return static_cast<std::size_t>(written);
