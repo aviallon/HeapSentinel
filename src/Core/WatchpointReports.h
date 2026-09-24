@@ -40,6 +40,15 @@ namespace hs
 		std::uintptr_t tableAddress = 0;     // what the live table slot held at the trap (0 = none); differs from `watchedAddress` for a stale arm
 		std::uint64_t  armedTick = 0;
 		std::uint64_t  freeTick = 0;         // the block's recorded free tick, when known (0 = none)
+		// 0.6.5 (CHANGE 1): allocation-instance matching. `armedInstance` is the
+		// allocation this watch armed; `freeInstance` is the allocation the free the
+		// classifier used belonged to. `freeInstanceMatch` is the FreeInstanceMatch
+		// outcome (0 = unknown, 1 = same, 2 = different) -- recorded so the log says
+		// whether a free was provably this block's own or belonged to another
+		// incarnation of a recycled address.
+		std::uint64_t  armedInstance = 0;
+		std::uint64_t  freeInstance = 0;
+		std::uint32_t  freeInstanceMatch = 0;
 		// 0.6.4 FIX B: which free the classifier used (slot Release tick, or the
 		// free ring's newest record for the address). Two different events in
 		// general, so which one won is evidence, not an implementation detail.

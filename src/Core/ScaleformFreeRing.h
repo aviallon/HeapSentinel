@@ -24,6 +24,10 @@ namespace hs
 		std::uint32_t  freeStack = 0;
 		std::uint32_t  poisonIndex = 0;  // 1-based quarantine slot, 0 = none
 		std::uint64_t  freeTick = 0;
+		// 0.6.5: the allocation instance the freed block belonged to (0 = unknown).
+		// Paired with freeTick so the classifier can tell this free from a stale
+		// record of a PREVIOUS incarnation of a recycled address.
+		std::uint64_t  allocInstance = 0;
 		std::uint32_t  threadId = 0;
 		std::uint32_t  flags = 0;
 	};

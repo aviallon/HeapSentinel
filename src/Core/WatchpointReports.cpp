@@ -176,7 +176,7 @@ namespace hs
 			return 0;
 		}
 		const auto written = std::snprintf(a_buffer, a_size,
-			"slot=%u watched=0x%llX before=0x%llX after=0x%llX%s writer_rip=0x%llX dr6=0x%X dr7=0x%X tid=%u armed_tick=%llu trap_tick=%llu stale_arm=%d table=0x%llX free_tick=%llu unattributed=%d ever_armed=0x%X any_dr=%d dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX",
+			"slot=%u watched=0x%llX before=0x%llX after=0x%llX%s writer_rip=0x%llX dr6=0x%X dr7=0x%X tid=%u armed_tick=%llu trap_tick=%llu stale_arm=%d table=0x%llX free_tick=%llu unattributed=%d ever_armed=0x%X any_dr=%d dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX armed_inst=%llu free_inst=%llu free_inst_match=%s",
 			a_report.slotIndex,
 			static_cast<unsigned long long>(a_report.watchedAddress),
 			static_cast<unsigned long long>(a_report.valueAtArm),
@@ -197,7 +197,10 @@ namespace hs
 			static_cast<unsigned long long>(a_report.drAddress[0]),
 			static_cast<unsigned long long>(a_report.drAddress[1]),
 			static_cast<unsigned long long>(a_report.drAddress[2]),
-			static_cast<unsigned long long>(a_report.drAddress[3]));
+			static_cast<unsigned long long>(a_report.drAddress[3]),
+			static_cast<unsigned long long>(a_report.armedInstance),
+			static_cast<unsigned long long>(a_report.freeInstance),
+			FreeInstanceMatchName(static_cast<FreeInstanceMatch>(a_report.freeInstanceMatch)));
 
 		if (written < 0) {
 			return 0;

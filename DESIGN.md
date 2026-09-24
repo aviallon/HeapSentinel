@@ -752,9 +752,11 @@ On the `#DB` (`EXCEPTION_SINGLE_STEP`) trap the VEH reports, at minimum:
   DR0-DR3 fields, whether that read succeeded and its `GetLastError()`, the
   exception record's own DR values next to it, and EFlags (whose TF bit
   explains a trap-flag single step). See 13.4;
-- **which free the classifier used** (0.6.4): the slot's Release tick or the
-  free ring's newest record for the address, plus the resulting context (a
-  post-free link, a realloc-in-progress write, a free that predates the arm, or
+- **which free the classifier used** (0.6.4), **and which allocation it belonged
+  to** (0.6.5): the slot's Release tick or the free ring's newest record for the
+  address, the allocation-instance id paired with that tick, whether it matches
+  the instance the watch armed, and the resulting context (a post-free link, a
+  realloc-in-progress write, a free whose tick or allocation predates this one, or
   a genuine delayed write-after-free). See 13.4;
 - whether the arm was **stale** (the table had moved on) and, when it was, the
   address the live table slot holds now - so `watched=` is never contradicted by
@@ -983,46 +985,83 @@ The 2026-09-24 trip falsified that in two ways, both structural:
    armed on an already-freed block). That third case is NOT silenced: it is a
    real write we cannot assign to the allocator.
 
-The window is also derived from the trip rather than from one event. Our free hook
-takes its tick before the original free call, so the link write can follow the
-record by the duration of our own remaining work (a stack capture and ledger
-lookups), and `hk_SfRealloc` can precede its record by the same kind of latency.
-The trip measures those gaps directly: 0-114 ms after the recorded free and
-1-165 ms before it. `kAllocatorBookkeepingWindowMs` is 250 ms, the next round
-bound above the observed worst case, and applied on BOTH sides through that one
-function, which the trap path and the drainer call identically (defence in depth
-for the race where the free record lands after the trap).
+**The window, and the 0.6.5 change that shrank it (CHANGE 2).** In 0.6.4 the
+width was entirely our own instrumentation latency: `hk_SfFree` took its tick
+before `RecordScaleformFree` and before `o_SfFree`, so the free we recorded was
+older than the free the allocator performs, by however long our stack capture and
+ledger lookups took. The trip measured those gaps directly -- 0-114 ms after the
+recorded free and 1-165 ms before it -- and the window was widened to 250 ms to
+cover them. That window was a bounded silence, and the 2026-09-24 log shows
+exactly what it cost: a `QuickLootIE.dll+0x9ADB9` write 174 ms after its free was
+treated as the allocator's own post-free link and silenced. On the one writer
+that matters.
+
+0.6.5 removes the latency instead of covering it. `hk_SfFree` now calls
+`o_SfFree` FIRST and records the free with a tick taken AFTER the original
+returns. The allocator's free-list link write happens INSIDE that call, so the
+record now lands at or just after the write rather than up to 114 ms before it,
+and the window only has to cover the allocator's own bookkeeping:
+`kAllocatorBookkeepingWindowMs` is back to 32 ms, two `GetTickCount64` ticks on
+the Windows timer. The slot is still marked released BEFORE the free
+(`OnScaleformFree` is unchanged), so a write-after-free in the gap between the
+release and the free record is still recognised from the slot's own release
+evidence. The two orderings are still named apart (`allocator-post-free-link`
+when the record and the trap share a tick, `allocator-realloc-in-progress` when
+the record lands later), and the shipped window is asserted to be smaller than
+the 174 ms that silenced the QuickLootIE write -- a window that wide would
+silence it again, so a future widening fails the test rather than the game.
+
+**Allocation-instance matching (CHANGE 1).** The honest caveat on the
+third-party-writer lead was that the free ring never invalidates a record when an
+address is recycled, so a free record may belong to a PREVIOUS incarnation of the
+same address. The tick comparison cannot always see that: for a RELEASED slot the
+snapshot's `armedTick` has already been overwritten by the release tick, so the
+predates-arm test is a no-op exactly where the recycled-address case lives.
+
+0.6.5 makes the match structural. Every recorded Scaleform allocation is minted a
+monotonic instance id (`NextAllocationInstance`, 0 reserved for "unknown"); it
+travels with the allocation in the ledger, into the watch slot when the block is
+armed, and into the free ring's record when it is freed. The classifier resolves
+the free EVIDENCE as a pair -- the newest tick and the instance that belongs with
+it -- and `MatchFreeInstance` compares the armed allocation's instance with the
+free's. A KNOWN mismatch is `free-predates-allocation`: the free belongs to
+another incarnation, it is not evidence about this write, and it is REPORTED and
+labelled, never silently matched. `kUnknown` (an id is 0 because the allocation
+was evicted, the ledger was off, or the record predates the field) falls back to
+the tick classifier rather than inventing a mismatch that cannot be proven. A free
+tick older than the arm still keeps the `free-predates-arm` label, so the corpus's
+six free-predates-arm rows are not relabelled by the refinement.
 
 **Residual risk, stated plainly:** a genuine use-after-free write landing within
-250 ms of the free is treated as allocator bookkeeping and missed. The two
-genuine delayed writes in the same corpus are 1858 ms and 12379 ms after their
-free, an order of magnitude outside the window, and they are still reported. The
-window is a bounded silence, not a claim of completeness.
+two ticks of the free is treated as allocator bookkeeping and missed. The two
+genuine delayed writes in the corpus are 1858 ms and 12379 ms after their free,
+an order of magnitude outside the window, and they are still reported. The window
+is a bounded silence, not a claim of completeness. **A distinct residual risk
+remains in the instance ids themselves:** a free that lands so late that the
+address has already been re-allocated and freed again could carry a different
+instance while still being the same logical free; the ring keeps only the newest
+record per address, so the corpus models that relation rather than proving it.
 
-**Why the window is this wide, and the structural fix that would shrink it.** The
-width is entirely our own instrumentation latency: `hk_SfFree` takes its tick
-before `RecordScaleformFree` and before `o_SfFree`, so the free we record is
-older than the free the allocator performs, by however long our stack capture and
-ledger lookups take. Recording the tick AFTER the original free returns (and
-rejecting a promotion candidate the free ring already records as freed, which is
-the likely shape of the two `free-predates-arm` rows) would let the window shrink
-back to a couple of ticks. Both change free-record semantics that the double-free
-path depends on, so neither belongs in a narrow correctness release; they are
-candidates for 0.6.5.
-
-**What the 2026-09-24 corpus says under the corrected rules.** Replaying the
-trip's 21 write reports through the shipped classifier (a permanent off-game
-test, `watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_designed`)
-gives: 18 are allocator bookkeeping and go silent (7 post-free links and 11
-realloc-in-progress writes), 2 report because their free record predates the arm
-(0xA34DF900, written by `VCRUNTIME140.dll`; 0xA33C04B0, written by
-`SkyrimSE.exe+0x11922AB`), and 1 (`0xA36190E0`) is a genuine delayed write whose
-`after` value is still a code pointer, so the drainer's benign shape rule drops
-it. Of the 18 shape-conforming, non-stale reports named as the trip's noise, 16
-go silent and 2 remain, labelled. The expectation before the replay was that all
-18 would go silent; 16 + 2 labelled is what the evidence supports, and the two
-survivors are a new question (why were we watching an address whose only free
-record predates the arm?) rather than a regression.
+**What the 2026-09-24 corpus says under the 0.6.5 rules.** The permanent off-game
+test
+(`watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_designed`)
+now holds all 28 `watchpoint-write` reports in the live log: the 21 of the
+17:53-18:02 window, the two earlier ones (a v0.6.1 write and the v0.6.2 post-free
+link), and the five later 18:10 reports. Part A replays the 21 rows through the
+0.6.4 rules and pins the documented split -- 18 allocator bookkeeping (7
+post-free links + 11 realloc-in-progress), 2 `free-predates-arm`, 1 delayed.
+Part B replays all 28 through the shipped classifier: 19 go silent as allocator
+bookkeeping, 6 are reported and labelled `free-predates-arm` (2 from the window
+plus 4 from the 18:10 group), 2 are reported as genuine delayed writes (the
+12.4 s `SkyrimSE.exe+0x140D177B5` write, and the `QuickLootIE` write at 18:10:34
+that the 250 ms window used to silence), and the one v0.6.1 record is `live`
+(and the drainer's benign shape rule drops it). **Both `QuickLootIE.dll+0x9ADB9`
+rows are reported.** The one at 18:10:33 is `free-predates-arm` (its free record
+is older than the arm); the one at 18:10:34 is the delayed write whose free is
+174 ms earlier. The instance relation in Part B is MODELLED from the logged
+ordering (a free recorded before the arm is a previous incarnation's), because the
+run did not log instance ids; that is stated in the test, not presented as a
+measurement.
 
 **The headline, stated honestly.** After the trip: the instrument survives a real
 in-game session and produces records, and the writers it names are overwhelmingly
@@ -1031,17 +1070,17 @@ has now been observed as the writer.** The v0.6.3 session's log kept growing
 after the 18:02:36 window the first analysis covered, and the five later write
 reports include two written by `QuickLootIE.dll+0x9ADB9` (the AE port of the very
 mod whose vtable corruption started this feature at 0.6.0) and others by
-`SkyrimSE.exe+0xD0500C` and `+0xD5A843`, all over the first qword of a block
-whose free record PREDATES the arm. Four of those five are still reported under
-0.6.4's rules, labelled `free-predates-arm`; the fifth -- a `QuickLootIE` write
-whose block's free record is 174 ms earlier and whose arm tick equals that free
-tick -- would be silenced as an allocator post-free link. That is a concrete
-instance of the window's residual risk, on the one writer that matters, and it is
-recorded here rather than smoothed over. The corruptor question is open in the
-sense that this is a correlation, not a proof of an owning bug: the free ring
-never invalidates a record when an address is recycled, so `free-predates-arm`
-means "the free evidence is older than this arm" and not "this module corrupted
-a live object".
+`SkyrimSE.exe+0xD0500C` and `+0xD5A843`. Under 0.6.4's rules four of those five
+were reported, labelled `free-predates-arm`, and the fifth -- the `QuickLootIE`
+write at 18:10:34, whose free record is 174 ms earlier and whose arm tick equals
+that free tick -- was silenced as an allocator post-free link. 0.6.5 reports all
+five. That is still a correlation, not a proof of an owning bug: the free ring
+never invalidates a record when an address is recycled, so `free-predates-arm` /
+`free-predates-allocation` mean "the free evidence is older than this arm, or
+belongs to another incarnation" and not "this module corrupted a live object".
+What 0.6.5 does change is that the correlation can no longer be produced by
+matching a free to the wrong allocation, and a real write within two ticks of a
+free is the only remaining silence.
 
 ### 13.5 Shutdown and the final-state assertion
 
@@ -1096,18 +1135,21 @@ errors) and, for the trap-path decisions, on real hardware `#DB`s in the Windows
 test: the debug-register measurement classification (failed vs
 genuinely-zero vs armed), the free-tick preference, the two allocator orderings
 kept apart, the `free-predates-arm` case reported rather than silenced, the
-record encoding, and the 21-row 2026-09-24 corpus replay. Each of those tests was
-broken once and seen to fail (the mutation run ids are in the v0.6.4 release
-notes). **UNPROVEN: the in-game correctness of the corrected path.** 0.6.2 is the
-precedent for not claiming otherwise -- a green suite with a real mutation proof
-did not cover the case the game hit. Only a fresh trip can show that the
-corrected record is populated, that the 16 allocator rows stay silent in the real
-process, and what the two `free-predates-arm` rows really are. The counters in
-the periodic stats line exist so that a fresh trip answers it from the log
-without a second analysis pass: `suppressed N post-free link(s) + M
-realloc-in-progress write(s), K free-predates-arm report(s); unattributed #DB
-debug-register reads: F failed (no measurement), Z succeeded and found no debug
-register`.
+allocation-instance match (`same` matched, a KNOWN `different` reported as
+`free-predates-allocation` even when the tick would have silenced it, and
+`unknown` falling back to the ticks), the record encoding, and the 28-row
+2026-09-24 corpus replay. Each of those tests was broken once and seen to fail
+(the mutation run ids are in the v0.6.5 release notes). **UNPROVEN: the in-game
+correctness of the corrected path.** 0.6.2 is the precedent for not claiming
+otherwise -- a green suite with a real mutation proof did not cover the case the
+game hit. Only a fresh trip can show that the corrected record is populated, that
+the allocator rows stay silent in the real process with the two-tick window, that
+the free tick recorded after `o_SfFree` really lands where the corpus models it,
+and what the two `QuickLootIE` rows really are. The counters in the periodic stats
+line exist so that a fresh trip answers it from the log without a second analysis
+pass: `suppressed N post-free link(s) + M realloc-in-progress write(s), K
+free-predates-arm/other-allocation report(s); unattributed #DB debug-register
+reads: F failed (no measurement), Z succeeded and found no debug register`.
 
 ## 14. Publishing symbols (making our own frames legible)
 

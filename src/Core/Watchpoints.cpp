@@ -182,7 +182,18 @@ namespace hs
 		if (address == 0) {
 			return;
 		}
-		if (WatchpointSlots::Get().Release(address, ::GetTickCount64())) {
+		// 0.6.5 (CHANGE 1): the allocation instance of the block being freed. The
+		// ledger still holds its live record here -- RecordScaleformFree has not run
+		// and, for a realloc, Erase has not run either -- so the free can be paired
+		// with the allocation it actually frees. Unknown (0) falls back to ticks.
+		std::uint64_t freeInstance = 0;
+		{
+			AllocationInfo info;
+			if (ShadowLedger::Get().Find(address, info)) {
+				freeInstance = info.allocInstance;
+			}
+		}
+		if (WatchpointSlots::Get().Release(address, ::GetTickCount64(), freeInstance)) {
 			// FIX 2: ask the next sweep to clear the released slot on EVERY thread,
 			// not just this one. The free hook must not do the OS work itself, so
 			// this is a flag + a generation bump, bounded to one sweep.
@@ -262,10 +273,21 @@ namespace hs
 			// This is the ONLY classification the trap path and the drainer need;
 			// the locking module map is never consulted from the VEH.
 			const bool armedWasCode = readable && IsPlausibleVTable(valueAtArm);
+			// 0.6.5 (CHANGE 1): the instance of the allocation we are arming. The
+			// ledger holds it for a live Scaleform block; when the record is absent or
+			// already freed the instance stays 0 (unknown) and the classifier falls
+			// back to the tick evidence rather than claiming a match.
+			std::uint64_t allocInstance = 0;
+			{
+				AllocationInfo info;
+				if (ShadowLedger::Get().Find(candidate, info) && (info.flags & kFlagFreed) == 0) {
+					allocInstance = info.allocInstance;
+				}
+			}
 
 			std::size_t index = 0;
 			if (slots.Claim(candidate, readable ? valueAtArm : 0, armedWasCode, 0, a_now, _generation.load(std::memory_order_relaxed),
-					::GetCurrentThreadId(), index)) {
+					::GetCurrentThreadId(), index, allocInstance)) {
 				BumpGeneration();
 				_dirty.store(true, std::memory_order_relaxed);
 				logger::info("watchpoints: slot {} armed for block 0x{:X} (first qword 0x{:X}, {} copied from a sampled Scaleform allocation)",
@@ -350,6 +372,7 @@ namespace hs
 					arm.valueAtArm.store(0, std::memory_order_relaxed);
 					arm.allocSite.store(0, std::memory_order_relaxed);
 					arm.armedAt.store(0, std::memory_order_relaxed);
+					arm.allocInstance.store(0, std::memory_order_relaxed);
 					arm.generation.store(0, std::memory_order_relaxed);
 					arm.armedWasCode.store(false, std::memory_order_relaxed);
 				}
@@ -396,6 +419,7 @@ namespace hs
 				arm.allocSite.store(snap[slot].allocSite, std::memory_order_relaxed);
 				arm.armedWasCode.store(snap[slot].armedWasCode, std::memory_order_relaxed);
 				arm.armedAt.store(a_now, std::memory_order_relaxed);
+				arm.allocInstance.store(snap[slot].allocInstance, std::memory_order_relaxed);
 				arm.generation.store(generation, std::memory_order_relaxed);
 				entry->everArmedMask.fetch_or(1u << slot, std::memory_order_release);
 			}
@@ -416,29 +440,40 @@ namespace hs
 		_lastArmedThreads = armedNow;
 	}
 
-	std::uint64_t Watchpoints::ResolveFreeTick(std::uint64_t a_slotFreeTick, std::uintptr_t a_address, std::uint32_t* a_outSource) noexcept
+	std::uint64_t Watchpoints::ResolveFreeEvidence(std::uint64_t a_slotFreeTick, std::uint64_t a_slotFreeInstance,
+		std::uintptr_t a_address, std::uint64_t* a_outInstance, std::uint32_t* a_outSource) noexcept
 	{
-		// 0.6.4 FIX B. The free ring is consulted UNCONDITIONALLY. 0.6.3 only looked
-		// it up when the slot had no Release tick, so for an already-released slot
-		// the stale Release tick shadowed the ring's newest record -- the trip case
-		// where free_tick=261486289, the ring's record was 261487115 and the trap was
-		// 261487115: a delta of 826 ms was reported where the true delta was 0.
-		std::uint64_t freeTick = a_slotFreeTick;
+		// 0.6.4 FIX B + 0.6.5 CHANGE 1. The free ring is consulted UNCONDITIONALLY,
+		// and the tick it returns is paired with ITS OWN allocation instance. 0.6.3
+		// only looked the ring up when the slot had no Release tick, so for an
+		// already-released slot the stale Release tick shadowed the ring's newest
+		// record (free_tick=261486289, ring 261487115, trap 261487115: a delta of
+		// 826 ms was reported where the true delta was 0). PreferNewestFreeTick
+		// picks the newer tick; the instance that wins with it is the one the
+		// classifier must use, because a tick without its instance cannot say
+		// whether the free belongs to this allocation or to a previous incarnation
+		// of a recycled address.
+		std::uint64_t tick = a_slotFreeTick;
+		std::uint64_t instance = a_slotFreeInstance;
 		auto          source = a_slotFreeTick != 0 ? FreeTickSource::kSlotSnapshot : FreeTickSource::kNone;
 
 		ScaleformFreeRecord record;
 		if (ScaleformFreeRing::Get().Find(a_address, record) && record.freeTick != 0) {
 			const auto preferred = PreferNewestFreeTick(a_slotFreeTick, record.freeTick);
-			if (preferred != freeTick || source == FreeTickSource::kNone) {
+			if (preferred != tick || source == FreeTickSource::kNone) {
+				tick = preferred;
+				instance = record.allocInstance;
 				source = FreeTickSource::kFreeRing;
 			}
-			freeTick = preferred;
 		}
 
+		if (a_outInstance != nullptr) {
+			*a_outInstance = instance;
+		}
 		if (a_outSource != nullptr) {
 			*a_outSource = static_cast<std::uint32_t>(source);
 		}
-		return freeTick;
+		return tick;
 	}
 
 	void Watchpoints::DrainReports() noexcept
@@ -502,16 +537,20 @@ namespace hs
 				continue;
 			}
 
-			// 0.6.4 FIX B: resolve the free tick the same way the trap path does --
-			// ALWAYS consult the free ring and prefer its newest record for the address
-			// over the slot's Release tick. This is the drainer's own lookup (defence in
-			// depth for the race where the free record lands after the trap), and it is
-			// what makes the 17:56:56 case silent instead of a 826 ms delta.
+			// 0.6.4 FIX B + 0.6.5 CHANGE 1: resolve the free EVIDENCE the same way the
+			// trap path does -- ALWAYS consult the free ring, prefer its newest record
+			// over the slot's Release tick, and take the allocation instance paired with
+			// the tick that won. This is the drainer's own lookup (defence in depth for
+			// the race where the free record lands after the trap), and it is what makes
+			// the 17:56:56 case silent instead of a 826 ms delta.
 			const auto    freeFromSnap = report.freeTick;
 			std::uint32_t freeSource = report.freeTickSource;
-			const auto    freeTick = ResolveFreeTick(report.freeTick, report.watchedAddress, &freeSource);
-			const auto freeContext =
-				ClassifyWriteAgainstFree(freeTick, report.armedTick, report.tick, kAllocatorBookkeepingWindowMs);
+			std::uint64_t freeInstance = report.freeInstance;
+			const auto    freeTick = ResolveFreeEvidence(report.freeTick, report.freeInstance, report.watchedAddress,
+				&freeInstance, &freeSource);
+			const auto    instanceMatch = MatchFreeInstance(report.armedInstance, freeInstance);
+			const auto freeContext = ClassifyWriteAgainstFreeInstance(instanceMatch, freeTick, report.armedTick, report.tick,
+				kAllocatorBookkeepingWindowMs);
 			if (FreeContextIsAllocatorBookkeeping(freeContext)) {
 				if (freeContext == WatchpointFreeContext::kReallocInProgress) {
 					WatchpointReports::Get().NoteReallocSuppressed();
@@ -520,12 +559,12 @@ namespace hs
 				}
 				continue;
 			}
-			if (freeContext == WatchpointFreeContext::kFreePredatesArm) {
-				// A real write we cannot attribute to the allocator: the free ring's only
-				// record for the address is OLDER than the arm, so either the address was
-				// recycled (the ring never invalidates a record) or a watch was armed on
-				// an already-freed block. Reported below, labelled -- silencing it would
-				// hide a write to a freed block.
+			if (freeContext == WatchpointFreeContext::kFreePredatesArm ||
+				freeContext == WatchpointFreeContext::kFreePredatesAllocation) {
+				// A real write we cannot attribute to the allocator: the free evidence is
+				// older than the arm, or belongs to a DIFFERENT allocation of a recycled
+				// address. Reported below, labelled -- silencing it would hide a write to
+				// a freed block.
 				WatchpointReports::Get().NoteFreePredatesArm();
 			}
 
@@ -602,6 +641,9 @@ namespace hs
 			ScaleformFreeRecord freeRecord;
 			if (ScaleformFreeRing::Get().Find(report.watchedAddress, freeRecord)) {
 				detail += "\n  Scaleform free record: freed at tick " + std::to_string(freeRecord.freeTick);
+				if (freeRecord.allocInstance != 0) {
+					detail += " (allocation instance " + std::to_string(freeRecord.allocInstance) + ")";
+				}
 				if (freeRecord.freeSite) {
 					detail += " by ";
 					detail += ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(freeRecord.freeSite));
@@ -616,6 +658,11 @@ namespace hs
 			detail += FreeTickSourceName(static_cast<FreeTickSource>(freeSource));
 			detail += " tick " + std::to_string(freeTick) + "; context ";
 			detail += WatchpointFreeContextName(freeContext);
+			// 0.6.5 CHANGE 1: WHICH allocation the free belonged to, and whether that
+			// is the allocation we armed. This is the difference between "the free ring
+			// has a record for this address" and "the free IS this block's own free".
+			detail += "; armed_alloc_instance=" + std::to_string(report.armedInstance) + " free_alloc_instance=" +
+				std::to_string(freeInstance) + " (" + FreeInstanceMatchName(instanceMatch) + ")";
 			if (freeTick != 0) {
 				detail += " (trap - free = ";
 				detail += std::to_string(report.tick >= freeTick ? static_cast<long long>(report.tick - freeTick)
@@ -636,6 +683,14 @@ namespace hs
 						  "), so it is not evidence about this write: either the address was recycled and the ring record is "
 						  "stale (the ring never invalidates a record on re-allocation), or a watch was armed on an "
 						  "already-freed block. The write is real and is reported rather than assigned to the allocator.";
+			}
+			if (freeContext == WatchpointFreeContext::kFreePredatesAllocation) {
+				detail += "\n  FREE EVIDENCE BELONGS TO ANOTHER ALLOCATION: the free record for this address was of "
+						  "allocation instance " + std::to_string(freeInstance) + ", but this watch armed instance " +
+						  std::to_string(report.armedInstance) +
+						  ". The free ring never invalidates a record when an address is recycled, so this free is a "
+						  "previous incarnation's, NOT this block's own free: it is not evidence about this write and the "
+						  "write is real. Reported and labelled rather than silently matched to this allocation.";
 			}
 
 			// FIX 4: the stale-arm case is a first-class outcome of the 0.6.1
@@ -831,6 +886,8 @@ namespace hs
 				report.allocSite = snap.allocSite;
 				report.armedTick = snap.armedTick;
 				report.freeTick = snap.freeTick;
+				report.armedInstance = snap.allocInstance;
+				report.freeInstance = snap.freeInstance;
 				report.armGeneration = snap.generation;
 				report.armedWasCode = snap.armedWasCode;
 				if (owner == WatchpointTrapOwner::kTableReleased) {
@@ -846,6 +903,7 @@ namespace hs
 					report.valueAtArm = entry->arms[slot].valueAtArm.load(std::memory_order_relaxed);
 					report.allocSite = entry->arms[slot].allocSite.load(std::memory_order_relaxed);
 					report.armedTick = entry->arms[slot].armedAt.load(std::memory_order_relaxed);
+					report.armedInstance = entry->arms[slot].allocInstance.load(std::memory_order_relaxed);
 					report.armGeneration = entry->arms[slot].generation.load(std::memory_order_relaxed);
 					report.armedWasCode = entry->arms[slot].armedWasCode.load(std::memory_order_relaxed);
 				}
@@ -855,7 +913,10 @@ namespace hs
 			// newest record for the address over the slot's Release tick, and record
 			// which source won. 0.6.3 only looked the ring up when the slot's tick was
 			// zero, so a stale Release tick shadowed the newest free record.
-			report.freeTick = ResolveFreeTick(report.freeTick, report.watchedAddress, &report.freeTickSource);
+			report.freeTick = ResolveFreeEvidence(report.freeTick, report.freeInstance, report.watchedAddress,
+				&report.freeInstance, &report.freeTickSource);
+			report.freeInstanceMatch =
+				static_cast<std::uint32_t>(MatchFreeInstance(report.armedInstance, report.freeInstance));
 
 			std::uintptr_t valueAfter = 0;
 			const bool     readable = SafeReadQword(report.watchedAddress, valueAfter);
@@ -877,8 +938,9 @@ namespace hs
 			// the free record lands. Neither is a use-after-free. Do NOT record either
 			// and do NOT clear this thread's DR: keep watching, stay silent.
 			if (record) {
-				const auto freeContext =
-					ClassifyWriteAgainstFree(report.freeTick, report.armedTick, now, kAllocatorBookkeepingWindowMs);
+				const auto freeContext = ClassifyWriteAgainstFreeInstance(
+					static_cast<FreeInstanceMatch>(report.freeInstanceMatch), report.freeTick, report.armedTick, now,
+					kAllocatorBookkeepingWindowMs);
 				if (FreeContextIsAllocatorBookkeeping(freeContext)) {
 					record = false;
 					if (freeContext == WatchpointFreeContext::kReallocInProgress) {

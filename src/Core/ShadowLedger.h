@@ -58,8 +58,18 @@ namespace hs
 
 		std::uint64_t allocTick = 0;  // GetTickCount64 at allocation
 		std::uint64_t freeTick = 0;   // GetTickCount64 at free
+		// 0.6.5: monotonic per-allocation instance id (0 = unknown). The free ring
+		// never invalidates a record when an address is recycled, so the free
+		// record and the watch slot carry this id and a free is matched to the
+		// slot only when the two agree. See WatchpointEncoding.h.
+		std::uint64_t allocInstance = 0;
 		std::uint32_t poisonIndex = 0;  // 1-based quarantine slot, 0 = not poisoned
 	};
+
+	// Mint the next per-allocation instance id. Monotonic, never reused, and
+	// starts at 1 so 0 stays reserved for "unknown". Called once per recorded
+	// Scaleform allocation; lock-free (one relaxed fetch_add).
+	[[nodiscard]] std::uint64_t NextAllocationInstance() noexcept;
 
 	// ptr -> AllocationInfo, sharded open addressing with linear probing.
 	//
