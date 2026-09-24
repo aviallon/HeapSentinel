@@ -142,21 +142,18 @@ namespace hs
 		std::uint32_t a_readSource, std::uint32_t a_readStatus, std::uint32_t a_dr6, const std::uintptr_t* a_drAddress,
 		std::size_t a_count) noexcept
 	{
-		if (a_readSource == kDrSourceNone || a_readStatus == kDrReadNotAttempted) {
-			return DebugRegisterMeasurement::kNotAttempted;
-		}
-		if (a_readStatus == kDrReadFailed) {
-			return DebugRegisterMeasurement::kReadFailed;
-		}
-		if (a_dr6 != 0) {
-			return DebugRegisterMeasurement::kReadNonZero;
-		}
-		for (std::size_t i = 0; i < a_count; ++i) {
-			if (a_drAddress[i] != 0) {
-				return DebugRegisterMeasurement::kReadNonZero;
-			}
-		}
-		return DebugRegisterMeasurement::kReadZero;
+	if (a_readSource == kDrSourceNone || a_readStatus == kDrReadNotAttempted) {
+		return DebugRegisterMeasurement::kNotAttempted;
+	}
+	if (a_readStatus == kDrReadFailed) {
+		return DebugRegisterMeasurement::kReadFailed;
+	}
+	// MUTATION M1 (temporary): never inspect the measured DR state, so a
+	// successful read that found a breakpoint is reported as a zero read.
+	(void)a_dr6;
+	(void)a_drAddress;
+	(void)a_count;
+	return DebugRegisterMeasurement::kReadZero;
 	}
 
 	inline constexpr std::uint32_t kWatchReportValueUnreadable = 1u << 0;
