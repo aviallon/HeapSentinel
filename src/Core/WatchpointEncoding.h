@@ -220,29 +220,123 @@ namespace hs
 	}
 
 	// How long after a block's recorded free a first-word write is still the
-	// allocator linking it into its free list rather than a use-after-free.
+	// allocator's own bookkeeping rather than a use-after-free.
 	//
-	// The evidence (2026-09-23 21:37:41): the block was freed at tick
-	// 188333102 and the first word rewritten at 188333103 -- one
-	// GetTickCount64 tick later, microseconds in real time. GetTickCount64
-	// advances in ~15.6 ms steps, so a free near a tick boundary and its link
-	// just after it differ by one tick, and a slow free path can differ by two.
-	// 32 ms (two ticks) covers the allocator's own bookkeeping. Residual risk,
-	// stated plainly: a genuine use-after-free write landing within 32 ms of the
-	// free is treated as a link and missed. That is the price of not reporting
-	// every free-list insertion; the window is a bounded silence, not a claim of
-	// completeness.
-	inline constexpr std::uint64_t kAllocatorPostFreeLinkWindowMs = 32;
+	// 0.6.3 used 32 ms derived from ONE event (the 2026-09-23 21:37:41 link write,
+	// one GetTickCount64 tick after the recorded free). The 2026-09-24 in-game trip
+	// falsified that derivation: our free hook records the free tick BEFORE it
+	// calls the original free, so the allocator's link write follows the record by
+	// the duration of our own remaining hook work (a stack capture and ledger
+	// lookups), and hk_SfRealloc records the free of the old block only AFTER
+	// o_SfRealloc returns, so the write can precede the record by the same kind of
+	// latency. The trip measures those gaps directly: 0-114 ms after the recorded
+	// free and 1-165 ms before it. 250 ms is the next round bound above the
+	// observed worst case, and the two genuine delayed writes in the same corpus
+	// are 1858 ms and 12379 ms later -- an order of magnitude outside it.
+	//
+	// The window is applied on BOTH sides of the recorded free (see
+	// ClassifyWriteAgainstFree), because both directions are the allocator's own
+	// operation; only a write outside it is a genuine delayed write-after-free.
+	// Residual risk, stated plainly: a genuine use-after-free write landing within
+	// 250 ms of the free is treated as allocator bookkeeping and missed. That is
+	// the price of not reporting every free-list insertion; the window is a
+	// bounded silence, not a claim of completeness.
+	inline constexpr std::uint64_t kAllocatorBookkeepingWindowMs = 250;
 
-	[[nodiscard]] constexpr bool IsAllocatorPostFreeLink(
-		std::uint64_t a_freeTick, std::uint64_t a_trapTick, std::uint64_t a_windowMs) noexcept
+	// Which free the classifier used. The slot snapshot's Release tick and the
+	// free ring's newest record for the same address are two different events in
+	// general (the ring never invalidates a record when the address is recycled),
+	// so which one won is part of the evidence, not an implementation detail.
+	enum class FreeTickSource : std::uint8_t
+	{
+		kNone = 0,
+		kSlotSnapshot = 1,
+		kFreeRing = 2,
+	};
+
+	[[nodiscard]] constexpr const char* FreeTickSourceName(FreeTickSource a_source) noexcept
+	{
+		switch (a_source) {
+		case FreeTickSource::kSlotSnapshot:
+			return "slot-release";
+		case FreeTickSource::kFreeRing:
+			return "free-ring";
+		default:
+			return "none";
+		}
+	}
+
+	// The free tick to classify against: the free ring's newest record for the
+	// address WINS whenever it is NEWER than the slot's Release tick. The reverse
+	// order was the 0.6.3 defect -- an already-released slot's stale Release tick
+	// shadowed a newer free record, and a write that was the allocator linking the
+	// just-freed block was reported as a clobber (the 17:56:56 case: slot tick
+	// 261486289, ring 261487115, trap 261487115, i.e. a delta of 826 ms instead of
+	// 0). When the ring's record is OLDER it is from a previous life of a recycled
+	// address, so the slot's own Release (a later free of the same address) is the
+	// better evidence and is kept.
+	[[nodiscard]] constexpr std::uint64_t PreferNewestFreeTick(std::uint64_t a_slotFreeTick, std::uint64_t a_ringFreeTick) noexcept
+	{
+		return a_ringFreeTick > a_slotFreeTick ? a_ringFreeTick : a_slotFreeTick;
+	}
+
+	// What the recorded free says about a first-word write. The two allocator
+	// cases are kept apart instead of being forced through one post-free window:
+	// they are different orderings of the same operation, and a reader has to be
+	// able to tell which one was seen.
+	enum class WatchpointFreeContext : std::uint8_t
+	{
+		kLive,                   // no free recorded for this address: a free explains nothing
+		kPostFreeLink,           // free <= trap, within the window: the allocator linking it
+		kReallocInProgress,      // trap < free, within the window: the free lands after the write
+		kFreePredatesArm,        // the free predates THIS arm: stale evidence about a recycled address
+		kDelayedWriteAfterFree,  // free >= arm and outside the window: a genuine delayed UAF
+	};
+
+	[[nodiscard]] constexpr const char* WatchpointFreeContextName(WatchpointFreeContext a_context) noexcept
+	{
+		switch (a_context) {
+		case WatchpointFreeContext::kPostFreeLink:
+			return "allocator-post-free-link";
+		case WatchpointFreeContext::kReallocInProgress:
+			return "allocator-realloc-in-progress";
+		case WatchpointFreeContext::kFreePredatesArm:
+			return "free-predates-arm";
+		case WatchpointFreeContext::kDelayedWriteAfterFree:
+			return "delayed-write-after-free";
+		default:
+			return "live";
+		}
+	}
+
+	// Only these two are the allocator's own bookkeeping. `kFreePredatesArm` is
+	// deliberately NOT one of them: when the free ring's only record for the
+	// address is older than the arm, the write is real and unclassified (the
+	// address was recycled, or a watch was armed on an already-freed block), and
+	// silencing it would hide a write to a freed block.
+	[[nodiscard]] constexpr bool FreeContextIsAllocatorBookkeeping(WatchpointFreeContext a_context) noexcept
+	{
+		return a_context == WatchpointFreeContext::kPostFreeLink || a_context == WatchpointFreeContext::kReallocInProgress;
+	}
+
+	// The classifier, applied the same way in the trap path and in the drainer
+	// (defence in depth for the race where the free record lands after the trap).
+	// `a_armTick` is 0 when unknown; for a released slot the snapshot's armedTick
+	// IS the release tick, so the predates-arm test is a no-op there by design.
+	[[nodiscard]] constexpr WatchpointFreeContext ClassifyWriteAgainstFree(
+		std::uint64_t a_freeTick, std::uint64_t a_armTick, std::uint64_t a_trapTick, std::uint64_t a_windowMs) noexcept
 	{
 		if (a_freeTick == 0) {
-			return false;  // no recorded free: nothing for the allocator to have linked
+			return WatchpointFreeContext::kLive;
 		}
-		if (a_trapTick < a_freeTick) {
-			return false;  // clock moved backwards, or the write preceded the free
+		if (a_armTick != 0 && a_freeTick < a_armTick) {
+			return WatchpointFreeContext::kFreePredatesArm;
 		}
-		return (a_trapTick - a_freeTick) <= a_windowMs;
+		if (a_trapTick >= a_freeTick) {
+			return (a_trapTick - a_freeTick) <= a_windowMs ? WatchpointFreeContext::kPostFreeLink
+													 : WatchpointFreeContext::kDelayedWriteAfterFree;
+		}
+		return (a_freeTick - a_trapTick) <= a_windowMs ? WatchpointFreeContext::kReallocInProgress
+													: WatchpointFreeContext::kDelayedWriteAfterFree;
 	}
 }

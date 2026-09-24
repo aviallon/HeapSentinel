@@ -137,3 +137,13 @@ namespace hstest
 
 #define HS_CHECK_NE(actual, unexpected) \
 	::hstest::CheckNe(__FILE__, __LINE__, (actual), (unexpected), #actual, #unexpected)
+
+// Like HS_CHECK, but the failure message carries extra context (which corpus row,
+// which tick). Only the failing path builds the string.
+#define HS_CHECK_MSG(expr, message)                                                        \
+	do {                                                                                    \
+		++::hstest::CheckCount();                                                            \
+		if (!(expr)) {                                                                       \
+			::hstest::Fail(__FILE__, __LINE__, std::string{ #expr } + " -- " + (message));    \
+		}                                                                                    \
+	} while (false)

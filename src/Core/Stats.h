@@ -47,6 +47,14 @@ namespace hs
 		std::uint64_t watchTrips = 0;
 		std::uint64_t watchReports = 0;
 		std::uint64_t watchReportDrops = 0;
+		// 0.6.4: why write reports were suppressed, and -- for an unattributed #DB --
+		// whether the debug-register state was actually MEASURED. The 2026-09-24 trip
+		// could not answer that last question from the log at all.
+		std::uint64_t watchPostFreeSuppressed = 0;
+		std::uint64_t watchReallocSuppressed = 0;
+		std::uint64_t watchFreePredatesArm = 0;
+		std::uint64_t watchDrReadFailed = 0;
+		std::uint64_t watchDrReadZero = 0;
 
 		std::string health;
 	};

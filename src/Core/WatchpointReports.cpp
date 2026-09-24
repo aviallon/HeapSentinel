@@ -131,6 +131,20 @@ namespace hs
 		return copied;
 	}
 
+	void WatchpointReports::NoteUnattributedMeasured(DebugRegisterMeasurement a_measurement) noexcept
+	{
+		switch (a_measurement) {
+		case DebugRegisterMeasurement::kReadFailed:
+			_drReadFailed.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case DebugRegisterMeasurement::kReadZero:
+			_drReadZero.fetch_add(1, std::memory_order_relaxed);
+			break;
+		default:
+			break;
+		}
+	}
+
 	std::size_t WatchpointReports::Count() const noexcept
 	{
 		const auto written = _writeCursor.load(std::memory_order_acquire);
@@ -153,6 +167,7 @@ namespace hs
 		_readCursor.store(0, std::memory_order_relaxed);
 		_recorded.store(0, std::memory_order_relaxed);
 		_dropped.store(0, std::memory_order_relaxed);
+		ResetSuppressionCountersForTesting();
 	}
 
 	std::size_t EncodeWatchpointReport(const WatchpointReport& a_report, char* a_buffer, std::size_t a_size) noexcept
@@ -183,6 +198,68 @@ namespace hs
 			static_cast<unsigned long long>(a_report.drAddress[1]),
 			static_cast<unsigned long long>(a_report.drAddress[2]),
 			static_cast<unsigned long long>(a_report.drAddress[3]));
-		return static_cast<std::size_t>(written < 0 ? 0 : written);
+
+		if (written < 0) {
+			return 0;
+		}
+		const auto haveDr = a_report.drReadSource != kDrSourceNone || a_report.drReadStatus != kDrReadNotAttempted;
+		const auto haveFreeSource = a_report.freeTickSource != 0;  // FreeTickSource::kNone == 0
+		if (!haveDr && !haveFreeSource) {
+			return static_cast<std::size_t>(written);
+		}
+
+		// 0.6.4 FIX A/B, second line: HOW the DR fields above were obtained, and
+		// WHICH free the classifier used. Kept on its own line so a record with no
+		// provenance (or a reader grepping the 0.6.3 field order) is unchanged.
+		const char* source = "none";
+		switch (a_report.drReadSource) {
+		case kDrSourceExceptionContext:
+			source = "exception-record";
+			break;
+		case kDrSourceCurrentThread:
+			source = "faulting-thread-read(no-suspend)";
+			break;
+		default:
+			break;
+		}
+		const char* status = "not-attempted";
+		switch (a_report.drReadStatus) {
+		case kDrReadOk:
+			status = "ok";
+			break;
+		case kDrReadFailed:
+			status = "FAILED";
+			break;
+		default:
+			break;
+		}
+
+		std::size_t offset = static_cast<std::size_t>(written);
+		if (offset >= a_size) {
+			offset = a_size - 1;
+		}
+		const auto appended = std::snprintf(a_buffer + offset, a_size - offset,
+			"\n  dr_used=%s dr_read=%s dr_err=%u disagrees=%d trap_flag=%d free_from=%s\n"
+			"    exception-record: dr6=0x%X dr7=0x%X dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX\n"
+			"    faulting-thread-read: dr6=0x%X dr7=0x%X dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX eflags=0x%X",
+			source, status, a_report.drReadError,
+			(a_report.drReadFlags & kWatchReportDrContextDisagrees) != 0 ? 1 : 0,
+			(a_report.flags & kWatchReportTrapFlagSet) != 0 ? 1 : 0,
+			FreeTickSourceName(static_cast<FreeTickSource>(a_report.freeTickSource)),
+			a_report.contextDr6, a_report.contextDr7,
+			static_cast<unsigned long long>(a_report.contextDrAddress[0]),
+			static_cast<unsigned long long>(a_report.contextDrAddress[1]),
+			static_cast<unsigned long long>(a_report.contextDrAddress[2]),
+			static_cast<unsigned long long>(a_report.contextDrAddress[3]),
+			a_report.threadDr6, a_report.threadDr7,
+			static_cast<unsigned long long>(a_report.threadDrAddress[0]),
+			static_cast<unsigned long long>(a_report.threadDrAddress[1]),
+			static_cast<unsigned long long>(a_report.threadDrAddress[2]),
+			static_cast<unsigned long long>(a_report.threadDrAddress[3]),
+			a_report.contextEFlags);
+		if (appended < 0) {
+			return static_cast<std::size_t>(written);
+		}
+		return static_cast<std::size_t>(written) + static_cast<std::size_t>(appended);
 	}
 }
