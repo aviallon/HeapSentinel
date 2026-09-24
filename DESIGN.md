@@ -1025,10 +1025,23 @@ survivors are a new question (why were we watching an address whose only free
 record predates the arm?) rather than a regression.
 
 **The headline, stated honestly.** After the trip: the instrument survives a real
-in-game session and produces records -- no third-party module has yet been
-observed as the writer of a clobbered vtable. Every writer in the corpus is the
-engine's own allocator code, the game's CRT, or the Wine loader. The corruptor
-question is still open, with the allocator's own noise now identified.
+in-game session and produces records, and the writers it names are overwhelmingly
+the engine's own allocator code and the game's CRT -- **but a third-party module
+has now been observed as the writer.** The v0.6.3 session's log kept growing
+after the 18:02:36 window the first analysis covered, and the five later write
+reports include two written by `QuickLootIE.dll+0x9ADB9` (the AE port of the very
+mod whose vtable corruption started this feature at 0.6.0) and others by
+`SkyrimSE.exe+0xD0500C` and `+0xD5A843`, all over the first qword of a block
+whose free record PREDATES the arm. Four of those five are still reported under
+0.6.4's rules, labelled `free-predates-arm`; the fifth -- a `QuickLootIE` write
+whose block's free record is 174 ms earlier and whose arm tick equals that free
+tick -- would be silenced as an allocator post-free link. That is a concrete
+instance of the window's residual risk, on the one writer that matters, and it is
+recorded here rather than smoothed over. The corruptor question is open in the
+sense that this is a correlation, not a proof of an owning bug: the free ring
+never invalidates a record when an address is recycled, so `free-predates-arm`
+means "the free evidence is older than this arm" and not "this module corrupted
+a live object".
 
 ### 13.5 Shutdown and the final-state assertion
 
