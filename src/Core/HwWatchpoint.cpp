@@ -69,11 +69,13 @@ namespace hs::hw
 
 	bool ReadCurrentThread(ThreadDebugState& a_out, std::uint32_t* a_outError)
 	{
-		const bool ok = ReadThread(::GetCurrentThread(), a_out);
-		if (a_outError) {
-			*a_outError = ok ? 0u : static_cast<std::uint32_t>(::GetLastError());
-		}
-		return ok;
+	// MUTATION M6 (temporary): the explicit read never succeeds, so the trap
+	// path falls back to the exception context only -- the 0.6.3 state.
+	(void)a_out;
+	if (a_outError) {
+		*a_outError = 87u;
+	}
+	return false;
 	}
 
 	bool ReadThread(HANDLE a_thread, ThreadDebugState& a_out)
