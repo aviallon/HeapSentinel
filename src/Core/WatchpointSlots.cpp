@@ -96,7 +96,8 @@ namespace hs
 				slot.allocSite = a_allocSite;
 				slot.armedTick = a_tick;
 				slot.freeTick = 0;
-				slot.allocInstance = a_allocInstance;
+				slot.allocInstance = 0;  // MUTATION M4 (temporary)
+				(void)a_allocInstance;
 				slot.freeInstance = 0;
 				slot.generation = a_generation;
 				slot.threadId = a_threadId;
