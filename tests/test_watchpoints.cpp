@@ -149,23 +149,137 @@ HS_TEST(watchpoint_structural_consume_rule_is_independent_of_classification)
 	HS_CHECK_EQ(hs::BuildDr7(nothing, hs::kWatchpointSlotCount), 0ull);
 }
 
-HS_TEST(watchpoint_post_free_window_matches_the_observed_link)
+HS_TEST(watchpoint_free_classifier_keeps_the_two_allocator_cases_apart)
 {
-	using hs::IsAllocatorPostFreeLink;
-	constexpr std::uint64_t kWindow = hs::kAllocatorPostFreeLinkWindowMs;
+	using hs::WatchpointFreeContext;
+	constexpr std::uint64_t kWindow = hs::kAllocatorBookkeepingWindowMs;
+	using hs::ClassifyWriteAgainstFree;
 
-	// The evidence (2026-09-23 21:37:41): freed at 188333102, link written at
-	// 188333103 -- one tick later. That MUST be silent.
-	HS_CHECK(IsAllocatorPostFreeLink(188333102ull, 188333103ull, kWindow));
+	// The evidence that started this (2026-09-23 21:37:41): freed at 188333102, the
+	// link written at 188333103 -- one tick later. That MUST be silent, and it is
+	// the POST-FREE side. (armedTick is 0 here: unknown, which disables the
+	// predates-arm test.)
+	HS_CHECK(ClassifyWriteAgainstFree(188333102ull, 0, 188333103ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
 	// Same tick and the end of the window are also the allocator linking.
-	HS_CHECK(IsAllocatorPostFreeLink(100ull, 100ull, kWindow));
-	HS_CHECK(IsAllocatorPostFreeLink(100ull, 100ull + kWindow, kWindow));
-	// One tick past the window: a genuine delayed use-after-free, reported.
-	HS_CHECK(!IsAllocatorPostFreeLink(100ull, 100ull + kWindow + 1ull, kWindow));
+	HS_CHECK(ClassifyWriteAgainstFree(100ull, 0, 100ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	HS_CHECK(ClassifyWriteAgainstFree(100ull, 0, 100ull + kWindow, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	// One tick past the window is a genuine delayed use-after-free, reported.
+	HS_CHECK(ClassifyWriteAgainstFree(100ull, 0, 100ull + kWindow + 1ull, kWindow) == WatchpointFreeContext::kDelayedWriteAfterFree);
 	// No recorded free: not attributable to the allocator at all.
-	HS_CHECK(!IsAllocatorPostFreeLink(0ull, 12345ull, kWindow));
-	// Clock going backwards is never treated as a link.
-	HS_CHECK(!IsAllocatorPostFreeLink(500ull, 499ull, kWindow));
+	HS_CHECK(ClassifyWriteAgainstFree(0ull, 0, 12345ull, kWindow) == WatchpointFreeContext::kLive);
+
+	// RECALL vs FORWARD: the free record landing AFTER the trap is the realloc
+	// case (hk_SfRealloc calls o_SfRealloc first), a DIFFERENT context from the
+	// post-free link -- forcing it through the post-free window is the 0.6.3 bug.
+	// The 17:56:55 corpus rows: trap 261486322 / 261486342, ring free 261486289.
+	HS_CHECK(ClassifyWriteAgainstFree(261486289ull, 0, 261486322ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	HS_CHECK(ClassifyWriteAgainstFree(261486322ull, 0, 261486289ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
+	HS_CHECK(ClassifyWriteAgainstFree(261486289ull, 0, 261486289ull, kWindow) == WatchpointFreeContext::kPostFreeLink);
+	// A free far in the future is not a realloc: it is not bookkeeping, so it is
+	// never suppressed.
+	HS_CHECK(ClassifyWriteAgainstFree(100ull + kWindow + 1ull, 0, 100ull, kWindow) == WatchpointFreeContext::kDelayedWriteAfterFree);
+
+	// Only the two allocator orderings are bookkeeping. `kFreePredatesArm` and
+	// `kDelayedWriteAfterFree` are NOT: silencing them would hide a real write.
+	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kPostFreeLink));
+	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kReallocInProgress));
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kFreePredatesArm));
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kDelayedWriteAfterFree));
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(WatchpointFreeContext::kLive));
+
+	// A free record that PREDATES this arm is stale evidence about this watch
+	// (rows 2 and 8 of the corpus: 0xA34DF900, 0xA33C04B0). It is reported and
+	// labelled, never assigned to the allocator.
+	HS_CHECK(ClassifyWriteAgainstFree(1000ull, 2000ull, 9000ull, kWindow) == WatchpointFreeContext::kFreePredatesArm);
+	// ...but a write before the arm that is ALSO before the free is the realloc
+	// ordering, because the free is not older than the arm in that case.
+	HS_CHECK(ClassifyWriteAgainstFree(2000ull, 1000ull, 1900ull, kWindow) == WatchpointFreeContext::kReallocInProgress);
+
+	// The window is one bound, used on BOTH sides (0.6.4). It is larger than the
+	// 0.6.3 32 ms because the trip measured our own free hook's latency between
+	// the tick we record and the original free call / o_SfRealloc return.
+	HS_CHECK(hs::kAllocatorBookkeepingWindowMs >= 165ull);
+}
+
+HS_TEST(watchpoint_prefers_the_free_rings_newest_record_over_the_slot_tick)
+{
+	// The concrete 2026-09-24 17:56:56 case: slot Release tick 261486289, free ring
+	// 261487115, trap 261487115. 0.6.3 used the slot tick and reported a delta of
+	// 826 ms instead of 0. The ring's newest record must win.
+	HS_CHECK_EQ(hs::PreferNewestFreeTick(261486289ull, 261487115ull), 261487115ull);
+	// When the ring's record is OLDER it is from a previous life of a recycled
+	// address, so the slot's own (later) Release is the better evidence.
+	HS_CHECK_EQ(hs::PreferNewestFreeTick(2000ull, 1000ull), 2000ull);
+	HS_CHECK_EQ(hs::PreferNewestFreeTick(0ull, 1000ull), 1000ull);
+	HS_CHECK_EQ(hs::PreferNewestFreeTick(1000ull, 0ull), 1000ull);
+	HS_CHECK_EQ(hs::PreferNewestFreeTick(0ull, 0ull), 0ull);
+
+	// End to end through the real ring: record a free, then classify the trap that
+	// the stale slot tick would have mis-labelled.
+	auto& ring = hs::ScaleformFreeRing::Get();
+	ring.Init(64);
+	hs::ScaleformFreeRecord record;
+	record.ptr = 0xA3AC1410ull;
+	record.freeTick = 261487115ull;
+	ring.Record(record);
+
+	hs::ScaleformFreeRecord found;
+	HS_CHECK(ring.Find(0xA3AC1410ull, found));
+	HS_CHECK_EQ(found.freeTick, 261487115ull);
+
+	const auto slotTick = 261486289ull;                 // the stale slot Release tick
+	const auto trap = 261487115ull;                     // the run's trap tick
+	const auto freeTick = hs::PreferNewestFreeTick(slotTick, found.freeTick);
+	HS_CHECK_EQ(freeTick, 261487115ull);
+	HS_CHECK_EQ(trap - freeTick, 0ull);
+	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(
+		hs::ClassifyWriteAgainstFree(freeTick, 0, trap, hs::kAllocatorBookkeepingWindowMs)));
+	// The 0.6.3 behaviour, for contrast: 32 ms was the old window, and the slot
+	// tick alone is 826 ms early, so the write was reported as a clobber.
+	HS_CHECK_EQ(slotTick + 826ull, trap);
+	HS_CHECK(!hs::FreeContextIsAllocatorBookkeeping(
+		hs::ClassifyWriteAgainstFree(slotTick, 0, trap, /*0.6.3 window, for contrast=*/32ull)));
+
+	// Every free tick source has a name (the log says which one won).
+	HS_CHECK(std::string{ hs::FreeTickSourceName(hs::FreeTickSource::kFreeRing) } == "free-ring");
+	HS_CHECK(std::string{ hs::FreeTickSourceName(hs::FreeTickSource::kSlotSnapshot) } == "slot-release");
+	HS_CHECK(std::string{ hs::FreeTickSourceName(hs::FreeTickSource::kNone) } == "none");
+	// ...and every free context does too (the report prints it).
+	HS_CHECK(std::string{ hs::WatchpointFreeContextName(hs::WatchpointFreeContext::kReallocInProgress) } ==
+		"allocator-realloc-in-progress");
+	HS_CHECK(std::string{ hs::WatchpointFreeContextName(hs::WatchpointFreeContext::kFreePredatesArm) } == "free-predates-arm");
+
+	ring.Shutdown();
+}
+
+HS_TEST(watchpoint_debug_register_measurement_distinguishes_failed_from_zero)
+{
+	using hs::DebugRegisterMeasurement;
+	using hs::ClassifyDebugRegisterMeasurement;
+
+	const std::uintptr_t none[hs::kWatchpointSlotCount] = { 0, 0, 0, 0 };
+	const std::uintptr_t some[hs::kWatchpointSlotCount] = { 0x27D0F000, 0, 0, 0 };
+
+	// The 0.6.3 hole: 104/104 records printed dr6=dr7=dr0-3=0, and nothing said
+	// whether that was a FAILED read or a successful read that returned zero. The
+	// two are now different outcomes of the same input.
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceCurrentThread, hs::kDrReadFailed, 0, none, 4) ==
+		DebugRegisterMeasurement::kReadFailed);
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceCurrentThread, hs::kDrReadOk, 0, none, 4) ==
+		DebugRegisterMeasurement::kReadZero);
+	// A successful read that found a breakpoint armed is a real measurement.
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceCurrentThread, hs::kDrReadOk, 0x2, none, 4) ==
+		DebugRegisterMeasurement::kReadNonZero);
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceCurrentThread, hs::kDrReadOk, 0, some, 4) ==
+		DebugRegisterMeasurement::kReadNonZero);
+	// The exception-context fallback is a source, so a failing read from it is
+	// still "failed", not "no attempt".
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceExceptionContext, hs::kDrReadFailed, 0, none, 4) ==
+		DebugRegisterMeasurement::kReadFailed);
+	// A record with no provenance at all is not a measurement, and must not be
+	// mistaken for a successful zero read (that was the 0.6.3 misreading).
+	HS_CHECK(ClassifyDebugRegisterMeasurement(hs::kDrSourceNone, hs::kDrReadNotAttempted, 0, none, 4) ==
+		DebugRegisterMeasurement::kNotAttempted);
 }
 
 HS_TEST(watchpoint_slot_records_the_block_free_tick)
@@ -238,7 +352,113 @@ HS_TEST(watchpoint_unattributed_report_encoding_carries_the_raw_dr_state)
 	HS_CHECK(text.find("writer_rip=0x7FF6AABBCCDD") != std::string::npos);
 	HS_CHECK(text.find("dr0=0x27D0F000") != std::string::npos);
 
-	// The record survives the ring, flags and all.
+	// 0.6.4 FIX A: a record with no provenance says nothing about the DR fields
+	// (the second line is absent), which is exactly why 0.6.3's zeros were
+	// unreadable. Case 1 is the 0.6.3 hole: the exception record carries nothing
+	// AND the explicit read of the faulting thread FAILED -- so the fields are not
+	// a measurement, and the record now says so with the error code.
+	report.drReadSource = hs::kDrSourceExceptionContext;
+	report.drReadStatus = hs::kDrReadFailed;
+	report.drReadError = 87;  // ERROR_INVALID_PARAMETER, as GetThreadContext would set it
+	report.contextDr6 = 0;
+	report.contextDr7 = 0;
+	report.contextEFlags = 0x246;
+	report.contextDrAddress[0] = 0;
+	report.drReadFlags = 0;
+	report.flags = hs::kWatchReportUnattributed | hs::kWatchReportDrMeasured;
+	const auto provenance = hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	HS_CHECK(provenance > 0);
+	HS_CHECK(provenance < sizeof(buffer));
+	const std::string provText{ buffer };
+	HS_CHECK(provText.find("dr_used=exception-record") != std::string::npos);
+	HS_CHECK(provText.find("dr_read=FAILED") != std::string::npos);
+	HS_CHECK(provText.find("dr_err=87") != std::string::npos);
+	HS_CHECK(provText.find("trap_flag=0") != std::string::npos);
+	HS_CHECK(provText.find("free_from=none") != std::string::npos);
+	HS_CHECK(hs::ClassifyDebugRegisterMeasurement(report.drReadSource, report.drReadStatus, report.dr6,
+				report.drAddress, hs::kWatchpointSlotCount) == hs::DebugRegisterMeasurement::kReadFailed);
+
+	// Case 2: the host DID populate the exception record, the explicit read
+	// succeeded too, and the two disagree. BOTH sets must be in the encoding (that
+	// comparison is the answer 0.6.3 could not produce) and EFlags is recorded.
+	report.drReadStatus = hs::kDrReadOk;
+	report.drReadError = 0;
+	report.dr6 = 0xFFFF0FF2;
+	report.dr7 = 0x99990055;
+	report.drAddress[0] = 0x12340000;
+	report.contextDr6 = 0xFFFF0FF2;
+	report.contextDr7 = 0x99990055;
+	report.contextEFlags = 0x10246;  // TF (0x100) is set
+	report.contextDrAddress[0] = 0x12340000;
+	report.threadDr6 = 0x99990055;
+	report.threadDr7 = 0x00000001;
+	report.threadDrAddress[0] = 0;
+	report.drReadFlags = hs::kWatchReportDrContextDisagrees;
+	report.flags = hs::kWatchReportUnattributed | hs::kWatchReportDrMeasured | hs::kWatchReportTrapFlagSet;
+	(void)hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	const std::string bothText{ buffer };
+	HS_CHECK(bothText.find("disagrees=1") != std::string::npos);
+	HS_CHECK(bothText.find("trap_flag=1") != std::string::npos);
+	HS_CHECK(bothText.find("exception-record: dr6=0xFFFF0FF2 dr7=0x99990055 dr0=0x12340000") != std::string::npos);
+	HS_CHECK(bothText.find("faulting-thread-read: dr6=0x99990055 dr7=0x1 dr0=0x0") != std::string::npos);
+	HS_CHECK(bothText.find("eflags=0x10246") != std::string::npos);
+	HS_CHECK(hs::ClassifyDebugRegisterMeasurement(report.drReadSource, report.drReadStatus, report.dr6,
+				report.drAddress, hs::kWatchpointSlotCount) == hs::DebugRegisterMeasurement::kReadNonZero);
+
+	// The free-tick source is carried too (FIX B): which free the classifier used.
+	report.freeTickSource = static_cast<std::uint32_t>(hs::FreeTickSource::kFreeRing);
+	(void)hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	HS_CHECK(std::string{ buffer }.find("free_from=free-ring") != std::string::npos);
+
+	// Case 3: the explicit read SUCCEEDED and genuinely returned zero while the
+	// exception record was empty. This is a DIFFERENT record from a failed read --
+	// the distinction FIX A exists to make -- and it means the host delivered a
+	// single step with no debug register set at all.
+	report.drReadSource = hs::kDrSourceCurrentThread;
+	report.drReadStatus = hs::kDrReadOk;
+	report.drReadError = 0;
+	report.dr6 = 0;
+	report.dr7 = 0;
+	report.drAddress[0] = 0;
+	report.contextDr6 = 0;
+	report.contextDr7 = 0;
+	report.contextDrAddress[0] = 0;
+	report.threadDr6 = 0;
+	report.threadDr7 = 0;
+	report.threadDrAddress[0] = 0;
+	report.drReadFlags = 0;
+	report.flags = hs::kWatchReportUnattributed | hs::kWatchReportDrMeasured;
+	(void)hs::EncodeWatchpointReport(report, buffer, sizeof(buffer));
+	const std::string zeroText{ buffer };
+	HS_CHECK(zeroText.find("dr_used=faulting-thread-read(no-suspend)") != std::string::npos);
+	HS_CHECK(zeroText.find("dr_read=ok") != std::string::npos);
+	HS_CHECK(zeroText.find("trap_flag=0") != std::string::npos);
+	HS_CHECK(hs::ClassifyDebugRegisterMeasurement(report.drReadSource, report.drReadStatus, report.dr6,
+				report.drAddress, hs::kWatchpointSlotCount) == hs::DebugRegisterMeasurement::kReadZero);
+
+	// The two counters the stats line reports are driven by the classifier, so a
+	// regression in either surfaces as a number in the log.
+	auto& reportsForCounters = hs::WatchpointReports::Get();
+	reportsForCounters.ResetSuppressionCountersForTesting();
+	reportsForCounters.NoteUnattributedMeasured(hs::DebugRegisterMeasurement::kReadFailed);
+	reportsForCounters.NoteUnattributedMeasured(hs::DebugRegisterMeasurement::kReadZero);
+	reportsForCounters.NoteUnattributedMeasured(hs::DebugRegisterMeasurement::kReadZero);
+	reportsForCounters.NotePostFreeSuppressed();
+	reportsForCounters.NoteReallocSuppressed();
+	reportsForCounters.NoteReallocSuppressed();
+	reportsForCounters.NoteFreePredatesArm();
+	HS_CHECK_EQ(reportsForCounters.UnattributedDrReadFailed(), 1ull);
+	HS_CHECK_EQ(reportsForCounters.UnattributedDrReadZero(), 2ull);
+	HS_CHECK_EQ(reportsForCounters.PostFreeSuppressed(), 1ull);
+	HS_CHECK_EQ(reportsForCounters.ReallocSuppressed(), 2ull);
+	HS_CHECK_EQ(reportsForCounters.FreePredatesArm(), 1ull);
+
+	// The record survives the ring with BOTH DR sets and the provenance.
+	report.dr7 = 0x99990055;
+	report.drAddress[0] = 0x27D0F000ull;
+	report.threadDr6 = 0x2;
+	report.threadDr7 = 0x1;
+	report.threadDrAddress[0] = 0ull;
 	auto& reports = hs::WatchpointReports::Get();
 	reports.Init(8);
 	reports.ResetForTesting();
@@ -246,9 +466,14 @@ HS_TEST(watchpoint_unattributed_report_encoding_carries_the_raw_dr_state)
 	hs::WatchpointReport out[8]{};
 	HS_CHECK_EQ(reports.Drain(out, 8), 1u);
 	HS_CHECK((out[0].flags & hs::kWatchReportUnattributed) != 0u);
-	HS_CHECK_EQ(out[0].dr7, 0x4u);
+	HS_CHECK_EQ(out[0].dr7, 0x99990055u);
 	HS_CHECK(out[0].anyDrProgrammed);
 	HS_CHECK_EQ(out[0].drAddress[0], 0x27D0F000ull);
+	HS_CHECK_EQ(out[0].threadDr6, 0x2u);
+	HS_CHECK_EQ(out[0].threadDr7, 0x1u);
+	HS_CHECK_EQ(out[0].threadDrAddress[0], 0ull);
+	HS_CHECK_EQ(out[0].drReadSource, hs::kDrSourceCurrentThread);
+	HS_CHECK_EQ(out[0].drReadStatus, hs::kDrReadOk);
 	reports.Shutdown();
 }
 
@@ -556,6 +781,124 @@ HS_TEST(watchpoint_slots_clear_all_reports_what_it_cleared)
 // The preallocated trap report ring + its deterministic encoding
 // ---------------------------------------------------------------------------
 
+HS_TEST(watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_designed)
+{
+	// The v0.6.3 in-game trip (2026-09-24, build 4f409330007c) produced 21
+	// watchpoint-write reports. 18 of them share the allocator-bookkeeping shape:
+	// the armed value was a genuine vtable in the exe range and the value after
+	// the write was a heap pointer or 0. The ticks below are the run's own
+	// numbers, read out of HeapSentinel.log / HeapSentinel-reports.log:
+	//   trapTick      = trap_tick
+	//   slotFreeTick  = the 0.6.3 report's free_tick (the slot's Release tick)
+	//   ringFreeTick  = "Scaleform free record: freed at tick X" (the free ring)
+	//   armTick       = armed_tick
+	// The expectation is the 0.6.4 rule: free = max(slot, ring), one bounded
+	// window on both sides, and only the two ALLOCATOR orderings suppressed.
+	struct Row
+	{
+		std::uint64_t           trap;
+		std::uint64_t           slotFree;
+		std::uint64_t           ringFree;
+		std::uint64_t           arm;
+		bool                    staleArm;
+		const char*             writer;
+		hs::WatchpointFreeContext expected;
+	};
+
+	const Row rows[] = {
+		{ 261331396ull, 261331347ull, 261331427ull, 261331347ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261343708ull, 261331329ull, 261331329ull, 261332401ull, false, "VCRUNTIME140.dll+0x1294B", hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 261350107ull, 261350022ull, 261350022ull, 261350022ull, false, "SkyrimSE.exe+0x1191FD6", hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261373926ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261373974ull, 261373860ull, 261373860ull, 261372940ull, true, "SkyrimSE.exe+0x11920D9", hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261418699ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11918CE", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261418718ull, 261418666ull, 261418719ull, 261418666ull, false, "SkyrimSE.exe+0x11920CA", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261420558ull, 261418700ull, 261418700ull, 261418808ull, false, "SkyrimSE.exe+0x11922AB", hs::WatchpointFreeContext::kFreePredatesArm },
+		{ 261423083ull, 261423031ull, 261423177ull, 261423031ull, false, "SkyrimSE.exe+0x11920F4", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452716ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452719ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452740ull, 261452663ull, 261452751ull, 261452663ull, false, "SkyrimSE.exe+0x1193C08", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452748ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452793ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261452824ull, 261452645ull, 261452884ull, 261452645ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261486322ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x119234E", hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261486342ull, 261486163ull, 261486289ull, 261486163ull, false, "SkyrimSE.exe+0x11922D0", hs::WatchpointFreeContext::kPostFreeLink },
+		// The case named in the 0.6.3 report: the stale slot Release tick (826 ms
+		// early) shadowed the ring's newest record, so a delta of 0 was reported
+		// with a delta of 826.
+		{ 261487115ull, 261486289ull, 261487115ull, 261486555ull, false, "SkyrimSE.exe+0x119214E", hs::WatchpointFreeContext::kPostFreeLink },
+		{ 261745821ull, 261745750ull, 261745985ull, 261745750ull, false, "SkyrimSE.exe+0x11917BA", hs::WatchpointFreeContext::kReallocInProgress },
+		{ 261788348ull, 261788288ull, 261788288ull, 261788288ull, false, "SkyrimSE.exe+0x1193AD5", hs::WatchpointFreeContext::kPostFreeLink },
+		// 12.4 s after the free, and its `after` value is a code pointer, so the
+		// drainer's benign shape rule drops it anyway. It is kept here as the
+		// corpus's genuine delayed-write row.
+		{ 261826937ull, 261817722ull, 261817722ull, 261817722ull, false, "SkyrimSE.exe+0x140D177B5", hs::WatchpointFreeContext::kDelayedWriteAfterFree },
+	};
+
+	std::size_t suppressed = 0;
+	std::size_t delayed = 0;
+	std::size_t predatesArm = 0;
+	std::size_t postFree = 0;
+	std::size_t reallocInProgress = 0;
+	for (const auto& row : rows) {
+		const auto freeTick = hs::PreferNewestFreeTick(row.slotFree, row.ringFree);
+		const auto got = hs::ClassifyWriteAgainstFree(freeTick, row.arm, row.trap, hs::kAllocatorBookkeepingWindowMs);
+		// HS_CHECK_EQ on the enum would not say which row failed, so compare the
+		// names and let a failure print the row's identity.
+		HS_CHECK_MSG(std::string{ hs::WatchpointFreeContextName(got) } ==
+				std::string{ hs::WatchpointFreeContextName(row.expected) },
+			std::string{ "corpus row trap=" } + std::to_string(row.trap) + " writer=" + row.writer + " expected=" +
+				hs::WatchpointFreeContextName(row.expected) + " got=" + hs::WatchpointFreeContextName(got));
+		if (hs::FreeContextIsAllocatorBookkeeping(got)) {
+			++suppressed;
+			if (got == hs::WatchpointFreeContext::kReallocInProgress) {
+				++reallocInProgress;
+			} else {
+				++postFree;
+			}
+		} else if (got == hs::WatchpointFreeContext::kDelayedWriteAfterFree) {
+			++delayed;
+		} else if (got == hs::WatchpointFreeContext::kFreePredatesArm) {
+			++predatesArm;
+		}
+	}
+
+	// The honest headline, asserted as a NUMBER so it cannot drift silently: of
+	// the 21 writes the trip produced, 18 are allocator bookkeeping and go silent
+	// (7 post-free links and 11 realloc-in-progress writes, a split DESIGN 13.4
+	// states), 2 report because their free evidence predates the arm, and 1 is a
+	// genuine delayed write (which the shape rule drops in the drainer).
+	HS_CHECK_EQ(suppressed, std::size_t{ 18 });
+	HS_CHECK_EQ(postFree, std::size_t{ 7 });
+	HS_CHECK_EQ(reallocInProgress, std::size_t{ 11 });
+	HS_CHECK_EQ(predatesArm, std::size_t{ 2 });
+	HS_CHECK_EQ(delayed, std::size_t{ 1 });
+	HS_CHECK_EQ(sizeof(rows) / sizeof(rows[0]), std::size_t{ 21 });
+
+	// The 18 shape-conforming, non-stale rows named in the task: 16 go silent and
+	// 2 remain (the two whose free record predates the arm). This is stated as a
+	// check rather than left implicit, because "the 18 should go silent" was the
+	// expectation and the truth is 16 + 2 labelled.
+	std::size_t shapeConforming = 0;
+	std::size_t shapeConformingSuppressed = 0;
+	for (const auto& row : rows) {
+		if (row.staleArm) {
+			continue;
+		}
+		if (std::string{ row.writer }.rfind("SkyrimSE.exe+0x140D", 0) == 0) {
+			continue;  // the one row whose `after` was a code pointer, not heap/0
+		}
+		++shapeConforming;
+		if (hs::FreeContextIsAllocatorBookkeeping(
+				hs::ClassifyWriteAgainstFree(hs::PreferNewestFreeTick(row.slotFree, row.ringFree), row.arm, row.trap,
+					hs::kAllocatorBookkeepingWindowMs))) {
+			++shapeConformingSuppressed;
+		}
+	}
+	HS_CHECK_EQ(shapeConforming, std::size_t{ 18 });
+	HS_CHECK_EQ(shapeConformingSuppressed, std::size_t{ 16 });
+}
+
 HS_TEST(watchpoint_reports_drain_oldest_first)
 {
 	auto& reports = hs::WatchpointReports::Get();
@@ -792,6 +1135,18 @@ namespace
 		bool           anyDrProgrammed = false;
 		int            unattributedRecorded = 0;
 		int            postFreeSuppressed = 0;
+		int            reallocSuppressed = 0;
+		int            freePredatesArm = 0;
+
+		// 0.6.4 FIX A: the model records BOTH DR sets, exactly as the plugin does, so
+		// a test can assert the measurement exists on real hardware AND that the
+		// explicit read itself worked.
+		std::uint32_t  drReadSource = hs::kDrSourceNone;
+		std::uint32_t  drReadStatus = hs::kDrReadNotAttempted;
+		std::uint32_t  drReadError = 0;
+		std::uint32_t  threadDr6 = 0;
+		std::uint32_t  threadDr7 = 0;
+		hs::DebugRegisterMeasurement measurement = hs::DebugRegisterMeasurement::kNotAttempted;
 
 		bool           consumed = false;
 		int            recorded = 0;
@@ -803,6 +1158,8 @@ namespace
 		bool           reportArmedWasCode = false;
 		std::uintptr_t reportValueAfter = 0;
 		bool           reportReadable = true;
+		hs::WatchpointFreeContext reportFreeContext = hs::WatchpointFreeContext::kLive;
+		hs::FreeTickSource        reportFreeSource = hs::FreeTickSource::kNone;
 	};
 	TrapModel g_model;
 
@@ -848,14 +1205,47 @@ namespace
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 		auto*          context = a_info->ContextRecord;
-		const auto     dr6 = static_cast<std::uint64_t>(context->Dr6);
-		const auto     dr7 = static_cast<std::uint64_t>(context->Dr7);
-		const std::uint64_t drAddress[hs::kWatchpointSlotCount] = {
+
+		// 0.6.4 FIX A, the PRODUCTION measurement: read the faulting thread's own
+		// debug state (no suspension needed) and keep the outcome. The model uses the
+		// same read the plugin uses, so breaking the read breaks this test.
+		hs::hw::ThreadDebugState drState;
+		g_model.drReadError = 0;
+		const bool drReadOk = hs::hw::ReadCurrentThread(drState, &g_model.drReadError);
+		g_model.drReadStatus = drReadOk ? hs::kDrReadOk : hs::kDrReadFailed;
+
+		const std::uint64_t contextDrAddress[hs::kWatchpointSlotCount] = {
 			static_cast<std::uint64_t>(context->Dr0),
 			static_cast<std::uint64_t>(context->Dr1),
 			static_cast<std::uint64_t>(context->Dr2),
 			static_cast<std::uint64_t>(context->Dr3),
 		};
+		const std::uint64_t contextDr6 = static_cast<std::uint64_t>(context->Dr6);
+		const std::uint64_t contextDr7 = static_cast<std::uint64_t>(context->Dr7);
+		// The PRODUCTION source selection: the exception record wins whenever it
+		// carries anything (on real Windows it does for a data breakpoint), and the
+		// faulting-thread read supplies the fields only when it does not.
+		const bool contextHasDr = contextDr6 != 0 || contextDr7 != 0 || contextDrAddress[0] != 0 ||
+			contextDrAddress[1] != 0 || contextDrAddress[2] != 0 || contextDrAddress[3] != 0;
+		const bool useThreadRead = drReadOk && !contextHasDr;
+		g_model.drReadSource = useThreadRead ? hs::kDrSourceCurrentThread : hs::kDrSourceExceptionContext;
+		g_model.threadDr6 = drReadOk ? static_cast<std::uint32_t>(drState.dr6) : 0u;
+		g_model.threadDr7 = drReadOk ? static_cast<std::uint32_t>(drState.dr7) : 0u;
+
+		const auto    dr6 = useThreadRead ? drState.dr6 : contextDr6;
+		const auto    dr7 = useThreadRead ? drState.dr7 : contextDr7;
+		const std::uint64_t threadDrAddress[hs::kWatchpointSlotCount] = {
+			static_cast<std::uint64_t>(drState.dr0),
+			static_cast<std::uint64_t>(drState.dr1),
+			static_cast<std::uint64_t>(drState.dr2),
+			static_cast<std::uint64_t>(drState.dr3),
+		};
+		std::uint64_t drAddress[hs::kWatchpointSlotCount] = {};
+		for (std::size_t slot = 0; slot < hs::kWatchpointSlotCount; ++slot) {
+			drAddress[slot] = useThreadRead ? threadDrAddress[slot] : contextDrAddress[slot];
+		}
+		g_model.measurement = hs::ClassifyDebugRegisterMeasurement(
+			g_model.drReadSource, g_model.drReadStatus, static_cast<std::uint32_t>(dr6), drAddress, hs::kWatchpointSlotCount);
 
 		bool          handled = false;
 		std::uint64_t cleared = dr7;
@@ -887,19 +1277,39 @@ namespace
 				valueAtArm = snap.valueAtArm;
 				armedWasCode = snap.armedWasCode;
 			}
-			std::uint64_t freeTick = tableValid ? snap.freeTick : 0;
-			if (freeTick == 0) {
-				hs::ScaleformFreeRecord freeRecord;
-				if (hs::ScaleformFreeRing::Get().Find(watched, freeRecord)) {
-					freeTick = freeRecord.freeTick;
+			// 0.6.4 FIX B, the PRODUCTION resolution: always consult the free ring and
+			// prefer its newest record over the slot's Release tick.
+			std::uint64_t         freeTick = tableValid ? snap.freeTick : 0;
+			hs::FreeTickSource    freeSource = freeTick != 0 ? hs::FreeTickSource::kSlotSnapshot : hs::FreeTickSource::kNone;
+			hs::ScaleformFreeRecord freeRecord;
+			if (hs::ScaleformFreeRing::Get().Find(watched, freeRecord) && freeRecord.freeTick != 0) {
+				const auto preferred = hs::PreferNewestFreeTick(freeTick, freeRecord.freeTick);
+				if (preferred != freeTick || freeSource == hs::FreeTickSource::kNone) {
+					freeSource = hs::FreeTickSource::kFreeRing;
 				}
+				freeTick = preferred;
 			}
+			const auto armTick = tableValid ? snap.armedTick : 0ull;
+			const auto freeContext = hs::ClassifyWriteAgainstFree(freeTick, armTick, ::GetTickCount64(),
+				hs::kAllocatorBookkeepingWindowMs);
+			// Recorded even when the write is then SUPPRESSED: "which context was it" is
+			// part of the evidence, and the suppression counter alone does not say
+			// whether it was the post-free or the realloc ordering.
+			g_model.reportFreeContext = freeContext;
+			g_model.reportFreeSource = freeSource;
 			std::uintptr_t after = 0;
 			const bool     readable = TestSafeRead(watched, after);
 			bool           record = armedWasCode && readable && after != valueAtArm;
-			if (record && hs::IsAllocatorPostFreeLink(freeTick, ::GetTickCount64(), hs::kAllocatorPostFreeLinkWindowMs)) {
+			if (record && hs::FreeContextIsAllocatorBookkeeping(freeContext)) {
 				record = false;
-				++g_model.postFreeSuppressed;
+				if (freeContext == hs::WatchpointFreeContext::kReallocInProgress) {
+					++g_model.reallocSuppressed;
+				} else {
+					++g_model.postFreeSuppressed;
+				}
+			}
+			if (record && freeContext == hs::WatchpointFreeContext::kFreePredatesArm) {
+				++g_model.freePredatesArm;
 			}
 			if (record) {
 				++g_model.recorded;
@@ -931,9 +1341,26 @@ namespace
 			report.dr7 = static_cast<std::uint32_t>(dr7);
 			report.anyDrProgrammed = g_model.anyDrProgrammed;
 			report.flags = hs::kWatchReportUnattributed;
+			report.drReadSource = g_model.drReadSource;
+			report.drReadStatus = g_model.drReadStatus;
+			report.drReadError = g_model.drReadError;
+			report.contextDr6 = static_cast<std::uint32_t>(context->Dr6);
+			report.contextDr7 = static_cast<std::uint32_t>(context->Dr7);
+			report.contextEFlags = static_cast<std::uint32_t>(context->EFlags);
+			report.threadDr6 = g_model.threadDr6;
+			report.threadDr7 = g_model.threadDr7;
+			report.drReadFlags = ((drReadOk && g_model.threadDr6 != report.contextDr6) ? hs::kWatchReportDrContextDisagrees : 0u);
+			report.flags |= hs::kWatchReportDrMeasured;
+			if ((context->EFlags & 0x100u) != 0) {
+				report.flags |= hs::kWatchReportTrapFlagSet;
+			}
 			for (std::size_t slot = 0; slot < hs::kWatchpointSlotCount; ++slot) {
 				report.drAddress[slot] = static_cast<std::uintptr_t>(drAddress[slot]);
+				report.contextDrAddress[slot] = static_cast<std::uintptr_t>(contextDrAddress[slot]);
+				report.threadDrAddress[slot] = drReadOk ? static_cast<std::uintptr_t>(threadDrAddress[slot]) : 0u;
 			}
+			g_model.measurement = hs::ClassifyDebugRegisterMeasurement(
+				report.drReadSource, report.drReadStatus, report.dr6, report.drAddress, hs::kWatchpointSlotCount);
 			hs::WatchpointReports::Get().Record(report);
 			context->Dr6 = 0;
 			context->EFlags &= ~0x100u;
@@ -1098,6 +1525,28 @@ HS_TEST(hw_watchpoint_unattributed_db_is_consumed_and_recorded)
 	HS_CHECK_EQ(out[0].drAddress[0], static_cast<std::uintptr_t>(watched));
 	HS_CHECK_NE(out[0].writerRip, 0u);
 
+	// 0.6.4 FIX A on REAL hardware: the record says HOW the debug registers were
+	// measured AND carries both sets. On this platform the exception record carried
+	// the trap's DR state (so it is the source the classifier uses), while the
+	// faulting-thread read's values are carried next to it. Break the explicit
+	// read and `drReadStatus` fails; break the classification and `measurement`
+	// fails.
+	HS_CHECK_EQ(g_model.drReadSource, hs::kDrSourceExceptionContext);
+	HS_CHECK_EQ(g_model.drReadStatus, hs::kDrReadOk);
+	HS_CHECK_EQ(g_model.drReadError, 0u);
+	HS_CHECK(g_model.measurement == hs::DebugRegisterMeasurement::kReadNonZero);
+	HS_CHECK((out[0].flags & hs::kWatchReportDrMeasured) != 0u);
+	HS_CHECK_EQ(out[0].drReadSource, hs::kDrSourceExceptionContext);
+	HS_CHECK_EQ(out[0].drReadStatus, hs::kDrReadOk);
+	HS_CHECK_NE(out[0].dr6, 0u);          // a delivered hardware #DB always sets a B bit
+	HS_CHECK_NE(out[0].contextDr6, 0u);   // ...and the exception record carried it
+	// ...and the independent read RAN and its values are in the record. Whether
+	// they are non-zero is deliberately NOT asserted: this test proves the
+	// measurement happened and is carried, not what the host returned. (If the
+	// read returns zero on real Windows, that is a finding, not a test failure.)
+	HS_CHECK_EQ(out[0].threadDr6, g_model.threadDr6);
+	HS_CHECK_EQ(out[0].threadDr7, g_model.threadDr7);
+
 	hs::hw::DisarmCurrentThread();
 	::RemoveVectoredExceptionHandler(inner);
 	::RemoveVectoredExceptionHandler(outer);
@@ -1150,6 +1599,10 @@ HS_TEST(hw_watchpoint_silences_the_allocator_post_free_link)
 	g_model = TrapModel{};
 	g_model.anyDrProgrammed = true;
 
+	// Deterministic free evidence: no stale ring record for this static address
+	// from another test may win the PreferNewestFreeTick comparison.
+	hs::ScaleformFreeRing::Get().Shutdown();
+
 	auto& slots = hs::WatchpointSlots::Get();
 	slots.ResetForTesting();
 	const auto watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
@@ -1178,10 +1631,22 @@ HS_TEST(hw_watchpoint_silences_the_allocator_post_free_link)
 	HS_CHECK_EQ(g_model.postFreeSuppressed, 1);  // and known to be suppressed
 	HS_CHECK_EQ(g_model.unattributedRecorded, 0);
 
+	// 0.6.4 FIX B: WHICH free the classifier used, and that it decided post-free.
+	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(g_model.reportFreeContext));
+	HS_CHECK(g_model.reportFreeContext == hs::WatchpointFreeContext::kPostFreeLink);
+
 	// The slot was NOT released by us and the hardware watch is still enabled.
 	hs::hw::ThreadDebugState after;
 	HS_CHECK(hs::hw::ReadCurrentThread(after));
 	HS_CHECK((after.dr7 & hs::Dr7LocalEnableBit(0)) != 0);
+
+	// The PRODUCTION measurement path, asserted directly: the exception record
+	// supplied the classification, and the independent read of the faulting thread
+	// ALSO succeeded and found the breakpoint. That second fact is what makes the
+	// 0.6.3 zeros readable if they ever recur.
+	HS_CHECK_EQ(g_model.drReadSource, hs::kDrSourceExceptionContext);
+	HS_CHECK_EQ(g_model.drReadStatus, hs::kDrReadOk);
+	HS_CHECK(g_model.measurement == hs::DebugRegisterMeasurement::kReadNonZero);
 
 	hs::hw::DisarmCurrentThread();
 	::RemoveVectoredExceptionHandler(handler);
@@ -1195,6 +1660,10 @@ HS_TEST(hw_watchpoint_reports_a_clobber_on_a_block_freed_earlier)
 	g_watchedQword = 0x6FFFFB89DDB8ull;
 	g_model = TrapModel{};
 	g_model.anyDrProgrammed = true;
+
+	// Deterministic free evidence: no stale ring record for this static address
+	// from another test may win the PreferNewestFreeTick comparison.
+	hs::ScaleformFreeRing::Get().Shutdown();
 
 	auto& slots = hs::WatchpointSlots::Get();
 	slots.ResetForTesting();
@@ -1228,6 +1697,111 @@ HS_TEST(hw_watchpoint_reports_a_clobber_on_a_block_freed_earlier)
 	slots.ResetForTesting();
 }
 
+HS_TEST(hw_watchpoint_silences_a_realloc_in_progress_write)
+{
+	// (e) 0.6.4 FIX B, the case the 0.6.3 post-free window could never cover: the
+	// allocator's link write happens INSIDE o_SfRealloc, so the free record lands
+	// AFTER the trap (the reverse ordering of a plain free). This is a real #DB
+	// with the ring's newest record placed in the future, exactly as the trip's
+	// realloc rows showed.
+	g_watchedQword = 0x6FFFFB89DDB8ull;
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;
+
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+	auto& ring = hs::ScaleformFreeRing::Get();
+	ring.Init(64);
+
+	const auto watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, 1000, 1, 1, index));
+	HS_CHECK_EQ(index, 0u);
+	// A stale slot Release tick, and a free ring record that lands AFTER the trap.
+	HS_CHECK(slots.Release(watched, /*slot tick=*/1000));
+	hs::ScaleformFreeRecord future;
+	future.ptr = watched;
+	future.freeTick = ::GetTickCount64() + 100;  // the realloc's free record lands later
+	ring.Record(future);
+
+	g_model.everArmed[0] = true;
+	g_model.armAddress[0] = watched;
+	g_model.armValueAtArm[0] = 0x6FFFFB89DDB8ull;
+	g_model.armWasCode[0] = true;
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+
+	const auto handler = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(handler != nullptr);
+
+	g_watchedQword = 0x0;  // the free-list link, written while the realloc runs
+
+	HS_CHECK(g_model.consumed);
+	HS_CHECK_EQ(g_model.recorded, 0);           // silent
+	HS_CHECK_EQ(g_model.reallocSuppressed, 1);  // and labelled as the realloc case
+	HS_CHECK_EQ(g_model.postFreeSuppressed, 0);
+	HS_CHECK(g_model.reportFreeContext == hs::WatchpointFreeContext::kReallocInProgress);
+	HS_CHECK(g_model.reportFreeSource == hs::FreeTickSource::kFreeRing);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(handler);
+	ring.Shutdown();
+	slots.ResetForTesting();
+}
+
+HS_TEST(hw_watchpoint_reports_a_write_whose_free_predates_the_arm)
+{
+	// (f) The free ring's only record for the address is OLDER than the arm (a
+	// recycled address, or a watch armed on an already-freed block). That is not
+	// the allocator's bookkeeping for this write, so it is REPORTED and labelled
+	// rather than silenced -- the two corpus rows this leaves (0xA34DF900 and
+	// 0xA33C04B0) are exactly this shape.
+	g_watchedQword = 0x6FFFFB89DDB8ull;
+	g_model = TrapModel{};
+	g_model.anyDrProgrammed = true;
+
+	auto& slots = hs::WatchpointSlots::Get();
+	slots.ResetForTesting();
+	auto& ring = hs::ScaleformFreeRing::Get();
+	ring.Init(64);
+
+	const auto watched = reinterpret_cast<std::uintptr_t>(const_cast<std::uint64_t*>(&g_watchedQword));
+	std::size_t index = 0;
+	HS_CHECK(slots.Claim(watched, 0x6FFFFB89DDB8ull, /*armedWasCode=*/true, 0, /*arm tick=*/5000, 1, 1, index));
+	HS_CHECK_EQ(index, 0u);
+	hs::ScaleformFreeRecord old;
+	old.ptr = watched;
+	old.freeTick = 1000;  // one tick-scale BEFORE the arm: stale evidence
+	ring.Record(old);
+
+	g_model.everArmed[0] = true;
+	g_model.armAddress[0] = watched;
+	g_model.armValueAtArm[0] = 0x6FFFFB89DDB8ull;
+	g_model.armWasCode[0] = true;
+	std::uintptr_t addresses[hs::kWatchpointSlotCount] = { watched, 0, 0, 0 };
+	std::uint64_t  dr7 = 0;
+	HS_CHECK(hs::hw::ArmCurrentThread(addresses, hs::kWatchpointSlotCount, dr7));
+
+	const auto handler = ::AddVectoredExceptionHandler(1, &ModelTrapHandler);
+	HS_CHECK(handler != nullptr);
+
+	g_watchedQword = 0x0;
+
+	HS_CHECK(g_model.consumed);
+	HS_CHECK_EQ(g_model.recorded, 1);
+	HS_CHECK_EQ(g_model.freePredatesArm, 1);
+	HS_CHECK(g_model.reportFreeContext == hs::WatchpointFreeContext::kFreePredatesArm);
+	HS_CHECK(g_model.reportFreeSource == hs::FreeTickSource::kFreeRing);
+	HS_CHECK(hs::ClassifyWatchedWrite(g_model.reportValueAtArm, g_model.reportArmedWasCode,
+			g_model.reportValueAfter, g_model.reportReadable, /*afterIsCode=*/false) == hs::WatchpointWriteKind::kDegradation);
+
+	hs::hw::DisarmCurrentThread();
+	::RemoveVectoredExceptionHandler(handler);
+	ring.Shutdown();
+	slots.ResetForTesting();
+}
+
 #else
 HS_TEST(hw_watchpoint_traps_the_writer_of_a_watched_qword)
 {
@@ -1253,5 +1827,19 @@ HS_TEST(hw_watchpoint_reports_a_code_pointer_clobber)
 {
 	hstest::Note("Windows-only: needs a real #DB; ClassifyWatchedWrite above is the Linux-checkable half");
 	HS_CHECK(hs::ClassifyWatchedWrite(0x6FFFFB89DDB8ull, true, 0x0, true, false) == hs::WatchpointWriteKind::kDegradation);
+}
+
+HS_TEST(hw_watchpoint_silences_a_realloc_in_progress_write)
+{
+	hstest::Note("Windows-only: needs a real #DB; ClassifyWriteAgainstFree above is the Linux-checkable half");
+	HS_CHECK(hs::FreeContextIsAllocatorBookkeeping(
+		hs::ClassifyWriteAgainstFree(20000ull, 10000ull, 19900ull, hs::kAllocatorBookkeepingWindowMs)));
+}
+
+HS_TEST(hw_watchpoint_reports_a_write_whose_free_predates_the_arm)
+{
+	hstest::Note("Windows-only: needs a real #DB; ClassifyWriteAgainstFree above is the Linux-checkable half");
+	HS_CHECK(hs::ClassifyWriteAgainstFree(1000ull, 5000ull, 90000ull, hs::kAllocatorBookkeepingWindowMs) ==
+		hs::WatchpointFreeContext::kFreePredatesArm);
 }
 #endif

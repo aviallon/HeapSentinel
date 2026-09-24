@@ -247,6 +247,11 @@ HS_TEST(stats_format_includes_every_counter)
 	snapshot.watchTrips = 22;
 	snapshot.watchReports = 23;
 	snapshot.watchReportDrops = 24;
+	snapshot.watchPostFreeSuppressed = 25;
+	snapshot.watchReallocSuppressed = 26;
+	snapshot.watchFreePredatesArm = 27;
+	snapshot.watchDrReadFailed = 28;
+	snapshot.watchDrReadZero = 29;
 	snapshot.health = "GREEN";
 
 	const auto lines = FormatStats(snapshot);
@@ -269,6 +274,12 @@ HS_TEST(stats_format_includes_every_counter)
 	HS_CHECK(joined.find("19 claims") != std::string::npos);
 	HS_CHECK(joined.find("20 claim drops") != std::string::npos);
 	HS_CHECK(joined.find("22 trips") != std::string::npos);
+	// 0.6.4: the suppression and measurement counters are on the same line, so a
+	// trip's summary says WHY reports were silent and whether the debug-register
+	// state was actually measured.
+	HS_CHECK(joined.find("suppressed 25 post-free link(s) + 26 realloc-in-progress write(s), 27 free-predates-arm report(s)") !=
+		std::string::npos);
+	HS_CHECK(joined.find("28 failed (no measurement), 29 succeeded and found no debug register") != std::string::npos);
 	HS_CHECK(joined.find("health GREEN") != std::string::npos);
 }
 

@@ -46,8 +46,11 @@ namespace hs::hw
 	// Get/SetThreadContext itself failed.
 	[[nodiscard]] bool DisarmCurrentThread();
 
-	// Read the debug state of the calling thread without modifying it.
-	[[nodiscard]] bool ReadCurrentThread(ThreadDebugState& a_out);
+	// Read the debug state of the calling thread without modifying it. Needs no
+	// suspension (it is our own thread) and cannot deadlock. On failure
+	// `a_outError` (when non-null) receives GetLastError(), so a record can say
+	// WHY a debug-register field is zero instead of just printing 0x0.
+	[[nodiscard]] bool ReadCurrentThread(ThreadDebugState& a_out, std::uint32_t* a_outError = nullptr);
 
 	// Arm another thread: SuspendThread -> GetThreadContext ->
 	// SetThreadContext -> ResumeThread. Suspension is required for the write to

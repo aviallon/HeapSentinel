@@ -748,6 +748,14 @@ On the `#DB` (`EXCEPTION_SINGLE_STEP`) trap the VEH reports, at minimum:
 - the watched address (the address that actually trapped), the first qword at
   arming time and the first qword read immediately after the write;
 - which DR slot fired and the raw DR6;
+- **how the debug registers were measured** (0.6.4): the source of the DR6/DR7/
+  DR0-DR3 fields, whether that read succeeded and its `GetLastError()`, the
+  exception record's own DR values next to it, and EFlags (whose TF bit
+  explains a trap-flag single step). See 13.4;
+- **which free the classifier used** (0.6.4): the slot's Release tick or the
+  free ring's newest record for the address, plus the resulting context (a
+  post-free link, a realloc-in-progress write, a free that predates the arm, or
+  a genuine delayed write-after-free). See 13.4;
 - whether the arm was **stale** (the table had moved on) and, when it was, the
   address the live table slot holds now - so `watched=` is never contradicted by
   the table (0.6.2; see 13.4).
@@ -884,6 +892,45 @@ programmed. No allocation, no lock, no `std::string`, no spdlog -- the same POD
 record path as every other trap. If the fatal case recurs, it leaves data
 instead of another mystery.
 
+**The debug-register fields are a measurement (0.6.4, FIX A).** The 0.6.3 trip
+produced 104 unattributed records and every one of them read
+`dr6=0x0 dr7=0x0 dr0-3=0`. That cannot be a valid reading of a delivered `#DB`:
+a trap-flag single-step sets `DR6.BS` (0x4000) and a data breakpoint sets one of
+`B0-B3`. So the fields were either a failed read or an uninitialised struct -- and
+nothing in the record said which. The most important question about this feature
+was unanswerable.
+
+0.6.4 makes the measurement explicit. The trap path takes its **own** read of
+the faulting thread, `GetThreadContext(GetCurrentThread(),
+CONTEXT_DEBUG_REGISTERS)`: it is our own thread, so no suspension is needed and it
+cannot deadlock, which is why it is legal in the VEH at all. Which set of values
+the classifier then uses is a rule, not a preference: the **exception record wins
+whenever it carries anything**, because on real Windows it does for a data
+breakpoint -- the in-game attributed reports read `dr6=0xFFFF0FF2
+dr7=0x99990055`, and the Windows hardware test falsified the opposite choice
+(there `GetThreadContext`'s DR7 does not match the trap's DR7, so preferring the
+read unconditionally replaced a working classification with a different one). The
+faulting-thread read supplies the fields only when the exception record is empty,
+which is precisely the case the 104 hollow records were.
+
+Both sets are in the record either way, plus the read's outcome and its
+`GetLastError()`, plus EFlags, whose TF bit identifies a trap-flag single step.
+That makes the two questions answerable from the log alone: if the exception
+record was empty *and* the read failed, the record says `dr_read=FAILED` and the
+fields are **not a measurement**; if the exception record was empty but the read
+succeeded and also returned zero, the record says `dr_read=ok` and this host
+delivered a single step with no debug register set at all -- a finding to chase.
+The three outcomes are a portable `constexpr` decision
+(`ClassifyDebugRegisterMeasurement`) checked on Linux and driven by a real `#DB`
+in the Windows test, and the drainer says the outcome in words and counts them
+separately in the periodic stats line. "Read failed" and "read succeeded and
+genuinely found no debug register" are now different records instead of the same
+`0x0`.
+
+The attributed write reports carry the same provenance (0.6.3 left those fields
+unset, so they too printed `ever_armed=0x0 any_dr=0 dr0-3=0x0`, indistinguishable
+from a failed read).
+
 **Benign writes vs a clobbered vtable (0.6.2).** A data breakpoint fires on
 *any* write, including the allocator's or CRT's initialisation of a freshly
 allocated block. The one real trip was `VCRUNTIME140` writing `0` into an
@@ -904,27 +951,84 @@ breakpoint is a trap, so the store itself cannot re-fire. Only a degradation is
 reported, and only then is the slot released. The rule is `ClassifyWatchedWrite`
 in `Core/WatchpointEncoding.h` and is unit-tested off-game.
 
-**The allocator's post-free link (0.6.3, Deliverable 3).** The 2026-09-23
-21:37:41 event was a valid vtable replaced by a heap address one
-`GetTickCount64` tick after the block's own recorded free
-(`freed at tick 188333102`, written at `188333103`). 0.6.2's classifier was
-right that a code pointer had become non-code, but the write was the allocator
-linking the just-freed block into its free list -- normal reuse, safe by itself,
-not corruption. So `IsAllocatorPostFreeLink` suppresses a write whose trap tick
-is within `kAllocatorPostFreeLinkWindowMs` (32 ms, i.e. two timer ticks) of the
-block's recorded free. The window is derived from the evidence, not guessed: the
-observed link was one tick later, and `GetTickCount64` advances in ~15.6 ms
-steps, so a free near a boundary and its link just after it differ by one tick
-while a slow free path can differ by two. A suppressed write is silent and the
-watch stays armed; only a write to a block freed EARLIER than the window is a
-genuine use-after-free and is reported.
+**The allocator's own writes around a free (0.6.3 Deliverable 3, corrected in
+0.6.4 -- FIX B).** The 2026-09-23 21:37:41 event was a valid vtable replaced by a
+heap address one `GetTickCount64` tick after the block's own recorded free
+(`freed at tick 188333102`, written at `188333103`). That is the allocator
+linking the just-freed block into its free list: normal reuse, safe by itself,
+not corruption. 0.6.3 therefore suppressed a write within 32 ms after the
+block's recorded free.
+
+The 2026-09-24 trip falsified that in two ways, both structural:
+
+1. **The free ring was consulted only when the slot had no Release tick.**
+   `Watchpoints` reads the free ring only if `report.freeTick == 0`, so for an
+   already-released slot the stale slot `Release` tick SHADOWED the free ring's
+   newest record. Concrete case: slot tick 261486289, free-ring record 261487115,
+   trap 261487115 -- a delta of 0 where 0.6.3 computed 826 ms and reported a
+   clobber. The resolution is now unconditional and recorded:
+   `PreferNewestFreeTick` takes the free ring's newest record for the address
+   whenever it is NEWER than the slot's Release tick (when it is older it is from a
+   previous life of a recycled address, so the slot's own later Release is kept),
+   and the record says which source won.
+2. **The two orderings were conflated.** `hk_SfFree` records the free BEFORE it
+   calls the original, so the allocator's link write FOLLOWS the record
+   (`free <= trap`); `hk_SfRealloc` calls `o_SfRealloc` first and records the free
+   of the old block only AFTER it returns, so the link write PRECEDES the record
+   (`trap < free`). The 0.6.3 post-free window could only ever see the first. The
+   classification is now `ClassifyWriteAgainstFree`, which names the two
+   separately -- `allocator-post-free-link` and `allocator-realloc-in-progress` --
+   and reports a third, `free-predates-arm`, when the free ring's only record is
+   OLDER than the arm (a recycled address whose ring record is stale, or a watch
+   armed on an already-freed block). That third case is NOT silenced: it is a
+   real write we cannot assign to the allocator.
+
+The window is also derived from the trip rather than from one event. Our free hook
+takes its tick before the original free call, so the link write can follow the
+record by the duration of our own remaining work (a stack capture and ledger
+lookups), and `hk_SfRealloc` can precede its record by the same kind of latency.
+The trip measures those gaps directly: 0-114 ms after the recorded free and
+1-165 ms before it. `kAllocatorBookkeepingWindowMs` is 250 ms, the next round
+bound above the observed worst case, and applied on BOTH sides through that one
+function, which the trap path and the drainer call identically (defence in depth
+for the race where the free record lands after the trap).
 
 **Residual risk, stated plainly:** a genuine use-after-free write landing within
-32 ms of the free is treated as the allocator's link and missed. The window is a
-bounded silence, not a claim of completeness. It is applied twice -- in the trap
-path (which needs the free tick and must not clear the thread's DR) and again in
-the drainer (defence in depth for the race where the free record lands after the
-trap) -- through the same pure function, which is unit-tested off-game.
+250 ms of the free is treated as allocator bookkeeping and missed. The two
+genuine delayed writes in the same corpus are 1858 ms and 12379 ms after their
+free, an order of magnitude outside the window, and they are still reported. The
+window is a bounded silence, not a claim of completeness.
+
+**Why the window is this wide, and the structural fix that would shrink it.** The
+width is entirely our own instrumentation latency: `hk_SfFree` takes its tick
+before `RecordScaleformFree` and before `o_SfFree`, so the free we record is
+older than the free the allocator performs, by however long our stack capture and
+ledger lookups take. Recording the tick AFTER the original free returns (and
+rejecting a promotion candidate the free ring already records as freed, which is
+the likely shape of the two `free-predates-arm` rows) would let the window shrink
+back to a couple of ticks. Both change free-record semantics that the double-free
+path depends on, so neither belongs in a narrow correctness release; they are
+candidates for 0.6.5.
+
+**What the 2026-09-24 corpus says under the corrected rules.** Replaying the
+trip's 21 write reports through the shipped classifier (a permanent off-game
+test, `watchpoint_live_corpus_2026_09_24_write_reports_are_classified_as_designed`)
+gives: 18 are allocator bookkeeping and go silent (7 post-free links and 11
+realloc-in-progress writes), 2 report because their free record predates the arm
+(0xA34DF900, written by `VCRUNTIME140.dll`; 0xA33C04B0, written by
+`SkyrimSE.exe+0x11922AB`), and 1 (`0xA36190E0`) is a genuine delayed write whose
+`after` value is still a code pointer, so the drainer's benign shape rule drops
+it. Of the 18 shape-conforming, non-stale reports named as the trip's noise, 16
+go silent and 2 remain, labelled. The expectation before the replay was that all
+18 would go silent; 16 + 2 labelled is what the evidence supports, and the two
+survivors are a new question (why were we watching an address whose only free
+record predates the arm?) rather than a regression.
+
+**The headline, stated honestly.** After the trip: the instrument survives a real
+in-game session and produces records -- no third-party module has yet been
+observed as the writer of a clobbered vtable. Every writer in the corpus is the
+engine's own allocator code, the game's CRT, or the Wine loader. The corruptor
+question is still open, with the allocator's own noise now identified.
 
 ### 13.5 Shutdown and the final-state assertion
 
@@ -949,27 +1053,48 @@ the sample is invisible to the watchpoints (the ledger may still attribute its
 corruption after the fact). The health line reports slot occupancy, claims,
 claim drops, trips, rotations and report drops so a lossy run is legible. This
 is a detector for a sampled subset, not a shadow heap, and it is not presented
-as one. **It has now been run in the game twice.** The 0.6.1 trip exposed four
-defects: a stale arm whose `#DB` was handed to the crash handler and killed the
-session, a release that only disarmed the trapping thread, a benign construction
-write reported and released as if it were corruption, and a report whose
-`watched=` address disagreed with the table. 0.6.2 fixed those four, proved them
-off-game on Linux and on real hardware watchpoints in the Windows test -- and
-then **still killed the session on 2026-09-24**, because a `#DB` reached the
-handler through our own `Realloc` hook that the classifier called foreign and
-handed on. That is the precedent for not claiming more than the evidence shows:
-a green suite with a real mutation proof did not cover the case the game hit.
+as one. **It has now been run in the game three times.** The 0.6.1 trip exposed
+four defects: a stale arm whose `#DB` was handed to the crash handler and killed
+the session, a release that only disarmed the trapping thread, a benign
+construction write reported and released as if it were corruption, and a report
+whose `watched=` address disagreed with the table. 0.6.2 fixed those four,
+proved them off-game on Linux and on real hardware watchpoints in the Windows
+test -- and then **still killed the session on 2026-09-24**, because a `#DB`
+reached the handler through our own `Realloc` hook that the classifier called
+foreign and handed on. That is the precedent for not claiming more than the
+evidence shows: a green suite with a real mutation proof did not cover the case
+the game hit.
 
 The 0.6.3 changes are structural rather than another classifier -- survival is
-`MustConsumeDebugException` and no longer depends on classification -- and they
-are proven off-game on Linux (the pure post-free window, the record encoding,
-the slot free tick) and on real hardware watchpoints in the Windows test
-(unattributed `#DB` consumed and recorded, disabled run not masking, post-free
-link silent, delayed use-after-free reported). But **the corrected build has not
-yet had a fresh in-game trip**: in-game correctness of the corrected path is
-still unobserved, and only a fresh trip can show it. The unattributed record
-exists precisely so that if it recurs, the next report is data instead of
-another mystery.
+`MustConsumeDebugException` and no longer depends on classification -- and the
+2026-09-24 trip (build `4f409330007c`) confirmed the structural rule in the real
+process: 104 `EXCEPTION_SINGLE_STEP`s that the classifier could not attribute
+were consumed and recorded, and **the session survived**. That trip falsified two
+things in the *measurement*, not in the survival: the unattributed record's
+debug-register fields were hollow (104/104 read `dr6=0x0 dr7=0x0 dr0-3=0`, which
+no delivered `#DB` can be), and the post-free suppression was falsified by live
+evidence (the stale slot `Release` tick shadowed the free ring, and
+`hk_SfRealloc`'s free record lands after the trap). 0.6.4 fixes both -- see 13.4 --
+and the 0.6.3 corpus is now a permanent off-game regression test rather than a
+one-off analysis.
+
+**What is proven and what is not.** PROVEN off-game on Linux (without ASan/UBSan
+errors) and, for the trap-path decisions, on real hardware `#DB`s in the Windows
+test: the debug-register measurement classification (failed vs
+genuinely-zero vs armed), the free-tick preference, the two allocator orderings
+kept apart, the `free-predates-arm` case reported rather than silenced, the
+record encoding, and the 21-row 2026-09-24 corpus replay. Each of those tests was
+broken once and seen to fail (the mutation run ids are in the v0.6.4 release
+notes). **UNPROVEN: the in-game correctness of the corrected path.** 0.6.2 is the
+precedent for not claiming otherwise -- a green suite with a real mutation proof
+did not cover the case the game hit. Only a fresh trip can show that the
+corrected record is populated, that the 16 allocator rows stay silent in the real
+process, and what the two `free-predates-arm` rows really are. The counters in
+the periodic stats line exist so that a fresh trip answers it from the log
+without a second analysis pass: `suppressed N post-free link(s) + M
+realloc-in-progress write(s), K free-predates-arm report(s); unattributed #DB
+debug-register reads: F failed (no measurement), Z succeeded and found no debug
+register`.
 
 ## 14. Publishing symbols (making our own frames legible)
 

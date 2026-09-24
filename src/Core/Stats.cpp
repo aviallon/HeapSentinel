@@ -78,13 +78,18 @@ namespace hs
 		}
 
 		{
-			char buffer[320]{};
+			char buffer[512]{};
 			std::snprintf(buffer, sizeof(buffer),
-				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s)",
+				"stats: hardware watchpoints %zu/%zu slot(s), %llu claims, %llu claim drops, %llu releases, %llu trips, %llu report(s), %llu report drop(s); suppressed %llu post-free link(s) + %llu realloc-in-progress write(s), %llu free-predates-arm report(s); unattributed #DB debug-register reads: %llu failed (no measurement), %llu succeeded and found no debug register",
 				a_s.watchSlotsOccupied, kWatchpointSlotCount, static_cast<unsigned long long>(a_s.watchClaims),
 				static_cast<unsigned long long>(a_s.watchClaimDrops), static_cast<unsigned long long>(a_s.watchReleases),
 				static_cast<unsigned long long>(a_s.watchTrips), static_cast<unsigned long long>(a_s.watchReports),
-				static_cast<unsigned long long>(a_s.watchReportDrops));
+				static_cast<unsigned long long>(a_s.watchReportDrops),
+				static_cast<unsigned long long>(a_s.watchPostFreeSuppressed),
+				static_cast<unsigned long long>(a_s.watchReallocSuppressed),
+				static_cast<unsigned long long>(a_s.watchFreePredatesArm),
+				static_cast<unsigned long long>(a_s.watchDrReadFailed),
+				static_cast<unsigned long long>(a_s.watchDrReadZero));
 			lines.emplace_back(buffer);
 		}
 
@@ -131,6 +136,11 @@ namespace hs
 		snapshot.watchTrips = WatchpointSlots::Get().Trips();
 		snapshot.watchReports = WatchpointReports::Get().Recorded();
 		snapshot.watchReportDrops = WatchpointReports::Get().Dropped();
+		snapshot.watchPostFreeSuppressed = WatchpointReports::Get().PostFreeSuppressed();
+		snapshot.watchReallocSuppressed = WatchpointReports::Get().ReallocSuppressed();
+		snapshot.watchFreePredatesArm = WatchpointReports::Get().FreePredatesArm();
+		snapshot.watchDrReadFailed = WatchpointReports::Get().UnattributedDrReadFailed();
+		snapshot.watchDrReadZero = WatchpointReports::Get().UnattributedDrReadZero();
 
 		snapshot.health = Health::Line();
 		return snapshot;

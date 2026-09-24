@@ -52,6 +52,13 @@ namespace hs
 		std::uint64_t reportsDrained = 0;
 		std::uint64_t unattributedTraps = 0;
 		std::uint64_t postFreeLinksSuppressed = 0;
+		std::uint64_t reallocInProgressSuppressed = 0;
+		// 0.6.4 FIX A: of the unattributed traps, how many were recorded with a
+		// debug-register read that FAILED (the fields are not a measurement) versus
+		// one that succeeded and genuinely returned no debug register at all.
+		std::uint64_t unattributedDrReadFailed = 0;
+		std::uint64_t unattributedDrReadZero = 0;
+		std::uint64_t freePredatesArmReports = 0;
 		std::uint64_t considerCount = 0;
 		std::uint64_t selectedCount = 0;
 		std::uint64_t queueEvictions = 0;
@@ -139,6 +146,13 @@ namespace hs
 		void RotateHeld(std::uint64_t a_now) noexcept;
 		void SweepThreads(std::uint64_t a_now, bool a_force) noexcept;
 		void DrainReports() noexcept;
+		// 0.6.4 FIX B: resolve the free tick the classifier must use. ALWAYS
+		// consults ScaleformFreeRing and prefers its newest record for the address
+		// over the slot snapshot's Release tick (which was the 0.6.3 shadowing bug).
+		// Lock-free (Bloom + seqlock), so the trap path may call it; `a_outSource`
+		// receives the FreeTickSource that won, for the record and the log.
+		[[nodiscard]] static std::uint64_t ResolveFreeTick(std::uint64_t a_slotFreeTick, std::uintptr_t a_address,
+			std::uint32_t* a_outSource) noexcept;
 		[[nodiscard]] bool AllocSiteMatches(std::uintptr_t a_site) const noexcept;
 		[[nodiscard]] bool ResolveAllocSiteFilter();
 		[[nodiscard]] ThreadEntry* FindThread(std::uint32_t a_tid) noexcept;
@@ -169,7 +183,10 @@ namespace hs
 		std::atomic<std::uint64_t> _threadTableOverflow{ 0 };
 		std::atomic<std::uint64_t> _drained{ 0 };
 		std::atomic<std::uint64_t> _unattributed{ 0 };
-		std::atomic<std::uint64_t> _postFreeSuppressed{ 0 };
+		// NOTE: the suppression and debug-register-measurement counters live in
+		// WatchpointReports (0.6.4), not here: the periodic stats line is compiled by
+		// the off-game suite too, which does not link this Windows-only unit.
+		// See WatchpointReports::NoteUnattributedMeasured.
 
 		// Configuration snapshot, taken once at Init.
 		std::size_t   _sweepMs = 250;

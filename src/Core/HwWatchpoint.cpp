@@ -67,9 +67,13 @@ namespace hs::hw
 		return ApplyDebugState(::GetCurrentThread(), state);
 	}
 
-	bool ReadCurrentThread(ThreadDebugState& a_out)
+	bool ReadCurrentThread(ThreadDebugState& a_out, std::uint32_t* a_outError)
 	{
-		return ReadThread(::GetCurrentThread(), a_out);
+		const bool ok = ReadThread(::GetCurrentThread(), a_out);
+		if (a_outError) {
+			*a_outError = ok ? 0u : static_cast<std::uint32_t>(::GetLastError());
+		}
+		return ok;
 	}
 
 	bool ReadThread(HANDLE a_thread, ThreadDebugState& a_out)

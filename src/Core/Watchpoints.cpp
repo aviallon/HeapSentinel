@@ -148,7 +148,7 @@ namespace hs
 		_trackedCount.store(0, std::memory_order_relaxed);
 		_everProgrammedAnyDr.store(false, std::memory_order_relaxed);
 		_unattributed.store(0, std::memory_order_relaxed);
-		_postFreeSuppressed.store(0, std::memory_order_relaxed);
+		WatchpointReports::Get().ResetSuppressionCountersForTesting();
 
 		_initialized.store(true, std::memory_order_release);
 
@@ -416,6 +416,31 @@ namespace hs
 		_lastArmedThreads = armedNow;
 	}
 
+	std::uint64_t Watchpoints::ResolveFreeTick(std::uint64_t a_slotFreeTick, std::uintptr_t a_address, std::uint32_t* a_outSource) noexcept
+	{
+		// 0.6.4 FIX B. The free ring is consulted UNCONDITIONALLY. 0.6.3 only looked
+		// it up when the slot had no Release tick, so for an already-released slot
+		// the stale Release tick shadowed the ring's newest record -- the trip case
+		// where free_tick=261486289, the ring's record was 261487115 and the trap was
+		// 261487115: a delta of 826 ms was reported where the true delta was 0.
+		std::uint64_t freeTick = a_slotFreeTick;
+		auto          source = a_slotFreeTick != 0 ? FreeTickSource::kSlotSnapshot : FreeTickSource::kNone;
+
+		ScaleformFreeRecord record;
+		if (ScaleformFreeRing::Get().Find(a_address, record) && record.freeTick != 0) {
+			const auto preferred = PreferNewestFreeTick(a_slotFreeTick, record.freeTick);
+			if (preferred != freeTick || source == FreeTickSource::kNone) {
+				source = FreeTickSource::kFreeRing;
+			}
+			freeTick = preferred;
+		}
+
+		if (a_outSource != nullptr) {
+			*a_outSource = static_cast<std::uint32_t>(source);
+		}
+		return freeTick;
+	}
+
 	void Watchpoints::DrainReports() noexcept
 	{
 		WatchpointReport reports[16];
@@ -429,37 +454,79 @@ namespace hs
 			// diagnosis record, not a verdict about corruption: if the 0.6.2
 			// fatal case recurs, it leaves data instead of another mystery.
 			if ((report.flags & kWatchReportUnattributed) != 0) {
-				_unattributed.fetch_add(1, std::memory_order_relaxed);
-				char encoded[1024]{};
+				// NOTE: `_unattributed` and its two breakdown counters are incremented
+				// where the record is WRITTEN (the trap path), not here: a record the
+				// ring overwrites before the drainer sees it is still a #DB that was
+				// consumed, and 0.6.3 counted it in both places (doubling the stat).
+				char encoded[2048]{};
 				EncodeWatchpointReport(report, encoded, sizeof(encoded));
+				// 0.6.4 FIX A: the single most important question about this record --
+				// is the DR state a measurement? -- is answered here, in words, so a
+				// reader does not have to know that dr6 == 0 is impossible for a
+				// delivered #DB.
+				const auto measurement = ClassifyDebugRegisterMeasurement(report.drReadSource, report.drReadStatus, report.dr6,
+					report.drAddress, kWatchpointSlotCount);
 				std::string detail = "HARDWARE WATCHPOINT: a #DB was consumed structurally but could not be attributed to a watch we can name\n  ";
 				detail += encoded;
+				detail += "\n  ";
+				detail += report.drReadSource == kDrSourceCurrentThread ?
+					"dr_used=faulting-thread-read (the exception record carried nothing, so the explicit read supplies the fields); " :
+					(report.drReadSource == kDrSourceExceptionContext ?
+							"dr_used=exception-record; " :
+							"");
+				if (measurement == DebugRegisterMeasurement::kReadFailed) {
+					detail += "DEBUG REGISTER MEASUREMENT: the read FAILED (GetThreadContext on the faulting thread returned error ";
+					detail += std::to_string(report.drReadError);
+					detail += "). The dr6/dr7/dr0-3 fields in this record are the exception record's, NOT a measurement of "
+							  "the faulting thread: nothing can be concluded from them.";
+				} else if (measurement == DebugRegisterMeasurement::kReadZero) {
+					detail += "DEBUG REGISTER MEASUREMENT: the faulting thread's OWN debug state was read successfully "
+							  "(GetThreadContext on the faulting thread, no suspension) and returned DR6 == 0 with DR0-DR3 all "
+							  "zero: this host delivered a single step with NO debug register set at all (trap flag, int1/icebp, or "
+							  "host/kernel behaviour). That is a finding to chase, not a hole in the record; the trap flag bit of "
+							  "EFlags is shown above.";
+				} else if (measurement == DebugRegisterMeasurement::kReadNonZero) {
+					detail += "DEBUG REGISTER MEASUREMENT: the faulting thread's own debug state was read successfully, so "
+							  "the dr6/dr7/dr0-3 fields above are a real measurement that the classifier could not attribute.";
+				} else {
+					detail += "DEBUG REGISTER MEASUREMENT: none was taken; the dr6/dr7/dr0-3 fields above are not a "
+							  "measurement.";
+				}
 				detail += "\n  writer: ";
 				detail += ModuleMap::Get().Describe(report.writerRip);
 				detail += "\n  (consumed because this process has programmed a debug register: see DESIGN.md 13.4. "
 						  "A foreign #DB is effectively nonexistent and an escaping one kills the game, so survival no "
-						  "longer depends on classifying correctly. The raw DR6/DR7/DRi and the ever-armed mask are above.)";
+						  "longer depends on classifying correctly. The raw DR6/DR7/DRi, HOW they were read, and the "
+						  "ever-armed mask are above.)";
 				Report("watchpoint-unattributed", detail);
 				continue;
 			}
 
-			// 0.6.3: the allocator's own post-free link. A write that lands within
-			// the bounded window after the block's recorded free is the free-list
-			// next pointer, not corruption. Stay silent and keep the watch: only a
-			// write to a block freed EARLIER than the window is a genuine
-			// use-after-free. (Defence in depth: the trap path already suppresses
-			// these; this catches the race where the free record landed after the
-			// trap.)
-			std::uint64_t freeTick = report.freeTick;
-			if (freeTick == 0) {
-				ScaleformFreeRecord lookedUp;
-				if (ScaleformFreeRing::Get().Find(report.watchedAddress, lookedUp)) {
-					freeTick = lookedUp.freeTick;
+			// 0.6.4 FIX B: resolve the free tick the same way the trap path does --
+			// ALWAYS consult the free ring and prefer its newest record for the address
+			// over the slot's Release tick. This is the drainer's own lookup (defence in
+			// depth for the race where the free record lands after the trap), and it is
+			// what makes the 17:56:56 case silent instead of a 826 ms delta.
+			const auto    freeFromSnap = report.freeTick;
+			std::uint32_t freeSource = report.freeTickSource;
+			const auto    freeTick = ResolveFreeTick(report.freeTick, report.watchedAddress, &freeSource);
+			const auto freeContext =
+				ClassifyWriteAgainstFree(freeTick, report.armedTick, report.tick, kAllocatorBookkeepingWindowMs);
+			if (FreeContextIsAllocatorBookkeeping(freeContext)) {
+				if (freeContext == WatchpointFreeContext::kReallocInProgress) {
+					WatchpointReports::Get().NoteReallocSuppressed();
+				} else {
+					WatchpointReports::Get().NotePostFreeSuppressed();
 				}
-			}
-			if (IsAllocatorPostFreeLink(freeTick, report.tick, kAllocatorPostFreeLinkWindowMs)) {
-				_postFreeSuppressed.fetch_add(1, std::memory_order_relaxed);
 				continue;
+			}
+			if (freeContext == WatchpointFreeContext::kFreePredatesArm) {
+				// A real write we cannot attribute to the allocator: the free ring's only
+				// record for the address is OLDER than the arm, so either the address was
+				// recycled (the ring never invalidates a record) or a watch was armed on
+				// an already-freed block. Reported below, labelled -- silencing it would
+				// hide a write to a freed block.
+				WatchpointReports::Get().NoteFreePredatesArm();
 			}
 
 			// FIX 3: the trap path records only writes that could be a
@@ -493,7 +560,7 @@ namespace hs
 				RequestDisarm();
 			}
 
-			char encoded[512]{};
+			char encoded[2048]{};
 			EncodeWatchpointReport(report, encoded, sizeof(encoded));
 
 			std::string detail = "HARDWARE WATCHPOINT: a code pointer was clobbered on the first 8 bytes of a watched block\n  ";
@@ -539,6 +606,36 @@ namespace hs
 					detail += " by ";
 					detail += ModuleMap::Get().Describe(reinterpret_cast<std::uintptr_t>(freeRecord.freeSite));
 				}
+			}
+
+			// 0.6.4 FIX B: say which free the classifier used and what it decided,
+			// and when the slot's own Release tick was overruled, say by how much.
+			// That shadowed tick is exactly the number that made the 17:56:56 case a
+			// false report (826 instead of 0).
+			detail += "\n  free evidence: ";
+			detail += FreeTickSourceName(static_cast<FreeTickSource>(freeSource));
+			detail += " tick " + std::to_string(freeTick) + "; context ";
+			detail += WatchpointFreeContextName(freeContext);
+			if (freeTick != 0) {
+				detail += " (trap - free = ";
+				detail += std::to_string(report.tick >= freeTick ? static_cast<long long>(report.tick - freeTick)
+																		: -static_cast<long long>(freeTick - report.tick));
+				detail += " ms)";
+			}
+			if (freeFromSnap != 0 && freeFromSnap != freeTick) {
+				detail += "; the slot's own Release tick " + std::to_string(freeFromSnap) +
+						  " was overruled by the free ring's newer record (0.6.3 used it and reported a false delta of " +
+						  std::to_string(static_cast<long long>(report.tick >= freeFromSnap ? report.tick - freeFromSnap
+																									: freeFromSnap - report.tick)) +
+						  " ms)";
+			}
+			if (freeContext == WatchpointFreeContext::kFreePredatesArm) {
+				detail += "\n  FREE EVIDENCE PREDATES THIS ARM: the free ring's newest record for this address (tick " +
+						  std::to_string(freeTick) +
+						  ") is older than the arm (tick " + std::to_string(report.armedTick) +
+						  "), so it is not evidence about this write: either the address was recycled and the ring record is "
+						  "stale (the ring never invalidates a record on re-allocation), or a watch was armed on an "
+						  "already-freed block. The write is real and is reported rather than assigned to the allocator.";
 			}
 
 			// FIX 4: the stale-arm case is a first-class outcome of the 0.6.1
@@ -591,14 +688,86 @@ namespace hs
 		}
 
 		auto*      context = info->ContextRecord;
-		const auto dr6 = static_cast<std::uint64_t>(context->Dr6);
-		const auto dr7 = static_cast<std::uint64_t>(context->Dr7);
 
-		const std::uint64_t drAddress[kWatchpointSlotCount] = {
+		// 0.6.4 FIX A. The debug-register fields are a MEASUREMENT, and the 0.6.3
+		// records made that unanswerable: all 104 unattributed traps carried
+		// dr6=dr7=dr0-3=0, which cannot be true of a delivered #DB (a trap flag sets
+		// DR6.BS = 0x4000, a data breakpoint sets one of B0-B3), yet the fields were
+		// printed as if they had been read. We cannot tell "the host left the VEH's
+		// ContextRecord zeroed" from "the read failed" unless we take our own read,
+		// so we do: GetThreadContext on the FAULTING thread with
+		// CONTEXT_DEBUG_REGISTERS. No suspension is needed (it is our own thread)
+		// and it cannot deadlock, which is why it is legal here at all. The result,
+		// its GetLastError() and the exception record's own DR values are all kept,
+		// so "read failed" and "read succeeded and genuinely returned zero" are two
+		// different records instead of the same 0x0.
+		hw::ThreadDebugState drState;
+		std::uint32_t        drReadError = 0;
+		const bool           drReadOk = hw::ReadCurrentThread(drState, &drReadError);
+
+		const auto contextDr6 = static_cast<std::uint64_t>(context->Dr6);
+		const auto contextDr7 = static_cast<std::uint64_t>(context->Dr7);
+		const std::uint64_t contextDrAddress[kWatchpointSlotCount] = {
 			static_cast<std::uint64_t>(context->Dr0),
 			static_cast<std::uint64_t>(context->Dr1),
 			static_cast<std::uint64_t>(context->Dr2),
 			static_cast<std::uint64_t>(context->Dr3),
+		};
+
+		// The explicit read is authoritative ONLY when the exception record carries
+		// nothing. On real Windows the exception record does carry DR6/DR7/DR0-3 for
+		// a data breakpoint (the in-game attributed reports and the Windows hardware
+		// test both show it), and it is the state the CPU trapped on; the
+		// faulting-thread read is what makes the empty case legible, which is the
+		// case the 104 hollow records were. Preferring the read unconditionally would
+		// have replaced a working measurement with a different one -- the Windows
+		// test caught exactly that.
+		const bool contextHasDr = contextDr6 != 0 || contextDr7 != 0 || contextDrAddress[0] != 0 ||
+			contextDrAddress[1] != 0 || contextDrAddress[2] != 0 || contextDrAddress[3] != 0;
+		const bool useThreadRead = drReadOk && !contextHasDr;
+
+		const auto dr6 = useThreadRead ? drState.dr6 : contextDr6;
+		const auto dr7 = useThreadRead ? drState.dr7 : contextDr7;
+		const std::uint64_t threadDrAddress[kWatchpointSlotCount] = {
+			static_cast<std::uint64_t>(drState.dr0),
+			static_cast<std::uint64_t>(drState.dr1),
+			static_cast<std::uint64_t>(drState.dr2),
+			static_cast<std::uint64_t>(drState.dr3),
+		};
+		std::uint64_t drAddress[kWatchpointSlotCount] = {};
+		for (std::size_t slot = 0; slot < kWatchpointSlotCount; ++slot) {
+			drAddress[slot] = useThreadRead ? threadDrAddress[slot] : contextDrAddress[slot];
+		}
+
+		const auto drReadSource = useThreadRead ? kDrSourceCurrentThread : kDrSourceExceptionContext;
+		const auto drReadStatus = drReadOk ? kDrReadOk : kDrReadFailed;
+		const auto drContextDisagrees = drReadOk &&
+			(drState.dr6 != contextDr6 || drState.dr7 != contextDr7 || drState.dr0 != contextDrAddress[0] ||
+				drState.dr1 != contextDrAddress[1] || drState.dr2 != contextDrAddress[2] || drState.dr3 != contextDrAddress[3]);
+		const auto contextEFlags = static_cast<std::uint32_t>(context->EFlags);
+
+		// Apply the provenance to a record. Used by both the attributed and the
+		// unattributed paths so no record ever prints an unset DR field as a
+		// measurement again. BOTH sets are filled: the exception record's and the
+		// faulting-thread read's.
+		const auto fillDrProvenance = [&](WatchpointReport& a_target) noexcept {
+			a_target.drReadSource = drReadSource;
+			a_target.drReadStatus = drReadStatus;
+			a_target.drReadError = drReadError;
+			a_target.drReadFlags = drContextDisagrees ? kWatchReportDrContextDisagrees : 0u;
+			a_target.contextDr6 = static_cast<std::uint32_t>(contextDr6);
+			a_target.contextDr7 = static_cast<std::uint32_t>(contextDr7);
+			a_target.contextEFlags = contextEFlags;
+			a_target.threadDr6 = drReadOk ? static_cast<std::uint32_t>(drState.dr6) : 0u;
+			a_target.threadDr7 = drReadOk ? static_cast<std::uint32_t>(drState.dr7) : 0u;
+			a_target.flags |= kWatchReportDrMeasured;
+			if ((contextEFlags & 0x100u) != 0) {
+				a_target.flags |= kWatchReportTrapFlagSet;
+			}
+			for (std::size_t i = 0; i < kWatchpointSlotCount; ++i) {
+				a_target.contextDrAddress[i] = static_cast<std::uintptr_t>(contextDrAddress[i]);
+				a_target.threadDrAddress[i] = drReadOk ? static_cast<std::uintptr_t>(threadDrAddress[i]) : 0u;
+			}
 		};
 
 		// FIX 1: the per-thread record is the safety net. A DR slot this thread
@@ -645,6 +814,16 @@ namespace hs
 			report.threadId = selfTid;
 			report.dr6 = static_cast<std::uint32_t>(dr6);
 			report.dr7 = static_cast<std::uint32_t>(dr7);
+			// 0.6.4: an attributed record carries the same evidence an unattributed
+			// one does. 0.6.3 left these unset, so the write reports printed
+			// ever_armed=0x0 any_dr=0 dr0-3=0x0 -- indistinguishable from a failed
+			// read, which is exactly the ambiguity FIX A exists to remove.
+			report.everArmedMask = everMask;
+			report.anyDrProgrammed = everProgrammed;
+			for (std::size_t i = 0; i < kWatchpointSlotCount; ++i) {
+				report.drAddress[i] = static_cast<std::uintptr_t>(drAddress[i]);
+			}
+			fillDrProvenance(report);
 
 			if (owner == WatchpointTrapOwner::kTableCurrent || owner == WatchpointTrapOwner::kTableReleased) {
 				report.watchedAddress = snap.address;
@@ -672,14 +851,11 @@ namespace hs
 				}
 			}
 
-			// A stale arm may still name a block the free ring remembers; the slot's
-			// own free tick is authoritative for a released current slot.
-			if (report.freeTick == 0) {
-				ScaleformFreeRecord freeRecord;
-				if (ScaleformFreeRing::Get().Find(report.watchedAddress, freeRecord)) {
-					report.freeTick = freeRecord.freeTick;
-				}
-			}
+			// 0.6.4 FIX B: resolve the free tick ALWAYS, preferring the free ring's
+			// newest record for the address over the slot's Release tick, and record
+			// which source won. 0.6.3 only looked the ring up when the slot's tick was
+			// zero, so a stale Release tick shadowed the newest free record.
+			report.freeTick = ResolveFreeTick(report.freeTick, report.watchedAddress, &report.freeTickSource);
 
 			std::uintptr_t valueAfter = 0;
 			const bool     readable = SafeReadQword(report.watchedAddress, valueAfter);
@@ -694,14 +870,23 @@ namespace hs
 			// readable. The drainer makes the final code/non-code call.
 			bool record = report.armedWasCode && readable && valueAfter != report.valueAtArm;
 
-			// 0.6.3: suppress the allocator's own post-free link. A write inside
-			// the bounded window after the block's recorded free is the free-list
-			// next pointer, not a use-after-free. Do NOT record it and do NOT
-			// clear this thread's DR: keep watching, stay silent. Only a write to
-			// a block freed earlier than the window is reported.
-			if (record && IsAllocatorPostFreeLink(report.freeTick, now, kAllocatorPostFreeLinkWindowMs)) {
-				record = false;
-				_postFreeSuppressed.fetch_add(1, std::memory_order_relaxed);
+			// 0.6.4 FIX B: suppress the allocator's own bookkeeping, on both sides of
+			// the recorded free and with the two sides kept apart. A post-free link is
+			// the free-list next pointer written just after the free; a realloc-time
+			// write is the link written while o_SfRealloc is still running, i.e. before
+			// the free record lands. Neither is a use-after-free. Do NOT record either
+			// and do NOT clear this thread's DR: keep watching, stay silent.
+			if (record) {
+				const auto freeContext =
+					ClassifyWriteAgainstFree(report.freeTick, report.armedTick, now, kAllocatorBookkeepingWindowMs);
+				if (FreeContextIsAllocatorBookkeeping(freeContext)) {
+					record = false;
+					if (freeContext == WatchpointFreeContext::kReallocInProgress) {
+						WatchpointReports::Get().NoteReallocSuppressed();
+					} else {
+						WatchpointReports::Get().NotePostFreeSuppressed();
+					}
+				}
 			}
 
 			if (record && WatchpointOwnerIsStale(owner)) {
@@ -749,8 +934,19 @@ namespace hs
 			for (std::size_t slot = 0; slot < kWatchpointSlotCount; ++slot) {
 				report.drAddress[slot] = static_cast<std::uintptr_t>(drAddress[slot]);
 			}
+			fillDrProvenance(report);
 			WatchpointReports::Get().Record(report);
 			_unattributed.fetch_add(1, std::memory_order_relaxed);
+
+			// 0.6.4 FIX A: count the two cases the 0.6.3 records could not tell
+			// apart, so the next trip's summary says which one it was without reading
+			// every record. `kReadFailed` means the dr6/dr7/dr0-3 fields above are not
+			// a measurement; `kReadZero` means the read succeeded and this host
+			// genuinely delivered a #DB with no debug register set (trap flag, int1,
+			// or host behaviour) -- which is a finding, not a hole.
+			const auto measurement = ClassifyDebugRegisterMeasurement(report.drReadSource, report.drReadStatus, report.dr6,
+				report.drAddress, kWatchpointSlotCount);
+			WatchpointReports::Get().NoteUnattributedMeasured(measurement);
 
 			// We do not know which (if any) DR fired, so we cannot clear a slot.
 			// Clear DR6 and the trap flag: an unattributed #DB must not re-fire on
@@ -814,10 +1010,15 @@ namespace hs
 
 		WatchpointSlots::Get().ClearAll(::GetTickCount64());
 		WatchpointReports::Get().Shutdown();
-		logger::info("watchpoints: final state: {} slot(s) occupied, {} claims, {} claim drops, {} releases, {} trips, {} unattributed #DB(s) consumed, {} post-free link(s) suppressed",
+		logger::info("watchpoints: final state: {} slot(s) occupied, {} claims, {} claim drops, {} releases, {} trips, {} unattributed #DB(s) consumed, {} post-free link(s) suppressed, {} realloc-in-progress write(s) suppressed, {} free-predates-arm report(s)",
 			WatchpointSlots::Get().OccupiedCount(), WatchpointSlots::Get().Claims(), WatchpointSlots::Get().ClaimDrops(),
 			WatchpointSlots::Get().Releases(), WatchpointSlots::Get().Trips(),
-			_unattributed.load(std::memory_order_relaxed), _postFreeSuppressed.load(std::memory_order_relaxed));
+			_unattributed.load(std::memory_order_relaxed),
+			WatchpointReports::Get().PostFreeSuppressed(), WatchpointReports::Get().ReallocSuppressed(),
+			WatchpointReports::Get().FreePredatesArm());
+		logger::info("watchpoints: debug-register measurement: {} unattributed #DB(s) carried a FAILED read (fields are not a measurement), {} carried a successful read that genuinely returned no debug register",
+			WatchpointReports::Get().UnattributedDrReadFailed(),
+			WatchpointReports::Get().UnattributedDrReadZero());
 	}
 
 	WatchpointStats Watchpoints::Stats() const noexcept
@@ -843,7 +1044,11 @@ namespace hs
 		stats.reportsDropped = reports.Dropped();
 		stats.reportsDrained = _drained.load(std::memory_order_relaxed);
 		stats.unattributedTraps = _unattributed.load(std::memory_order_relaxed);
-		stats.postFreeLinksSuppressed = _postFreeSuppressed.load(std::memory_order_relaxed);
+		stats.postFreeLinksSuppressed = reports.PostFreeSuppressed();
+		stats.reallocInProgressSuppressed = reports.ReallocSuppressed();
+		stats.unattributedDrReadFailed = reports.UnattributedDrReadFailed();
+		stats.unattributedDrReadZero = reports.UnattributedDrReadZero();
+		stats.freePredatesArmReports = reports.FreePredatesArm();
 		stats.considerCount = plan.considered;
 		stats.selectedCount = plan.selected;
 		stats.queueEvictions = plan.queueEvictions;
