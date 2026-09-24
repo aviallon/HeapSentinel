@@ -407,9 +407,8 @@ namespace hs
 		if (a_freeTick != 0 && a_armTick != 0 && a_freeTick < a_armTick) {
 			return WatchpointFreeContext::kFreePredatesArm;
 		}
-		if (a_freeTick != 0 && a_match == FreeInstanceMatch::kDifferent) {
-			return WatchpointFreeContext::kFreePredatesAllocation;
-		}
+		// MUTATION M6 (temporary): ignore the instance mismatch entirely.
+		(void)a_match;
 		return ClassifyWriteAgainstFree(a_freeTick, a_armTick, a_trapTick, a_windowMs);
 	}
 
