@@ -198,9 +198,9 @@ namespace hs
 			static_cast<unsigned long long>(a_report.drAddress[1]),
 			static_cast<unsigned long long>(a_report.drAddress[2]),
 			static_cast<unsigned long long>(a_report.drAddress[3]),
-			static_cast<unsigned long long>(a_report.armedInstance),
-			static_cast<unsigned long long>(a_report.freeInstance),
-			FreeInstanceMatchName(static_cast<FreeInstanceMatch>(a_report.freeInstanceMatch)));
+			static_cast<unsigned long long>(0),  // MUTATION M5 (temporary)
+			static_cast<unsigned long long>(0),
+			"unproven");
 
 		if (written < 0) {
 			return 0;
