@@ -326,17 +326,16 @@ namespace hs
 	[[nodiscard]] constexpr WatchpointFreeContext ClassifyWriteAgainstFree(
 		std::uint64_t a_freeTick, std::uint64_t a_armTick, std::uint64_t a_trapTick, std::uint64_t a_windowMs) noexcept
 	{
-		if (a_freeTick == 0) {
-			return WatchpointFreeContext::kLive;
-		}
-		if (a_armTick != 0 && a_freeTick < a_armTick) {
-			return WatchpointFreeContext::kFreePredatesArm;
-		}
-		if (a_trapTick >= a_freeTick) {
-			return (a_trapTick - a_freeTick) <= a_windowMs ? WatchpointFreeContext::kPostFreeLink
-													 : WatchpointFreeContext::kDelayedWriteAfterFree;
-		}
-		return (a_freeTick - a_trapTick) <= a_windowMs ? WatchpointFreeContext::kReallocInProgress
-													: WatchpointFreeContext::kDelayedWriteAfterFree;
+	if (a_freeTick == 0) {
+		return WatchpointFreeContext::kLive;
+	}
+	// MUTATION M4 (temporary): drop the predates-arm case, so a stale free ring
+	// record is forced into the ordering test instead of being reported.
+	if (a_trapTick >= a_freeTick) {
+		return (a_trapTick - a_freeTick) <= a_windowMs ? WatchpointFreeContext::kPostFreeLink
+																		   : WatchpointFreeContext::kDelayedWriteAfterFree;
+	}
+	return (a_freeTick - a_trapTick) <= a_windowMs ? WatchpointFreeContext::kReallocInProgress
+																	   : WatchpointFreeContext::kDelayedWriteAfterFree;
 	}
 }
